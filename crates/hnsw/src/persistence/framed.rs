@@ -443,9 +443,30 @@ pub(super) fn floats(row: &[u8]) -> impl Iterator<Item = f32> + '_ {
         .map(|value| f32::from_le_bytes([value[0], value[1], value[2], value[3]]))
 }
 
+/// The refusal of a codebook holding `value`, which is not finite, as value
+/// `position` of centroid `centroid` of subvector `subvector`. Every reader
+/// of `pq_centroids.bin` refuses such a codebook in these words, since a
+/// value that is not finite makes every distance through its centroid NaN.
+pub(super) fn non_finite_codebook(
+    file: &str,
+    subvector: usize,
+    centroid: usize,
+    position: usize,
+    value: f32,
+) -> Error {
+    corrupt(
+        file,
+        format!(
+            "the codebook holds {} at value {} of centroid {} of subvector {}, and every \
+             value is finite",
+            value, position, centroid, subvector
+        ),
+    )
+}
+
 /// `pq_centroids.bin`, read and built: the frame, a payload exactly the
-/// codebook its own shape describes, and that shape `shape`, which is held
-/// before anything is allocated.
+/// codebook its own shape describes, that shape `shape`, and every value
+/// finite, each held before anything is allocated.
 pub(super) fn read_codebook(
     bytes: &[u8],
     file: &str,
@@ -486,6 +507,20 @@ pub(super) fn read_codebook(
     let actual = (subvectors.unwrap_or(usize::MAX), centroids, width);
     if actual != shape.expected {
         return Err(shape.mismatch(actual));
+    }
+    if let Some((at, value)) = values
+        .chunks_exact(4)
+        .map(|value| f32::from_le_bytes([value[0], value[1], value[2], value[3]]))
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(non_finite_codebook(
+            file,
+            at / (centroids * width),
+            at / width % centroids,
+            at % width,
+            value,
+        ));
     }
     let mut floats = values
         .chunks_exact(4)

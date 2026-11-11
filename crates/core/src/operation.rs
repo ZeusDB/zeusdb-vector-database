@@ -354,6 +354,10 @@ impl Operation {
                 fitted: None,
             } => out.extend_from_slice(completed_at.as_bytes()),
             Operation::AddMetadata { pairs } => {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "a field's count inside a payload, held by the payload ceiling, since the writer refuses a longer payload"
+                )]
                 out.extend_from_slice(&(pairs.len() as u32).to_le_bytes());
                 for (key, value) in pairs {
                     put_bytes(out, key.as_bytes());
@@ -489,6 +493,10 @@ impl Operation {
 }
 
 fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a field's count inside a payload, held by the payload ceiling, since the writer refuses a longer payload"
+    )]
     out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
     out.extend_from_slice(bytes);
 }
@@ -513,6 +521,10 @@ pub struct InsertParts<'a> {
 
 /// The removal layout, written once for both encoders.
 fn write_remove(out: &mut Vec<u8>, ids: &[String]) {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a field's count inside a payload, held by the payload ceiling, since the writer refuses a longer payload"
+    )]
     out.extend_from_slice(&(ids.len() as u32).to_le_bytes());
     for id in ids {
         put_bytes(out, id.as_bytes());
@@ -559,6 +571,10 @@ fn write_insert(
     put_bytes(out, id.as_bytes());
     out.extend_from_slice(&internal_id.to_le_bytes());
     out.push(level);
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a field's count inside a payload, held by the payload ceiling, since the writer refuses a longer payload"
+    )]
     out.extend_from_slice(&(vector.len() as u32).to_le_bytes());
     for value in vector {
         out.extend_from_slice(&value.to_le_bytes());
@@ -567,6 +583,10 @@ fn write_insert(
     match sparse {
         None => out.extend_from_slice(&NO_SPARSE.to_le_bytes()),
         Some(sparse) => {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a field's count inside a payload, held by the payload ceiling, since the writer refuses a longer payload"
+            )]
             out.extend_from_slice(&(sparse.dims.len() as u32).to_le_bytes());
             for dim in sparse.dims {
                 out.extend_from_slice(&dim.to_le_bytes());
@@ -607,6 +627,10 @@ fn write_train(out: &mut Vec<u8>, completed_at: &str, fitted: FittedRef<'_>) {
         }
         FittedRef::Scales(scales) => {
             out.push(SCHEME_SCALES);
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a field's count inside a payload, held by the payload ceiling, since the writer refuses a longer payload"
+            )]
             out.extend_from_slice(&(scales.len() as u32).to_le_bytes());
             for value in scales {
                 out.extend_from_slice(&value.to_le_bytes());
@@ -959,6 +983,7 @@ fn read_calibration(c: &mut Cursor<'_>) -> Result<Option<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::allocations::{bounded, read_bound};
     use crate::frame::fuzz::{Rng, HOSTILE};
     use crate::journal::JOURNAL_MAX_PAYLOAD;
     use serde_json::json;
@@ -1843,11 +1868,11 @@ mod tests {
             assert!(blob.len() <= JOURNAL_MAX_PAYLOAD);
             // The version 1 reader takes the same bytes, and differs from
             // the version 2 one on a train alone.
-            match decode_legacy(*kind, &blob) {
+            match bounded(read_bound(blob.len()), || decode_legacy(*kind, &blob)) {
                 Ok(_) | Err(Error::JournalRecordInvalid { .. }) => {}
                 Err(other) => panic!("unexpected error at version 1 {other:?}"),
             }
-            match decode(*kind, &blob) {
+            match bounded(read_bound(blob.len()), || decode(*kind, &blob)) {
                 Ok(Operation::Train {
                     fitted: Some(fitted),
                     ..

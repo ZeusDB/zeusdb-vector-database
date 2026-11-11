@@ -27,3 +27,9 @@ test-support = []
 [dependencies]
 zeusdb-vector-core = { workspace = true }
 serde = { workspace = true }
+
+[dev-dependencies]
+# The engine again, with its test support turned on, for the frame fuzz
+# mutator the dictionary's tests draw from. cargo applies a dev-dependency's
+# features to this crate's test targets and to nothing else.
+zeusdb-vector-core = { workspace = true, features = ["test-support"] }

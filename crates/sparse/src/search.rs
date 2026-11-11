@@ -653,6 +653,10 @@ impl PostingsIndex {
             let df = df as f64;
             let rarity = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
             dims.push(d);
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a weight narrowed to the f32 the scorer reads, not an offset, a count, an index or an id"
+            )]
             values.push((qw as f64 * rarity * numerator) as f32);
         }
         let mean = self.mean_length();
@@ -661,6 +665,10 @@ impl PostingsIndex {
             dims,
             values,
             c0: k1 * (1.0 - b),
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a weight narrowed to the f32 the scorer reads, not an offset, a count, an index or an id"
+            )]
             c1: (k1 as f64 * b as f64 / mean) as f32,
         }
     }

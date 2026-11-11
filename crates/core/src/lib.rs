@@ -39,8 +39,16 @@
 //! the binding's own `test-support` feature turns it on for the extension
 //! the interpreter checks run against. See `panic_point`.
 #![warn(unreachable_pub)]
+// A narrowing cast in this crate's library code states its bound in an
+// `#[expect]` beside it, so a cast with no stated bound fails the lint gate,
+// and an `#[expect]` whose cast is gone fails it too. Test code is left out.
+#![cfg_attr(not(test), warn(clippy::cast_possible_truncation))]
 
 mod admit;
+// The test build's allocator, which holds every request to a ceiling and a
+// fuzzer's reads to a bound. See `allocations`.
+#[cfg(any(test, feature = "test-support"))]
+mod allocations;
 mod bitmap;
 mod checksum;
 mod columns;
@@ -69,16 +77,28 @@ pub use admit::{Admit, And, Candidates};
 pub use bitmap::Bitmap;
 pub use checksum::checksum_of;
 pub use columns::{validate_indexed_fields, ColumnParts, ColumnStore, Selection};
-pub use distance::{CosineDist, DistPQ, DotDist, Int8Dist, Int8Metric, L1Dist, L2Dist, PqMetric};
+pub use distance::{
+    norm_f64, past_bound_words, screen, CosineDist, DistPQ, DotDist, Int8Dist, Int8Metric, L1Dist,
+    L2Dist, PqMetric, Screen, NORM_BOUND,
+};
 pub use error::{Error, Exception};
 pub use filter::{compile_filter, matches_filter, FieldLookup, Filter};
+// The frame fuzz mutator, for the fuzzers in the crates whose payloads are
+// framed. Present under the `test-support` feature and in this crate's own
+// tests; see `frame::fuzz`.
+#[cfg(any(test, feature = "test-support"))]
+pub use frame::fuzz as frame_fuzz;
 pub use frame::{
-    begin as frame_begin, finish as frame_finish, frame, fuzz as frame_fuzz, unframe,
-    FrameEncoding, FrameKind, Framed, FRAME_HEADER_BYTES, FRAME_MAGIC, FRAME_OVERHEAD_BYTES,
-    FRAME_TRAILER_BYTES,
+    begin as frame_begin, finish as frame_finish, frame, unframe, FrameEncoding, FrameKind, Framed,
+    FRAME_HEADER_BYTES, FRAME_MAGIC, FRAME_OVERHEAD_BYTES, FRAME_TRAILER_BYTES,
 };
 pub use fusion::{fuse, Contribution, FusedHit, Fusion, DEFAULT_RRF_K};
+// The dump fuzzer's mutator, for a fuzzer in another crate that mutates a
+// saved directory's dump. Present under the `test-support` feature and in
+// this crate's own tests; see `graph::dump_fuzz`.
 pub use graph::dump::{DUMP_FILENAME, LEGACY_DUMP_FILENAMES, NB_LAYER_MAX};
+#[cfg(any(test, feature = "test-support"))]
+pub use graph::dump_fuzz;
 #[cfg(any(test, feature = "test-support"))]
 pub use graph::GRAPH_CEILINGS;
 pub use graph::{
@@ -151,6 +171,8 @@ pub use storage::{
 /// and absent from every other build.
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support {
+    pub use crate::allocations::{bounded, read_bound, Bounded, CEILING};
+    pub use crate::graph::RESERVE_BYTES as GRAPH_RESERVE_BYTES;
     pub use crate::pq::quantizer_fits;
     pub use crate::test_vectors::clustered;
 }

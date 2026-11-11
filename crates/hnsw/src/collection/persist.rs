@@ -12,7 +12,7 @@ use super::{
     Collection, DenseIndex, DenseOpen, DenseRestored, Identity, IdentityRecord, QuantizationConfig,
     StorageMode, MAX_LAYER,
 };
-use crate::journal::{Durability, JournalPolicy, Recovery};
+use crate::journal::{Durability, JournalPolicy, PastBound, Recovery};
 use crate::locks::ReadGuard;
 use crate::persistence::unmapped_record;
 use crate::RerankCalibration;
@@ -24,10 +24,36 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, info, instrument};
 use zeusdb_vector_core::{
-    ArtefactRecord, Bounds, Dir, DumpRefusal, DumpRegion, DumpRows, Error, FsStorage, IdStore,
-    Inventory, KillPoint, MetadataStore, Persist, Position, PositionWalk, SegmentBase, Storage,
-    VectorGraph, DUMP_FILENAME,
+    screen, ArtefactRecord, Bounds, Dir, DumpRefusal, DumpRegion, DumpRows, Error, FsStorage,
+    IdStore, Int8Codec, Inventory, KillPoint, MetadataStore, Persist, Position, PositionWalk,
+    Screen, SegmentBase, Storage, VectorGraph, DUMP_FILENAME, NORM_BOUND,
 };
+
+/// Where a load read the parts [`Collection::first_past_bound`] scans, for
+/// the file its words name.
+pub(crate) struct BoundSources<'a> {
+    /// The file the checkpoint's raw vectors were read from.
+    pub(crate) raw: &'a str,
+    /// The journal file the load replayed, where it replayed one.
+    pub(crate) journal: Option<&'a str>,
+    /// The internal id counter the checkpoint held. A record at or past it
+    /// was installed by the replay.
+    pub(crate) counter: usize,
+    /// Whether the checkpoint held a fitted quantizer, rather than one a
+    /// training during the replay fitted.
+    pub(crate) fitted: bool,
+}
+
+impl BoundSources<'_> {
+    /// The journal's file where `replayed` and the load replayed one, and
+    /// `checkpoint` otherwise.
+    fn file(&self, replayed: bool, checkpoint: &str) -> String {
+        match self.journal {
+            Some(journal) if replayed => journal.to_string(),
+            _ => checkpoint.to_string(),
+        }
+    }
+}
 
 /// What a checkpoint is for, which decides the kill points it passes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -209,6 +235,89 @@ impl Collection {
         write(&mut records, ids.len())
     }
 
+    /// The first value the collection holds past what the bound on a
+    /// vector's norm allows, named with the file `sources` says it came from:
+    /// under l2, dot or l1 a raw vector whose norm passes `NORM_BOUND`, then a
+    /// codebook value past 2^62, then a scale past the largest one vectors
+    /// within the bound fit. `None` for every collection this build writes,
+    /// since `add` refuses a vector past the bound and a fit to vectors within
+    /// it holds no such value.
+    ///
+    /// A load asks this once the checkpoint is read and any journal replayed,
+    /// before anything is written, and opens the collection read only where
+    /// it answers one. Every raw vector takes the one pass of
+    /// `zeusdb_vector_core::screen`, under the id store's guard and the
+    /// index's, in that order.
+    pub(crate) fn first_past_bound(&self, sources: &BoundSources<'_>) -> Option<PastBound> {
+        if self.dense().bounded() {
+            let ids = self.ids.read().unwrap();
+            let index = self.dense().index.read().unwrap();
+            let node_at = index.node_at();
+            let graph = index.graph();
+            let origin_ids = graph.origin_ids();
+            for at in ids.slots() {
+                let Some(&node) = node_at.get(at) else {
+                    continue;
+                };
+                let Some(vector) = graph.raw_vector_at(node) else {
+                    continue;
+                };
+                let Screen::PastBound { norm } = screen(vector, true) else {
+                    continue;
+                };
+                let replayed = origin_ids
+                    .get(node as usize)
+                    .is_some_and(|&internal_id| internal_id >= sources.counter);
+                return Some(PastBound {
+                    file: sources.file(replayed, sources.raw),
+                    detail: format!(
+                        "the vector of '{}', whose Euclidean norm is {:e}",
+                        ids.read_name(at).unwrap_or_default(),
+                        norm
+                    ),
+                    allowed: format!(
+                        "2^62 ({:e}), the largest norm an index under {} takes",
+                        NORM_BOUND,
+                        self.dense().metric
+                    ),
+                });
+            }
+        }
+        if let Some((subvector, centroid, place, value)) = self
+            .pq()
+            .filter(|pq| pq.is_trained())
+            .and_then(|pq| pq.first_value_past_bound())
+        {
+            return Some(PastBound {
+                file: sources.file(!sources.fitted, "pq_centroids.bin"),
+                detail: format!(
+                    "{:e} at value {} of centroid {} of subvector {}",
+                    value, place, centroid, subvector
+                ),
+                allowed: format!(
+                    "2^62 ({:e}), the largest value a codebook fitted to vectors whose norm is \
+                     within 2^62 holds",
+                    NORM_BOUND
+                ),
+            });
+        }
+        if let Some((dimension, scale)) = self
+            .dense()
+            .int8_codec()
+            .and_then(|codec| codec.first_scale_past_bound())
+        {
+            return Some(PastBound {
+                file: sources.file(!sources.fitted, crate::persistence::INT8_SCALES_FILENAME),
+                detail: format!("a scale of {:e} at dimension {}", scale, dimension),
+                allowed: format!(
+                    "{:e}, the largest scale vectors whose norm is within 2^62 fit",
+                    Int8Codec::largest_scale_within_bound()
+                ),
+            });
+        }
+        None
+    }
+
     /// Whether this index should hold a raw store beside its codes.
     ///
     /// Asked by the loader after the graph is back and before the vectors are
@@ -297,6 +406,10 @@ impl Collection {
         let stranded_fill = vec![0f32; self.dense().dim];
         let mut placed = 0usize;
         let mut stranded = 0usize;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the node count, held below 2^31 by append_node and loading_layout"
+        )]
         for node in 0..nodes as u32 {
             let at = hnsw.record_of_at(node);
             match by_position.get(&(at as usize)) {
@@ -501,6 +614,14 @@ impl Collection {
         self.save_locked_as(path, CheckpointKind::Upgrade)
     }
 
+    /// The four phases into `storage`, under the mutation guard, for a test
+    /// that saves into a directory held in memory.
+    #[cfg(test)]
+    pub(crate) fn save_into(&self, storage: &dyn Storage) -> Result<(), Error> {
+        let _writers = self.writers.lock().unwrap();
+        self.save_to(storage, Written::Own).map(|_| ())
+    }
+
     /// The four phases, with the mutation guard already held.
     fn save_phases(&self, storage: &FsStorage, path: &str) -> Result<(), Error> {
         let start_time = Instant::now();
@@ -521,6 +642,12 @@ impl Collection {
     /// the manifest records of the directory's identity.
     fn save_to(&self, storage: &dyn Storage, written: Written) -> Result<IdentityRecord, Error> {
         let points = written.points();
+        // A collection read only for a value past the bound on a vector's
+        // norm writes nothing, into any directory, since this build writes no
+        // such value. Every save, backup and checkpoint passes here.
+        if let Some(refusal) = self.sink_bound_refusal() {
+            return Err(refusal);
+        }
         // What the directory will be, settled before anything is written, so
         // a collection whose generation cannot move writes nothing.
         let identity = self.next_identity()?;
@@ -664,14 +791,9 @@ impl Collection {
     /// collection reaches by saving and a directory reaches only by an edit.
     fn next_identity(&self) -> Result<Identity, Error> {
         let current = self.identity();
-        current.next(super::construct::draw_id()).ok_or_else(|| {
-            Error::Engine(format!(
-                "This collection was read from a directory recording generation {}, the \
-                 largest a manifest can hold, so no save can record the one after it. No \
-                 release writes that generation, so the directory's manifest was edited.",
-                current.generation
-            ))
-        })
+        current
+            .next(super::construct::draw_id())
+            .ok_or_else(|| Error::Engine(super::generation_exhausted(current.generation)))
     }
 
     /// Write the HNSW graph in ZeusDB's own format. See `graph::dump`.

@@ -384,7 +384,7 @@ impl GraphRoom {
 /// What it costs is reallocation on a build past the budget. The arenas grow
 /// geometrically, so a 50,000 record build at dimension 1,536 crosses it twice
 /// and moves roughly 400 MB in total, against a build that takes 70 seconds.
-pub(super) const RESERVE_BYTES: usize = 1 << 27;
+pub const RESERVE_BYTES: usize = 1 << 27;
 
 /// Records the reservation is taken for, being `expected_size` or as many as
 /// [`RESERVE_BYTES`] holds, whichever is smaller.
@@ -433,6 +433,10 @@ fn wide_lists_per(m: usize) -> usize {
 /// entry level down to its own level plus one, so a node's span is the entry
 /// level at the moment it arrived. `log(n) / log(m)` is where the top of an
 /// exponential level distribution at scale `1 / ln(m)` lands.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "a span from f64, a cast that saturates, held below LAYERS by the min on its line"
+)]
 fn expected_span(m: usize, expected_size: usize) -> usize {
     if expected_size < 2 || m < 2 {
         return 0;
@@ -824,6 +828,10 @@ where
         let mut lists: Vec<Vec<u32>> = Vec::new();
         for (layer, &count) in layer_counts_in.iter().enumerate() {
             for rank in 0..count {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "a rank within its layer's count, which loading_layout holds below 2^31"
+                )]
                 let node = layer_offsets[layer] + rank as u32;
                 let list_count = match walk.next_lists(&layer_offsets, &mut lists) {
                     Ok(list_count) => list_count,
@@ -836,6 +844,10 @@ where
                         layer, rank, list_count, LAYERS
                     )));
                 }
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "a layer of the layer table, below LAYERS, 16"
+                )]
                 graph.levels.push(layer as u8);
                 if let Err(reason) = graph.install_point(node, layer, rank, &lists[..list_count]) {
                     return Err(graph.not_built(reason));
@@ -980,6 +992,10 @@ where
         //
         // A span grown or a list promoted here takes words, wide lists and
         // slots the walk did not, so each is held to its ceiling as it grows.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the node count, held below 2^31 by append_node and loading_layout"
+        )]
         for node in 0..self.origin_ids.len() as u32 {
             for layer in 0..=self.span(node) {
                 for slot in 0..self.list_len(node, layer) {
@@ -1293,6 +1309,10 @@ where
         // is `above_level_edges`. Walking the nodes rather than summing the
         // wide lengths is also what keeps an abandoned word run, which
         // `grow_span` leaves behind, out of the count.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the node count, held below 2^31 by append_node and loading_layout"
+        )]
         let upper: usize = (0..self.origin_ids.len() as u32)
             .map(|node| {
                 (1..=self.levels[node as usize] as usize)
@@ -1305,6 +1325,10 @@ where
 
     /// Edges sitting at layers above their owner's level, which the vendored
     /// descent files and the vendored reverse update adds to.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the node count, held below 2^31 by append_node and loading_layout"
+    )]
     pub(super) fn above_level_edges(&self) -> usize {
         (0..self.origin_ids.len() as u32)
             .map(|node| {
@@ -1464,6 +1488,10 @@ where
     /// the one place the dump's positional identity is readable from outside a
     /// save. It exists so a round trip can be compared on where each point
     /// landed and not only on what each point holds.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the node count, held below 2^31 by append_node and loading_layout"
+    )]
     pub(super) fn point_ids(&self) -> Vec<PointId> {
         let order = DumpOrder::of(self);
         (0..self.origin_ids.len() as u32)
@@ -1563,6 +1591,7 @@ where
         let first = u32::try_from(self.upper_word.len())
             .expect("the word arena is held within its ceiling, which no u32 offset passes");
         self.upper_first.push(first);
+        #[expect(clippy::cast_possible_truncation, reason = "a span, below LAYERS, 16")]
         self.upper_span.push(span as u8);
         for layer in 1..=span {
             let word = if wide(layer) {
@@ -1613,6 +1642,7 @@ where
     /// Every node opens a span at least its level, and a span only grows, so
     /// every layer the run grows to is above the node's level and takes an
     /// empty word.
+    #[expect(clippy::cast_possible_truncation, reason = "a layer, below LAYERS, 16")]
     fn try_grow_span(&mut self, node: u32, layer: usize) -> Result<(), String> {
         let old_span = self.span(node);
         if layer <= old_span {
@@ -1785,10 +1815,18 @@ where
             targets.len()
         );
         match slab {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a list's length, at most 2m + 1 slots, 513 at the largest m"
+            )]
             Slab::Base => {
                 self.base_targets[at..at + targets.len()].copy_from_slice(targets);
                 self.base_len[node as usize] = targets.len() as u16;
             }
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a list's length, at most 2m + 1 slots, 513 at the largest m"
+            )]
             Slab::Wide => {
                 self.upper_targets[at..at + targets.len()].copy_from_slice(targets);
                 let list = self
@@ -1848,6 +1886,10 @@ where
             None => panic!("node {} owns no list at layer {}", node, layer),
         };
         match slab {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a list's length, at most 2m + 1 slots, 513 at the largest m"
+            )]
             Slab::Base => {
                 assert!(
                     len < self.base_cap(),
@@ -1869,6 +1911,10 @@ where
                     self.wide_len[wide] = 2;
                 }
             }
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a list's length, at most 2m + 1 slots, 513 at the largest m"
+            )]
             Slab::Wide => {
                 let cap = self.upper_cap_full();
                 assert!(
@@ -1947,6 +1993,10 @@ where
         };
         assert!(slot < len, "slot {} of a list holding {}", slot, len);
         match slab {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a list's length, at most 2m + 1 slots, 513 at the largest m"
+            )]
             Slab::Base => {
                 let removed = self.base_targets[at + slot];
                 self.base_targets
@@ -1954,6 +2004,10 @@ where
                 self.base_len[node as usize] = (len - 1) as u16;
                 removed
             }
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a list's length, at most 2m + 1 slots, 513 at the largest m"
+            )]
             Slab::Wide => {
                 let removed = self.upper_targets[at + slot];
                 self.upper_targets
@@ -2019,6 +2073,7 @@ where
             "the store is addressed by node index, so it holds one vector per node"
         );
         self.origin_ids.push(origin_id);
+        #[expect(clippy::cast_possible_truncation, reason = "a level, below LAYERS, 16")]
         self.levels.push(level as u8);
         self.record_of.push(position);
         store.push(data);
@@ -2043,6 +2098,7 @@ where
 
     /// Move the traversal's starting point, which insertion does when it draws
     /// a level above every level drawn before it.
+    #[expect(clippy::cast_possible_truncation, reason = "a level, below LAYERS, 16")]
     fn set_entry(&mut self, node: u32, level: usize) {
         self.entry = node;
         self.entry_level = level as u8;
@@ -2096,12 +2152,122 @@ where
     /// property and stay meaningful if the counters are ever wrong.
     pub(super) fn counted_in_degree(&self, layer: usize) -> Vec<u32> {
         let mut counts = vec![0u32; self.origin_ids.len()];
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the node count, held below 2^31 by append_node and loading_layout"
+        )]
         for node in 0..self.origin_ids.len() as u32 {
             for &target in self.neighbours_at(node, layer) {
                 counts[target as usize] += 1;
             }
         }
         counts
+    }
+
+    /// Whether the graph holds its own structure, with the first rule it
+    /// breaks where it does not, read against `store`, the rows it scores.
+    ///
+    /// The rules every insertion and every load leave, whatever the records.
+    /// Every list holds at most its layer's threshold, `2m` at layer zero and
+    /// `m` above, since the overflow slot is filled and emptied within one
+    /// push. No list names its owner, a node twice, or a node the graph does
+    /// not hold. Every list is in order of the distance from its owner to
+    /// each target, ties in either order. Every node owns a list at each
+    /// layer up to its level. The layer table counts the nodes at each
+    /// level. The entry is a node at the highest level, which the graph
+    /// records as the entry's. Every inbound counter equals the lists at its
+    /// layer naming its node, so a node a list names at a layer owns a
+    /// promoted list there. A node may own lists above its level and be named
+    /// above it, which the descent and the reverse update leave, so no rule
+    /// ties a target's level to the layer it is named at.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn structure_holds(&self, store: &VectorStore<T>) -> Result<(), String> {
+        let count = u32::try_from(self.origin_ids.len())
+            .map_err(|_| "the graph holds more nodes than a u32 numbers".to_string())?;
+        let mut at_level = [0u32; LAYERS];
+        let mut highest = 0u8;
+        for node in 0..count {
+            let level = self.levels[node as usize];
+            at_level[usize::from(level)] += 1;
+            highest = highest.max(level);
+            let span = self.span(node);
+            if span < usize::from(level) {
+                return Err(format!(
+                    "node {node} is at level {level} and owns lists to layer {span}"
+                ));
+            }
+            let owner = store.get(node);
+            for layer in 0..=span {
+                let list = self.neighbours_at(node, layer);
+                let threshold = if layer == 0 { 2 * self.m } else { self.m };
+                if list.len() > threshold {
+                    return Err(format!(
+                        "node {node} holds {} entries at layer {layer}, and its threshold is \
+                         {threshold}",
+                        list.len()
+                    ));
+                }
+                let mut nearer: Option<f32> = None;
+                for (slot, &target) in list.iter().enumerate() {
+                    if target >= count {
+                        return Err(format!(
+                            "node {node} names node {target} at layer {layer}, and the graph \
+                             holds {count}"
+                        ));
+                    }
+                    if target == node {
+                        return Err(format!("node {node} names itself at layer {layer}"));
+                    }
+                    if list[..slot].contains(&target) {
+                        return Err(format!(
+                            "node {node} names node {target} twice at layer {layer}"
+                        ));
+                    }
+                    let distance = self.dist_f.eval(owner, store.get(target));
+                    if distance.is_nan() {
+                        return Err(format!(
+                            "node {node} is at a NaN distance from node {target} at layer {layer}"
+                        ));
+                    }
+                    if let Some(previous) = nearer.filter(|&previous| distance < previous) {
+                        return Err(format!(
+                            "node {node} holds node {target} at {distance} after an entry at \
+                             {previous} at layer {layer}"
+                        ));
+                    }
+                    nearer = Some(distance);
+                }
+            }
+        }
+        if self.layer_counts != at_level {
+            return Err(format!(
+                "the layer table holds {:?} and the levels count {:?}",
+                self.layer_counts, at_level
+            ));
+        }
+        if count > 0
+            && (self.entry >= count
+                || self.levels[self.entry as usize] != self.entry_level
+                || self.entry_level != highest)
+        {
+            return Err(format!(
+                "the entry is node {} at recorded level {}, and the highest level is {highest}",
+                self.entry, self.entry_level
+            ));
+        }
+        for layer in 0..LAYERS {
+            let counted = self.counted_in_degree(layer);
+            for node in 0..count {
+                let (named, held) = (counted[node as usize], self.in_degree(node, layer));
+                if held != named {
+                    return Err(format!(
+                        "node {node} is named by {named} lists at layer {layer} and its counter \
+                         holds {held}"
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Every inbound counter the graph holds that is above zero, keyed by the
@@ -2430,6 +2596,10 @@ impl DumpOrder {
         let mut cursor = offsets;
         let mut by_layer = vec![0u32; graph.origin_ids.len()];
         let mut rank = vec![0u32; graph.origin_ids.len()];
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a node index, held below 2^31 by append_node and loading_layout"
+        )]
         for (node, &level) in graph.levels.iter().enumerate() {
             let level = level as usize;
             let at = cursor[level];
@@ -2660,6 +2830,10 @@ fn loading_layout(
     }
     within(NODES, 0, nb_point, ceilings().nodes)?;
     for layer in 0..LAYERS {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a layer's count, at most the node count, which this function holds to the nodes ceiling, below 2^31"
+        )]
         let count = layer_counts_in.get(layer).copied().unwrap_or(0) as u32;
         layer_counts[layer] = count;
         layer_offsets[layer + 1] = layer_offsets[layer] + count;

@@ -330,8 +330,8 @@ def test_checkpoint_only_opens_the_checkpoint_and_leaves_the_journal_alone(tmp_p
 RECOVERY_KEYS = [
     "checkpoint_sequence", "checkpoint_taken", "damage", "first_sequence", "format_version",
     "graph_rebuilt", "journaled", "read_only", "read_only_reason", "records_in_journal",
-    "repair", "replayed", "restored_from_aside", "segments", "skipped", "upgraded_from",
-    "withdrawn",
+    "repair", "replaced", "replayed", "restored_from_aside", "segments", "skipped",
+    "upgraded_from", "withdrawn",
 ]
 
 

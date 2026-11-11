@@ -34,6 +34,7 @@ use crate::int8::Int8Codec;
 use crate::pq::PQ;
 use crate::space::Position;
 use crate::storage::FsDir;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 type BoxedFilter = Box<dyn Fn(&usize) -> bool>;
@@ -2034,4 +2035,219 @@ fn a_twin_keeps_its_neighbours_on_every_graph_kind() {
         faults.len(),
         faults.join("\n")
     );
+}
+
+// ============================================================================
+// THE STRUCTURE UNDER RANDOM WRITES
+// ============================================================================
+
+/// The insertions each graph kind takes, unless `ZEUSDB_FUZZ_CASES` sets
+/// another number for a deep run.
+fn structure_insertions() -> usize {
+    std::env::var("ZEUSDB_FUZZ_CASES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300)
+}
+
+/// The nodes up to which the structure is asked after every step. Past it,
+/// every 64th step asks it, and the last step always does.
+const ASKED_EVERY_STEP: usize = 1_000;
+
+/// One graph kind as the structure test builds it, with the quantizer a
+/// quantized kind encodes through.
+enum StructureKind {
+    Raw(&'static str),
+    Pq(&'static str, Arc<PQ>),
+    Int8(&'static str, Arc<Int8Codec>),
+}
+
+impl StructureKind {
+    fn label(&self) -> String {
+        match self {
+            StructureKind::Raw(space) => format!("raw {space}"),
+            StructureKind::Pq(space, _) => format!("product quantized {space}"),
+            StructureKind::Int8(space, _) => format!("scalar quantized {space}"),
+        }
+    }
+
+    fn space(&self) -> &'static str {
+        match self {
+            StructureKind::Raw(space)
+            | StructureKind::Pq(space, _)
+            | StructureKind::Int8(space, _) => space,
+        }
+    }
+
+    /// An empty graph of this kind at degree `m`, its levels drawn from
+    /// `seed`.
+    fn empty(&self, m: usize, seed: u64) -> VectorGraph {
+        let mut graph = match self {
+            StructureKind::Raw(space) => VectorGraph::new_raw(space, 8, m, 64, LAYERS, 40),
+            StructureKind::Pq(space, pq) => {
+                VectorGraph::new_pq(space, m, 64, LAYERS, 40, pq.clone())
+            }
+            StructureKind::Int8(space, codec) => {
+                VectorGraph::new_int8(space, m, 64, LAYERS, 40, codec.clone())
+            }
+        };
+        graph.set_level_seed(seed);
+        graph
+    }
+}
+
+/// One record as the structure test holds it: its vector, as the space
+/// stores it, and the node the graph holds it at.
+struct Placed {
+    vector: Vec<f32>,
+    node: u32,
+}
+
+/// Insert `vector` as record `id` at position `id`, encoded as the kind
+/// encodes it, and hand back the node it took.
+fn place(graph: &mut VectorGraph, kind: &StructureKind, vector: &[f32], id: usize) -> u32 {
+    let node = u32::try_from(graph.nb_points()).unwrap();
+    let at = Position::from_slot(id);
+    match kind {
+        StructureKind::Raw(_) => graph.insert(vector, id, at),
+        StructureKind::Pq(_, pq) => {
+            let codes = pq.quantize(vector).unwrap();
+            graph.insert_batch_pq(&[(&codes, id, at)]).unwrap();
+        }
+        StructureKind::Int8(..) => {
+            let row = graph.int8_encode(vector).unwrap();
+            graph.insert_batch_int8(&[(&row, id, at)]).unwrap();
+        }
+    }
+    node
+}
+
+/// Every kind's graph holds its own structure through a seeded sequence of
+/// insertions, overwrites, strandings and rebuilds, asked after every step
+/// while the graph holds up to a thousand nodes and every 64th step past
+/// that. An overwrite files the record at a new node and strands the old
+/// one, a stranding clears a node's record, and a rebuild inserts every
+/// held record into a new graph in the order of its old node, at a degree
+/// drawn afresh, as a compaction and a rebuild do. A rebuild waits until as
+/// many records have been inserted since the last one as the graph holds,
+/// so the rebuilds cost no more than the insertions, and one runs once half
+/// the insertions are in where none has yet. The kinds are raw
+/// under the four metrics, product quantized under cosine and `l2`, which
+/// are the spaces it takes, and scalar quantized under the four metrics.
+#[test]
+fn every_graph_kind_holds_its_structure_under_random_writes() {
+    let budget = structure_insertions();
+    let sample = sample_vectors(1_000, 8, 0x0224_5eed);
+    let units = unit_sample_vectors(1_000, 8, 0x0224_5eed);
+    let trained = |space: &str| {
+        let pq = Arc::new(PQ::new(8, 4, 4, 1_000, None));
+        pq.train(if space == "cosine" { &units } else { &sample })
+            .unwrap();
+        pq
+    };
+    let fitted = |space: &str| {
+        Arc::new(Int8Codec::fit(8, if space == "cosine" { &units } else { &sample }).unwrap())
+    };
+    let mut kinds: Vec<StructureKind> = ["cosine", "l2", "l1", "dot"]
+        .into_iter()
+        .map(StructureKind::Raw)
+        .collect();
+    kinds.extend(
+        ["cosine", "l2"]
+            .into_iter()
+            .map(|space| StructureKind::Pq(space, trained(space))),
+    );
+    kinds.extend(
+        ["cosine", "l2", "l1", "dot"]
+            .into_iter()
+            .map(|space| StructureKind::Int8(space, fitted(space))),
+    );
+    for (k, kind) in kinds.iter().enumerate() {
+        let label = kind.label();
+        let mut state = 0x0224_0000_5eed_0001u64 ^ ((k as u64) << 40);
+        let mut draw = move |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % bound.max(1) as u64) as usize
+        };
+        let vector = |draw: &mut dyn FnMut(usize) -> usize| -> Vec<f32> {
+            let raw: Vec<f32> = (0..8).map(|_| (draw(41) as f32 - 20.0) * 0.25).collect();
+            let norm = raw.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if kind.space() == "cosine" && norm > 0.0 {
+                raw.iter().map(|x| x / norm).collect()
+            } else {
+                raw
+            }
+        };
+        let mut graph = kind.empty(4 + draw(5), 0x0224 + k as u64);
+        let mut held: BTreeMap<usize, Placed> = BTreeMap::new();
+        let (mut inserted, mut since_rebuild, mut next_id) = (0usize, 0usize, 0usize);
+        let (mut step, mut rebuilds, mut stranded) = (0usize, 0usize, 0usize);
+        while inserted < budget {
+            step += 1;
+            let roll = if rebuilds == 0 && inserted >= budget / 2 {
+                99
+            } else {
+                draw(100)
+            };
+            if roll < 70 || held.is_empty() {
+                for _ in 0..1 + draw(8) {
+                    let v = vector(&mut draw);
+                    let node = place(&mut graph, kind, &v, next_id);
+                    held.insert(next_id, Placed { vector: v, node });
+                    next_id += 1;
+                    inserted += 1;
+                    since_rebuild += 1;
+                }
+            } else if roll < 85 {
+                for _ in 0..1 + draw(4) {
+                    let id = *held.keys().nth(draw(held.len())).unwrap();
+                    let old = held[&id].node;
+                    graph.records_mut()[old as usize] = Position::NONE;
+                    stranded += 1;
+                    let v = vector(&mut draw);
+                    let node = place(&mut graph, kind, &v, id);
+                    held.insert(id, Placed { vector: v, node });
+                    inserted += 1;
+                    since_rebuild += 1;
+                }
+            } else if roll < 97 {
+                for _ in 0..1 + draw(4) {
+                    if held.is_empty() {
+                        break;
+                    }
+                    let id = *held.keys().nth(draw(held.len())).unwrap();
+                    let gone = held.remove(&id).unwrap();
+                    graph.records_mut()[gone.node as usize] = Position::NONE;
+                    stranded += 1;
+                }
+            } else if since_rebuild >= held.len() {
+                let mut order: Vec<(u32, usize)> =
+                    held.iter().map(|(&id, placed)| (placed.node, id)).collect();
+                order.sort_unstable();
+                graph = kind.empty(4 + draw(5), 0x0224 + k as u64 + rebuilds as u64);
+                for (_, id) in order {
+                    let v = held[&id].vector.clone();
+                    let node = place(&mut graph, kind, &v, id);
+                    held.get_mut(&id).unwrap().node = node;
+                }
+                since_rebuild = 0;
+                rebuilds += 1;
+            }
+            let last = inserted >= budget;
+            if graph.nb_points() <= ASKED_EVERY_STEP || step % 64 == 0 || last {
+                if let Err(broken) = graph.structure_holds() {
+                    panic!(
+                        "{label}, step {step}, {} nodes: {broken}",
+                        graph.nb_points()
+                    );
+                }
+            }
+        }
+        assert!(
+            rebuilds > 0 && stranded > 0,
+            "{label}: the sequence rebuilt {rebuilds} times and stranded {stranded} nodes"
+        );
+    }
 }

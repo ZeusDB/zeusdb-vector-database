@@ -459,6 +459,10 @@ impl DenseIndex {
         let mut every = true;
         for (node, record) in self.graph.records_mut().iter_mut().enumerate() {
             let at = *record as usize;
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a node index, held below 2^31 by append_node and loading_layout"
+            )]
             if *record != NONE && held.contains(at) && node_at[at] == NONE {
                 node_at[at] = node as u32;
                 placed += 1;
@@ -522,6 +526,10 @@ impl DenseIndex {
         let mut node_at = Vec::with_capacity(self.node_at.capacity().min(kept));
         let mut records = Vec::with_capacity(self.graph.record_capacity());
         records.extend_from_slice(self.graph.records());
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a position, below MAX_INTERNAL_ID, refused at admit and at load"
+        )]
         for (k, &old) in old_of_new.iter().enumerate() {
             let node = self.node_at[old as usize];
             node_at.push(node);
@@ -640,6 +648,10 @@ impl DenseIndex {
                 continue;
             }
             held += 1;
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a position, below MAX_INTERNAL_ID, refused at admit and at load"
+            )]
             if records.get(node as usize) != Some(&(at as u32)) {
                 return false;
             }
@@ -651,6 +663,10 @@ impl DenseIndex {
         }
         let filed = records.iter().filter(|&&position| position != NONE).count();
         let every = filed == records.len();
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a node index, held below 2^31 by append_node and loading_layout"
+        )]
         let back = records.iter().enumerate().all(|(node, &position)| {
             position == NONE || self.node_at.get(position as usize) == Some(&(node as u32))
         });
@@ -1195,6 +1211,10 @@ impl VectorIndex<Dense> for DenseIndex {
             (None, Some(row)) => Record::Int8(row),
             (None, None) => Record::Raw(vector),
         };
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the node count, held below 2^31 by append_node and loading_layout"
+        )]
         let node = self.graph.nb_points() as u32;
         self.graph.install(record, id.slot(), at, planned);
         // A record takes the next position, which `node_at` reaches, but
@@ -1363,6 +1383,10 @@ fn numbering_of(graph: &VectorGraph) -> (Vec<u32>, usize, bool) {
     node_at.resize(extent, NONE);
     let mut placed = 0;
     let mut every = true;
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a node index, held below 2^31 by append_node and loading_layout"
+    )]
     for (node, &position) in records.iter().enumerate() {
         if position == NONE {
             every = false;
@@ -1396,6 +1420,10 @@ pub(crate) enum DenseParts {
 
 /// Whether every node `graph` holds holds a record at a position `node_at`
 /// files it under.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "a node index, held below 2^31 by append_node and loading_layout"
+)]
 fn every_node_live(graph: &VectorGraph, node_at: &[u32]) -> bool {
     graph
         .records()

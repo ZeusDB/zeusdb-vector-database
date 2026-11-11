@@ -175,6 +175,10 @@ impl Column {
                                     refs[code as usize] = 1;
                                     code
                                 }
+                                #[expect(
+                                    clippy::cast_possible_truncation,
+                                    reason = "a dictionary code, below the records held since a freed code is reused, so below MAX_INTERNAL_ID"
+                                )]
                                 None => {
                                     dict.push(value.clone());
                                     refs.push(1);
@@ -2050,5 +2054,289 @@ mod tests {
             selected(&store, &field("cat", FieldTest::Equals(json!("b")))),
             vec![0]
         );
+    }
+
+    // ========================================================================
+    // THE FILTER LANGUAGE UNDER RANDOM INPUT
+    // ========================================================================
+
+    /// The filters the fuzzer draws, unless `ZEUSDB_FUZZ_CASES` sets another
+    /// number for a deep run.
+    fn fuzz_filters() -> usize {
+        std::env::var("ZEUSDB_FUZZ_CASES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20_000)
+    }
+
+    /// The fields a record carries and a filter names. The first four are
+    /// declared as columns, and the rest are read from the metadata. One
+    /// takes the prefix the group keys take, and one is not ASCII.
+    const FUZZ_FIELDS: [&str; 8] = ["cat", "price", "tags", "name", "i", "flag", "$price", "ü"];
+
+    /// The operators a field condition names, being the thirteen the language
+    /// evaluates, the three presence questions, and names it refuses.
+    const FUZZ_OPERATORS: [&str; 19] = [
+        "eq",
+        "ne",
+        "gt",
+        "gte",
+        "lt",
+        "lte",
+        "contains",
+        "startswith",
+        "endswith",
+        "in",
+        "nin",
+        "any",
+        "all",
+        "exists",
+        "is_missing",
+        "is_null",
+        "between",
+        "$eq",
+        "EQ",
+    ];
+
+    /// Strings sharing prefixes and suffixes, ASCII and not, so `startswith`,
+    /// `endswith` and `contains` meet their edges.
+    const FUZZ_STRINGS: [&str; 10] = ["", "a", "ab", "abc", "b", "ba", "ü", "üb", "日本", "日"];
+
+    /// A seeded xorshift generator, which is the whole of the fuzzer's state.
+    struct Draws(u64);
+
+    impl Draws {
+        fn below(&mut self, bound: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % bound.max(1) as u64) as usize
+        }
+
+        fn pick<T: Copy>(&mut self, from: &[T]) -> T {
+            from[self.below(from.len())]
+        }
+    }
+
+    /// A number at an edge of each width a comparison converts to.
+    fn fuzz_number(draws: &mut Draws) -> Value {
+        match draws.below(14) {
+            0 => json!(0),
+            1 => json!(-1),
+            2 => json!(1),
+            3 => json!(i64::MIN),
+            4 => json!(i64::MAX),
+            5 => json!(u64::MAX),
+            6 => json!(9_007_199_254_740_992i64),
+            7 => json!(9_007_199_254_740_993i64),
+            8 => json!(0.5),
+            9 => json!(-0.0),
+            10 => json!(1e308),
+            11 => json!(9_007_199_254_740_992.0f64),
+            12 => json!(1e-300),
+            _ => json!(draws.below(60) as i64 - 10),
+        }
+    }
+
+    /// A value of any JSON type, nested to `depth` at most.
+    fn fuzz_value(draws: &mut Draws, depth: usize) -> Value {
+        match draws.below(if depth == 0 { 5 } else { 7 }) {
+            0 => Value::Null,
+            1 => json!(draws.below(2) == 0),
+            2 | 3 => fuzz_number(draws),
+            4 => json!(draws.pick(&FUZZ_STRINGS)),
+            5 => Value::Array(
+                (0..draws.below(4))
+                    .map(|_| fuzz_value(draws, depth - 1))
+                    .collect(),
+            ),
+            _ => {
+                let mut map = serde_json::Map::new();
+                for _ in 0..draws.below(3) {
+                    map.insert(
+                        draws.pick(&FUZZ_FIELDS).to_string(),
+                        fuzz_value(draws, depth - 1),
+                    );
+                }
+                Value::Object(map)
+            }
+        }
+    }
+
+    /// One record's metadata: each field absent a quarter of the time and
+    /// otherwise of any type.
+    fn fuzz_record(draws: &mut Draws) -> HashMap<String, Value> {
+        let mut record = HashMap::new();
+        for name in FUZZ_FIELDS {
+            if draws.below(4) != 0 {
+                record.insert(name.to_string(), fuzz_value(draws, 2));
+            }
+        }
+        record
+    }
+
+    /// One field's condition: a value to equal, or a mapping of operators,
+    /// each with a target of any type, a list most often where the operator
+    /// takes one.
+    fn fuzz_condition(draws: &mut Draws) -> Value {
+        if draws.below(4) == 0 {
+            return fuzz_value(draws, 2);
+        }
+        let mut map = serde_json::Map::new();
+        for _ in 0..1 + draws.below(3) {
+            let op = draws.pick(&FUZZ_OPERATORS);
+            let target = match op {
+                "in" | "nin" | "any" | "all" if draws.below(4) != 0 => {
+                    Value::Array((0..draws.below(5)).map(|_| fuzz_value(draws, 1)).collect())
+                }
+                "exists" | "is_missing" | "is_null" if draws.below(4) != 0 => {
+                    json!(draws.below(2) == 0)
+                }
+                _ => fuzz_value(draws, 2),
+            };
+            map.insert(op.to_string(), target);
+        }
+        Value::Object(map)
+    }
+
+    /// One filter mapping, of fields and groups, nested to `depth`, with a
+    /// group's value drawn now and then of a shape the group refuses.
+    fn fuzz_mapping(draws: &mut Draws, depth: usize) -> serde_json::Map<String, Value> {
+        let mut map = serde_json::Map::new();
+        for _ in 0..1 + draws.below(3) {
+            let roll = if depth == 0 { 0 } else { draws.below(10) };
+            match roll {
+                0..=5 => {
+                    map.insert(draws.pick(&FUZZ_FIELDS).to_string(), fuzz_condition(draws));
+                }
+                6 | 7 => {
+                    let key = if roll == 6 { "$and" } else { "$or" };
+                    let value = if draws.below(12) == 0 {
+                        fuzz_value(draws, 1)
+                    } else {
+                        Value::Array(
+                            (0..draws.below(4))
+                                .map(|_| {
+                                    if draws.below(16) == 0 {
+                                        fuzz_value(draws, 1)
+                                    } else {
+                                        Value::Object(fuzz_mapping(draws, depth - 1))
+                                    }
+                                })
+                                .collect(),
+                        )
+                    };
+                    map.insert(key.to_string(), value);
+                }
+                _ => {
+                    let value = if draws.below(12) == 0 {
+                        fuzz_value(draws, 1)
+                    } else {
+                        Value::Object(fuzz_mapping(draws, depth - 1))
+                    };
+                    map.insert("$not".to_string(), value);
+                }
+            }
+        }
+        map
+    }
+
+    /// A refusal is one of the errors the compiler names for a filter.
+    fn is_a_filter_refusal(error: &crate::error::Error) -> bool {
+        use crate::error::Error;
+        matches!(
+            error,
+            Error::UnknownFilterOperation { .. }
+                | Error::ReservedKeyShape { .. }
+                | Error::FilterBranchNotMapping { .. }
+                | Error::FilterTooDeep { .. }
+                | Error::PresenceTargetNotBool { .. }
+        )
+    }
+
+    /// **The property.** Every mapping the grammar can draw, to a depth of
+    /// twelve and with shapes the compiler refuses among them, compiles or
+    /// is refused with one of the compiler's own errors, and none panics.
+    /// Every compiled filter judges every record without a panic. The
+    /// column store over the same records, with four fields declared and
+    /// some records erased, answers each filter with exactly the records
+    /// the walk finds where it answers exactly, and with a set containing
+    /// them where it narrows. A share of the filters compiles and a share of
+    /// the compiled ones the store answers exactly, so every path is reached.
+    #[test]
+    fn every_random_filter_compiles_or_is_refused_and_the_store_agrees_with_the_walk() {
+        use crate::allocations::{bounded, read_bound};
+        let filters = fuzz_filters();
+        let mut draws = Draws(0x0224_f11e_5eed_0001);
+        let records: Records = (0..200)
+            .map(|slot| (slot, fuzz_record(&mut draws)))
+            .collect();
+        let mut store = store_of(&FUZZ_FIELDS[..4], &records);
+        for (slot, _) in records.iter().filter(|(slot, _)| slot % 9 == 4) {
+            store.erase(*slot);
+        }
+        let (mut compiled, mut exact, mut narrowed) = (0usize, 0usize, 0usize);
+        for case in 0..filters {
+            let depth = draws.below(13);
+            let mapping: HashMap<String, Value> =
+                fuzz_mapping(&mut draws, depth).into_iter().collect();
+            let bound = read_bound(serde_json::to_string(&mapping).map_or(0, |text| text.len()));
+            let outcome = std::panic::catch_unwind(|| {
+                bounded(bound, || crate::filter::compile_filter(&mapping))
+            });
+            let filter = match outcome {
+                Err(_) => panic!("case {case}: compiling {mapping:?} panicked"),
+                Ok(Err(error)) => {
+                    assert!(
+                        is_a_filter_refusal(&error),
+                        "case {case}: {mapping:?} was refused with {error:?}"
+                    );
+                    continue;
+                }
+                Ok(Ok(filter)) => filter,
+            };
+            compiled += 1;
+            // Every record judged, the erased among them, and the live ones
+            // matched are the walk's answer.
+            let matched: Vec<usize> = records
+                .iter()
+                .filter(|(_, metadata)| crate::filter::matches_filter(metadata, &filter))
+                .map(|(slot, _)| *slot)
+                .collect();
+            let expected: Vec<usize> = matched
+                .into_iter()
+                .filter(|slot| store.live.contains(*slot))
+                .collect();
+            match store.select(&filter) {
+                Selection::Exact(bitmap) => {
+                    exact += 1;
+                    assert_eq!(
+                        bits(&bitmap),
+                        expected,
+                        "case {case}: the store's exact answer to {mapping:?}"
+                    );
+                }
+                Selection::Narrowed(bitmap, _) => {
+                    narrowed += 1;
+                    let bound = bits(&bitmap);
+                    assert!(
+                        expected.iter().all(|slot| bound.contains(slot)),
+                        "case {case}: the store's bound {bound:?} on {mapping:?} drops a record \
+                         of {expected:?}"
+                    );
+                }
+                Selection::Whole(_) => {}
+            }
+        }
+        eprintln!("{filters} filters, {compiled} compiled, {exact} exact, {narrowed} narrowed");
+        assert!(
+            compiled * 4 > filters && compiled < filters,
+            "{compiled} of {filters} compiled"
+        );
+        assert!(
+            exact * 10 > compiled,
+            "{exact} of {compiled} answered exactly"
+        );
+        assert!(narrowed > 0, "no filter was narrowed");
     }
 }

@@ -82,6 +82,11 @@ mod mutable;
 mod structure;
 #[cfg(test)]
 pub(crate) mod test_graph;
+// The dump fuzzer's mutator, for this crate's fuzzer below and for a fuzzer
+// in another crate that mutates a saved directory's dump. Present under the
+// `test-support` feature and in this crate's own tests.
+#[cfg(any(test, feature = "test-support"))]
+pub mod dump_fuzz;
 // A seeded mutator over valid dumps of both versions, driving the readers with
 // generated input rather than with the damage cases written by hand.
 #[cfg(test)]
@@ -1225,6 +1230,10 @@ impl VectorGraph {
                         .wrapping_mul(SCATTER_STRIDE)
                         .wrapping_add(round.wrapping_mul(SCATTER_OFFSET))
                         % n;
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "a node index taken modulo the node count, held below 2^31 by append_node and loading_layout"
+                    )]
                     if admits(i) {
                         acc += dist.eval(query, store.get(i as u32));
                     }
@@ -1315,7 +1324,15 @@ impl VectorGraph {
         };
         let mut samples = Vec::with_capacity(rounds);
         for round in 0..rounds {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a node index taken modulo the node count, held below 2^31 by append_node and loading_layout"
+            )]
             let first = (round.wrapping_mul(SCATTER_STRIDE).wrapping_add(1) % n) as u32;
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a node index taken modulo the node count, held below 2^31 by append_node and loading_layout"
+            )]
             let second = (round
                 .wrapping_mul(SCATTER_STRIDE)
                 .wrapping_add(SCATTER_OFFSET)
@@ -1464,6 +1481,10 @@ impl VectorGraph {
     ) -> Result<usize, String> {
         let nodes = self.nb_points();
         self.open_raw_store(dim, nodes)?;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the node count, held below 2^31 by append_node and loading_layout"
+        )]
         for node in 0..nodes as u32 {
             let position = self.record_of_at(node);
             let vector = source_node_at
@@ -1784,6 +1805,24 @@ impl VectorGraph {
             VectorGraph::L2PQ(b) => b.graph.room(),
             VectorGraph::L1PQ(b) => b.graph.room(),
             VectorGraph::Int8(b) => b.graph.room(),
+        }
+    }
+
+    /// Whether the graph holds its own structure, with the first rule it
+    /// breaks where it does not. The rules are `MutableGraph`'s
+    /// `structure_holds`, read against the rows the graph scores. A test
+    /// asks it after a write or a load.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn structure_holds(&self) -> Result<(), String> {
+        match self {
+            VectorGraph::Cosine(b) => b.graph.structure_holds(&b.store),
+            VectorGraph::L2(b) => b.graph.structure_holds(&b.store),
+            VectorGraph::L1(b) => b.graph.structure_holds(&b.store),
+            VectorGraph::Dot(b) => b.graph.structure_holds(&b.store),
+            VectorGraph::CosinePQ(b) => b.graph.structure_holds(&b.store),
+            VectorGraph::L2PQ(b) => b.graph.structure_holds(&b.store),
+            VectorGraph::L1PQ(b) => b.graph.structure_holds(&b.store),
+            VectorGraph::Int8(b) => b.graph.structure_holds(&b.store),
         }
     }
 
@@ -2213,3 +2252,8 @@ pub fn restore_int8_graph(
     };
     restore_with::<i8, Int8Dist>(dir, name, &expected, dist, &bounds, VectorGraph::Int8)
 }
+
+// The graph's creation budget, for a fuzzer in another crate that bounds a
+// load by what it may reserve.
+#[cfg(any(test, feature = "test-support"))]
+pub use mutable::RESERVE_BYTES;

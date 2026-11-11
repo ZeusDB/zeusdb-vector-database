@@ -41,6 +41,10 @@
 //! `cargo test -p zeusdb-vector-hnsw` compiles this crate, the engine's floor
 //! and their dependencies alone.
 #![warn(unreachable_pub)]
+// A narrowing cast in this crate's library code states its bound in an
+// `#[expect]` beside it, so a cast with no stated bound fails the lint gate,
+// and an `#[expect]` whose cast is gone fails it too. Test code is left out.
+#![cfg_attr(not(test), warn(clippy::cast_possible_truncation))]
 
 /// The block that plans an insertion's record, and then the point a test
 /// panics or pauses at once the plan is made and the index's read guard is
@@ -88,7 +92,7 @@ pub use collection::run_without_index;
 pub use flusher::Watch;
 pub use journal::{
     directory_of, journal_path, CheckpointTaken, Damage, Durability, JournalPolicy, JournalSink,
-    Recovery, Repair, JOURNAL_SUFFIX,
+    Note, Recovery, Repair, Replaced, JOURNAL_SUFFIX,
 };
 pub use rerank::{
     calibrate_rerank_from_sample, default_rerank_fetch, prepare_reconstruction, raw_distance_fn,
@@ -102,3 +106,10 @@ pub use zeusdb_vector_core::{
 };
 pub use zeusdb_vector_sparse::{SparseConfig, Unlink, Weighting};
 pub use zeusdb_vector_text::{SimpleTokenizer, TermDictionary, Tokenizer, TokenizerConfig};
+
+// The test build's allocator, which holds every request to a ceiling and a
+// fuzzer's reads to a bound. See `zeusdb_vector_core::test_support`.
+#[cfg(test)]
+#[global_allocator]
+static ALLOCATOR: zeusdb_vector_core::test_support::Bounded =
+    zeusdb_vector_core::test_support::Bounded;

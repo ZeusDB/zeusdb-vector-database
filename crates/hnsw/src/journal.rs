@@ -615,12 +615,47 @@ pub(crate) enum ReadOnlyCause {
     /// The directory holds these features, which this build does not know
     /// and its manifest marks `read_only`, in name order.
     Features(Vec<String>),
+    /// The directory records this generation, the largest a manifest can
+    /// hold, so no save can record the one after it, and the upgrade its
+    /// load takes is a save.
+    Generation(u64),
+    /// The directory holds this finite value past what the bound on a
+    /// vector's norm allows, which this build writes nowhere.
+    Bound(PastBound),
+}
+
+/// A finite value a directory holds past what the bound on a vector's norm,
+/// `NORM_BOUND`, allows: a stored vector of an index under l2, dot or l1
+/// whose norm passes it, a codebook value past 2^62, or a scale past the
+/// largest one vectors within the bound fit. A release before the bound took
+/// such vectors, and this build takes none, so a collection holding such a
+/// value is read only and no save writes it again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PastBound {
+    /// The file the value is in, by name.
+    pub(crate) file: String,
+    /// The value and its place, as the warning names them.
+    pub(crate) detail: String,
+    /// What the bound allows at that place, as the warning names it.
+    pub(crate) allowed: String,
+}
+
+impl PastBound {
+    /// The words a load's warning and every refusal of the collection give.
+    pub(crate) fn reason(&self) -> String {
+        format!(
+            "{} holds {}, past {}. This build writes no such value, so the collection is read \
+             only.",
+            self.file, self.detail, self.allowed
+        )
+    }
 }
 
 impl ReadOnlyCause {
     /// The reason the load's report and a medium's refusal name.
     pub(crate) fn reason(&self) -> String {
         match self {
+            ReadOnlyCause::Bound(past) => past.reason(),
             ReadOnlyCause::Medium(reason) => reason.clone(),
             ReadOnlyCause::Features(features) => format!(
                 "it holds the {} {}, which this build does not know and its manifest marks \
@@ -632,6 +667,9 @@ impl ReadOnlyCause {
                 },
                 quoted(features)
             ),
+            ReadOnlyCause::Generation(generation) => {
+                crate::collection::generation_exhausted(*generation)
+            }
         }
     }
 }
@@ -647,13 +685,15 @@ fn quoted(names: &[String]) -> String {
 }
 
 /// The sink a collection read only carries, read from a medium it cannot
-/// write or from a directory holding features this build does not know,
-/// marked `read_only`.
+/// write, from a directory holding features this build does not know,
+/// marked `read_only`, from a directory at the largest generation, or from a
+/// directory holding a value past the bound on a vector's norm.
 ///
 /// It takes no record, so every mutation is refused before it runs: with
 /// [`Error::CollectionReadOnly`] for a medium, naming the directory and the
-/// system's refusal, and with [`Error::FeatureReadOnly`] for features,
-/// naming the directory and the features. It names no journal, so the
+/// system's refusal, with [`Error::FeatureReadOnly`] for features, naming the
+/// directory and the features, and in the cause's own words for a
+/// generation or a value past the bound. It names no journal, so the
 /// collection reports none, and the sequence it reports is the last one the
 /// load replayed, which a save into another directory records as the
 /// sequence its state holds.
@@ -662,25 +702,34 @@ pub(crate) struct ReadOnlySink {
     directory: PathBuf,
     reason: String,
     features: Option<Vec<String>>,
+    generation: Option<u64>,
+    bound: bool,
     sequence: u64,
 }
 
 impl ReadOnlySink {
     pub(crate) fn new(directory: PathBuf, cause: ReadOnlyCause, sequence: u64) -> Self {
         let reason = cause.reason();
-        let features = match cause {
-            ReadOnlyCause::Medium(_) => None,
-            ReadOnlyCause::Features(features) => Some(features),
+        let (features, generation, bound) = match cause {
+            ReadOnlyCause::Medium(_) => (None, None, false),
+            ReadOnlyCause::Features(features) => (Some(features), None, false),
+            ReadOnlyCause::Generation(generation) => (None, Some(generation), false),
+            ReadOnlyCause::Bound(_) => (None, None, true),
         };
         ReadOnlySink {
             directory,
             reason,
             features,
+            generation,
+            bound,
             sequence,
         }
     }
 
     fn refusal(&self) -> Error {
+        if self.generation.is_some() || self.bound {
+            return Error::Engine(self.reason.clone());
+        }
         match &self.features {
             Some(features) => Error::FeatureReadOnly {
                 path: self.directory.display().to_string(),
@@ -718,6 +767,14 @@ impl OperationSink for ReadOnlySink {
 
     fn read_only_features(&self) -> Option<&[String]> {
         self.features.as_deref()
+    }
+
+    fn read_only_generation(&self) -> Option<u64> {
+        self.generation
+    }
+
+    fn read_only_bound(&self) -> bool {
+        self.bound
     }
 }
 
@@ -769,6 +826,43 @@ impl Damage {
             },
         }
     }
+}
+
+/// A value a directory records that a load of format 5.0.0 refuses, and the
+/// value the load took in its place, which the next save writes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Replaced {
+    /// The file that records the value, by name.
+    pub file: String,
+    /// The field, as the file names it.
+    pub field: String,
+    /// The value the file records.
+    pub recorded: String,
+    /// The value the load took in its place.
+    pub taken: String,
+    /// Why the recorded value was replaced and where the one taken came
+    /// from, in words.
+    pub detail: String,
+}
+
+/// One thing a load records about the directory beyond its counts, in the
+/// order the load met it. [`Recovery`] holds them in one list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Note {
+    /// A feature the directory holds that this build does not know and its
+    /// manifest marks `read_only`, which makes the collection read only.
+    ReadOnlyFeature(String),
+    /// A value the directory records that a load of format 5.0.0 refuses,
+    /// with the value the load took in its place.
+    Replaced(Replaced),
+    /// The generation the directory records, the largest a manifest can
+    /// hold, which makes a journaled one below 5.0.0 read only, since its
+    /// upgrade is a save.
+    ReadOnlyGeneration(u64),
+    /// A value the directory holds past what the bound on a vector's norm
+    /// allows, which makes the collection read only and which `read_only`
+    /// names with its file and the bound.
+    ReadOnlyBound,
 }
 
 /// What a repair set aside.
@@ -864,12 +958,17 @@ pub struct Recovery {
     /// Why the load took a checkpoint, where it took one.
     pub checkpoint_taken: Option<CheckpointTaken>,
     /// Why the collection is read only, where the medium refused the load's
-    /// first write or the directory holds features this build does not know
-    /// and its manifest marks `read_only`.
+    /// first write, the directory holds features this build does not know
+    /// and its manifest marks `read_only`, the directory records the largest
+    /// generation, or it holds a value past the bound on a vector's norm.
     pub read_only: Option<String>,
-    /// The features that make the collection read only, in name order, and
-    /// none where the medium did.
-    pub read_only_features: Vec<String>,
+    /// What the load records about the directory beyond these counts, in
+    /// the order it met each: the values it replaced, then the features, the
+    /// generation or the value past the bound that make the collection read
+    /// only. Read through [`Recovery::replaced`],
+    /// [`Recovery::read_only_features`], [`Recovery::read_only_generation`]
+    /// and [`Recovery::read_only_bound`].
+    pub notes: Vec<Note>,
     /// What a repair set aside, where the load was asked to repair and the
     /// journal was damaged.
     pub repair: Option<Repair>,
@@ -900,13 +999,64 @@ impl Recovery {
             upgraded_from: None,
             checkpoint_taken: None,
             read_only: None,
-            read_only_features: Vec::new(),
+            notes: Vec::new(),
             repair: None,
         }
     }
 
+    /// The values the directory records that a load of format 5.0.0
+    /// refuses, each with the value the load took in its place, in the order
+    /// the load met them. None where there was none.
+    pub fn replaced(&self) -> impl Iterator<Item = &Replaced> {
+        self.notes.iter().filter_map(|note| match note {
+            Note::Replaced(replaced) => Some(replaced),
+            _ => None,
+        })
+    }
+
+    /// The features that make the collection read only, in name order, and
+    /// none where the medium, the generation or a value past the bound did.
+    pub fn read_only_features(&self) -> Vec<&str> {
+        self.notes
+            .iter()
+            .filter_map(|note| match note {
+                Note::ReadOnlyFeature(feature) => Some(feature.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The generation that makes the collection read only, where the
+    /// directory records the largest a manifest can hold and its load would
+    /// upgrade it, which is a save.
+    pub fn read_only_generation(&self) -> Option<u64> {
+        self.notes.iter().find_map(|note| match note {
+            Note::ReadOnlyGeneration(generation) => Some(*generation),
+            _ => None,
+        })
+    }
+
+    /// Whether the collection is read only for a value its directory holds
+    /// past what the bound on a vector's norm allows.
+    pub fn read_only_bound(&self) -> bool {
+        self.notes
+            .iter()
+            .any(|note| matches!(note, Note::ReadOnlyBound))
+    }
+
     /// Say what happened, once, at the level each part of it earns.
     pub(crate) fn report(&self, directory: &str) {
+        for replaced in self.replaced() {
+            warn!(target: LOG_TARGET, operation = "load_replaced",
+                directory = directory,
+                file = replaced.file.as_str(),
+                field = replaced.field.as_str(),
+                recorded = replaced.recorded.as_str(),
+                taken = replaced.taken.as_str(),
+                "The directory records a value a load of format 5.0.0 refuses; the load took \
+                 another in its place, which the next save writes"
+            );
+        }
         if self.restored_from_aside {
             info!(target: LOG_TARGET, operation = "load_recover_aside",
                 directory = directory,
@@ -1013,7 +1163,33 @@ impl Recovery {
         let Some(reason) = &self.read_only else {
             return;
         };
-        if self.read_only_features.is_empty() {
+        if let Some(generation) = self.read_only_generation() {
+            warn!(target: LOG_TARGET, operation = "load_read_only",
+                directory = directory,
+                generation = generation,
+                format_version = self.format_version.as_str(),
+                replayed = self.replayed,
+                "The directory was opened read only, since it records the largest \
+                 generation a manifest can hold and its upgrade is a save; its journal \
+                 was replayed in memory, nothing on the medium changed, and every \
+                 change, checkpoint and save is refused"
+            );
+            return;
+        }
+        if self.read_only_bound() {
+            warn!(target: LOG_TARGET, operation = "load_read_only",
+                directory = directory,
+                reason = reason.as_str(),
+                format_version = self.format_version.as_str(),
+                replayed = self.replayed,
+                "The directory was opened read only, since it holds a value past the bound on \
+                 a vector's norm; nothing on the medium changed, and every change, checkpoint \
+                 and save is refused"
+            );
+            return;
+        }
+        let features = self.read_only_features();
+        if features.is_empty() {
             warn!(target: LOG_TARGET, operation = "load_read_only",
                 directory = directory,
                 reason = reason.as_str(),
@@ -1027,7 +1203,7 @@ impl Recovery {
             warn!(target: LOG_TARGET, operation = "load_read_only",
                 directory = directory,
                 reason = reason.as_str(),
-                features = self.read_only_features.join(", ").as_str(),
+                features = features.join(", ").as_str(),
                 format_version = self.format_version.as_str(),
                 replayed = self.replayed,
                 "The directory was opened read only, since it holds features this build does \
@@ -1035,6 +1211,30 @@ impl Recovery {
                  every change, save, checkpoint, journal and backup is refused"
             );
         }
+    }
+
+    /// What a caller who loaded the directory is told where the load took a
+    /// value in place of one the directory records, being the warning the
+    /// binding raises beside any other the load gives.
+    pub fn replaced_warning(&self, directory: &str) -> Option<String> {
+        let details: Vec<&str> = self
+            .replaced()
+            .map(|replaced| replaced.detail.as_str())
+            .collect();
+        if details.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "The directory {} was loaded with {} replaced: {}. The next save writes the value \
+             the load took.",
+            directory,
+            if details.len() == 1 {
+                "a value".to_string()
+            } else {
+                format!("{} values", details.len())
+            },
+            details.join("; ")
+        ))
     }
 
     /// What a caller who loaded the directory is told where the collection
@@ -1045,7 +1245,30 @@ impl Recovery {
             return None;
         }
         let reason = self.read_only.as_ref()?;
-        if !self.read_only_features.is_empty() {
+        if self.read_only_generation().is_some() {
+            return Some(format!(
+                "The directory {} was opened read only. {} It stays at format {}, and {} \
+                 records of its journal were replayed in memory. Every change, \
+                 checkpoint and save is refused in the words above.",
+                directory, reason, self.format_version, self.replayed
+            ));
+        }
+        if self.read_only_bound() {
+            let replayed = if self.journaled {
+                format!(
+                    ", and {} records of its journal were replayed in memory",
+                    self.replayed
+                )
+            } else {
+                String::new()
+            };
+            return Some(format!(
+                "The directory {} was opened read only. {} It stays at format {}{}. Every \
+                 change, checkpoint and save is refused in the words above.",
+                directory, reason, self.format_version, replayed
+            ));
+        }
+        if !self.read_only_features().is_empty() {
             let replayed = if self.journaled {
                 format!(
                     ", and {} records of its journal were replayed in memory",
@@ -1114,7 +1337,7 @@ impl Recovery {
                 "{found} {kept} {verb} set aside in {}. {done}",
                 folder.display()
             ),
-            (None, Some(reason)) if !self.read_only_features.is_empty() => format!(
+            (None, Some(reason)) if !self.read_only_features().is_empty() => format!(
                 "{found} {kept} {verb} left out of the replay. The directory was opened read \
                  only, since {}. Nothing on the medium changed, and every change, save, \
                  checkpoint, journal and backup is refused.",

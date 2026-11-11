@@ -326,6 +326,10 @@ where
                     .filter(|&&(layer, _)| layer as usize == l)
                     .count();
                 if held < self.m() {
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "a layer, below LAYERS, 16"
+                    )]
                     residue.push((l as u8, ep.node));
                 }
                 if ep.dist_to_ref < dist_to_entry {
@@ -591,6 +595,7 @@ where
         // The entry point check, which is the vendored `check_entry_point`. The
         // comparison is strict, so the first node drawn at a level keeps the
         // entry against every later node drawn at the same one.
+        #[expect(clippy::cast_possible_truncation, reason = "a level, below LAYERS, 16")]
         if level as u8 > self.entry_level() {
             self.set_entry(node, level);
         }

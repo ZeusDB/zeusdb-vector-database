@@ -724,6 +724,17 @@ pub enum Error {
     RecordRemoved { id: u32 },
     /// A count or a size a call takes, given below zero
     ArgumentNegative { name: &'static str, value: i64 },
+
+    // ------------------------------------------------------------------
+    // A vector past the bound on its norm. Appended after every variant
+    // above, and none wider than the widest above.
+    // ------------------------------------------------------------------
+    /// A query vector of an index under l2, dot or l1 whose Euclidean norm
+    /// passes [`NORM_BOUND`](crate::NORM_BOUND)
+    SearchVectorPastBound { norm: f64 },
+    /// A vector in a query batch of an index under l2, dot or l1 whose
+    /// Euclidean norm passes [`NORM_BOUND`](crate::NORM_BOUND)
+    BatchVectorPastBound { position: usize, norm: f64 },
 }
 
 impl Error {
@@ -763,11 +774,13 @@ impl Error {
             | SearchVectorEmpty
             | SearchVectorDimension { .. }
             | SearchVectorNotFinite { .. }
+            | SearchVectorPastBound { .. }
             | VectorEmpty
             | VectorDimension { .. }
             | VectorNotFinite { .. }
             | BatchVectorDimension { .. }
             | BatchVectorNotFinite { .. }
+            | BatchVectorPastBound { .. }
             | BatchArrayShape { .. }
             | BatchEmpty
             | BatchVectorEmpty { .. }
@@ -1189,6 +1202,9 @@ impl fmt::Display for Error {
                 "Search vector contains invalid value at index {}: {}",
                 index, value
             ),
+            SearchVectorPastBound { norm } => {
+                write!(f, "Search vector {}", crate::past_bound_words(*norm))
+            }
             VectorEmpty => f.write_str("Vector cannot be empty"),
             VectorDimension { expected, got } => write!(
                 f,
@@ -1217,6 +1233,12 @@ impl fmt::Display for Error {
                 f,
                 "Vector {} in batch contains invalid value at index {}: {} (must be finite)",
                 position, index, value
+            ),
+            BatchVectorPastBound { position, norm } => write!(
+                f,
+                "Vector {} in batch {}",
+                position,
+                crate::past_bound_words(*norm)
             ),
             BatchArrayShape { dim, shape } => write!(
                 f,

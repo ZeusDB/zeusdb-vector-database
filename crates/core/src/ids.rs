@@ -251,6 +251,10 @@ impl IdStore {
         let hash = self.hash(id);
         let tag = tag_of(hash);
         let mask = self.buckets.len() - 1;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a hash masked to the table, whose low bits the cast keeps by design"
+        )]
         let mut at = (hash as usize) & mask;
         loop {
             let slot = self.buckets[at];
@@ -268,6 +272,10 @@ impl IdStore {
     /// table has room, which the caller ensured.
     fn place(buckets: &mut [u32], tags: &mut [u8], slot: u32, hash: u64) {
         let mask = buckets.len() - 1;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a hash masked to the table, whose low bits the cast keeps by design"
+        )]
         let mut at = (hash as usize) & mask;
         while buckets[at] != EMPTY {
             at = (at + 1) & mask;
@@ -285,6 +293,10 @@ impl IdStore {
                 continue;
             }
             let hash = self.hash(self.text_of(entry));
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a position, below MAX_INTERNAL_ID, refused at admit and at load"
+            )]
             Self::place(&mut new_buckets, &mut new_tags, slot as u32, hash);
         }
         self.buckets = new_buckets;
@@ -311,6 +323,10 @@ impl IdStore {
             if slot == EMPTY {
                 break;
             }
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a hash masked to the table, whose low bits the cast keeps by design"
+            )]
             let ideal = (self.hash(self.text_of(self.entries[slot as usize])) as usize) & mask;
             // The entry at `next` may fill the hole at `at` unless its own
             // bucket lies cyclically in (at, next], where a probe for it
@@ -397,6 +413,10 @@ impl IdStore {
             refuse_unnamable(id, self.text.len()).is_ok(),
             "the record was held to the id's and the arena's ceilings"
         );
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a position, below MAX_INTERNAL_ID, refused at admit and at load"
+        )]
         let slot32 = slot as u32;
         if let Some(at) = self.find(id) {
             let old = self.buckets[at] as usize;
@@ -600,6 +620,10 @@ impl IdStore {
     /// write keeps the two in step; a close-up lists them first.
     pub fn held_positions(&self) -> Vec<u32> {
         let mut held = Vec::with_capacity(self.held);
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a position, below MAX_INTERNAL_ID, refused at admit and at load"
+        )]
         self.live.for_each(|slot| held.push(slot as u32));
         debug_assert!(
             held.iter().map(|&at| at as usize).eq(self.slots()),

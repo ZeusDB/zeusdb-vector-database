@@ -83,6 +83,7 @@ use super::store::VectorStore;
 use super::traverse::LAYERS;
 use super::Distance;
 use crate::checksum::{checksum_of, Checksum};
+use crate::distance::INV_NORM_BYTES;
 use crate::storage::Dir;
 use std::io::{BufReader, BufWriter, Read, Write};
 use tracing::{info, warn};
@@ -272,6 +273,24 @@ pub(crate) trait DumpElement:
     fn first_non_finite(_values: &[Self]) -> Option<f32> {
         None
     }
+    /// The first node whose row holds a NaN or an infinity, with that value,
+    /// over `values`, every row of a store end to end at `width` values a
+    /// row, for the element types that can hold one.
+    fn first_non_finite_row(_values: &[Self], _width: usize) -> Option<(usize, f32)> {
+        None
+    }
+    /// The first node whose row carries an inverse norm that is a NaN or an
+    /// infinity, with that value, over `values`, every row end to end at
+    /// `width` values a row. A row of a scalar cosine graph, `kind`
+    /// [`GraphKind::CosineInt8`], carries one in its last four bytes, and no
+    /// other row carries one.
+    fn first_non_finite_norm(
+        _values: &[Self],
+        _width: usize,
+        _kind: GraphKind,
+    ) -> Option<(usize, f32)> {
+        None
+    }
     /// Every node's row, end to end, as the rows a caller rebuilds from.
     fn into_row_values(values: Vec<Self>) -> super::RowValues;
 }
@@ -295,6 +314,22 @@ impl DumpElement for f32 {
 
     fn first_non_finite(values: &[Self]) -> Option<f32> {
         values.iter().copied().find(|value| !value.is_finite())
+    }
+
+    /// One pass over every value with no early exit, then a second pass
+    /// for the place where the first finds a value. A value is not finite
+    /// where every exponent bit is set, and only there does one added at the
+    /// exponent's lowest bit carry into the sign bit, so the sign bit of the
+    /// sums taken together says whether any value is not finite.
+    fn first_non_finite_row(values: &[Self], width: usize) -> Option<(usize, f32)> {
+        let carried = values.iter().fold(0u32, |seen, value| {
+            seen | ((value.to_bits() & 0x7f80_0000) + 0x0080_0000)
+        });
+        if carried & 0x8000_0000 == 0 {
+            return None;
+        }
+        let at = values.iter().position(|value| !value.is_finite())?;
+        Some((at / width.max(1), values[at]))
     }
 
     fn into_row_values(values: Vec<Self>) -> super::RowValues {
@@ -331,6 +366,29 @@ impl DumpElement for i8 {
 
     fn decode(bytes: &[u8]) -> Vec<Self> {
         bytes.iter().map(|&byte| byte as i8).collect()
+    }
+
+    fn first_non_finite_norm(
+        values: &[Self],
+        width: usize,
+        kind: GraphKind,
+    ) -> Option<(usize, f32)> {
+        if kind != GraphKind::CosineInt8 || width < INV_NORM_BYTES {
+            return None;
+        }
+        values
+            .chunks_exact(width)
+            .enumerate()
+            .find_map(|(node, row)| {
+                let tail = &row[width - INV_NORM_BYTES..];
+                let norm = f32::from_le_bytes([
+                    tail[0] as u8,
+                    tail[1] as u8,
+                    tail[2] as u8,
+                    tail[3] as u8,
+                ]);
+                (!norm.is_finite()).then_some((node, norm))
+            })
     }
 
     fn into_row_values(values: Vec<Self>) -> super::RowValues {
@@ -1231,6 +1289,10 @@ where
 
     // The identity region, checked against its checksum before its rules.
     let ended = |region: &str, e: std::io::Error| format!("its {} ends early: {}", region, e);
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a region's length, held to the file's length in u64 before the cast"
+    )]
     let mut identity = vec![0u8; header.identity_bytes as usize];
     hashed
         .read_hashed(&mut identity)
@@ -1281,8 +1343,9 @@ where
     let entry = point_at(&layer_counts, header.entry_node as usize)
         .expect("the entry node is below the node count the layer table sums to");
 
-    // The rows region, streamed into the store, against its checksum and,
-    // on a raw graph, against a value no record can hold.
+    // The rows region, streamed into the store, against its checksum, on a
+    // raw graph against a value no record can hold, and on a scalar cosine
+    // graph against an inverse norm no record can carry.
     let mut store = VectorStore::with_capacity(dimension, nb_point);
     let mut row = vec![0u8; dimension * T::BYTES];
     let mut non_finite: Option<(usize, f32)> = None;
@@ -1309,10 +1372,21 @@ where
             value, node, origin_ids[node]
         )));
     }
+    if let Some((node, value)) = T::first_non_finite_norm(store.values(), dimension, expected.kind)
+    {
+        return Err(DumpRefusal::rows(format!(
+            "its rows region holds {} as the inverse norm of node {}, internal id {}",
+            value, node, origin_ids[node]
+        )));
+    }
 
     // The topology region, read whole and judged on its checksum here. Its
     // structure is the caller's to check, since a failure there hands back
     // the rows rather than refusing them.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a region's length, held to the file's length in u64 before the cast"
+    )]
     let mut topology = vec![0u8; header.topology_bytes as usize];
     hashed
         .read_hashed(&mut topology)
@@ -1353,6 +1427,10 @@ fn point_at(layer_counts: &[usize], index: usize) -> Option<PointId> {
     let mut first = 0usize;
     for (layer, &count) in layer_counts.iter().enumerate() {
         if index < first + count {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a layer, below LAYERS, 16, and a rank below its layer's count, which the header's u32 node count holds"
+            )]
             return Some(PointId(layer as u8, (index - first) as i32));
         }
         first += count;
@@ -1386,6 +1464,10 @@ pub(super) fn number_nodes(
     origin_ids: &[usize],
     positions: Option<&[u32]>,
 ) -> Result<Vec<u32>, Numbering> {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a node index, below the header's node count, a u32"
+    )]
     let mut order: Vec<(usize, u32)> = origin_ids
         .iter()
         .enumerate()
@@ -1400,6 +1482,10 @@ pub(super) fn number_nodes(
     }
     let mut record_of = vec![crate::space::Position::NONE; origin_ids.len()];
     let Some(held) = positions else {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a rank, below the header's node count, a u32"
+        )]
         for (rank, &(_, node)) in order.iter().enumerate() {
             record_of[node as usize] = rank as u32;
         }
@@ -1413,6 +1499,10 @@ pub(super) fn number_nodes(
         if (id as usize) < origin {
             return Err(Numbering::Unplaced(id));
         }
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a position, below the header's node count, a u32"
+        )]
         if id as usize == origin {
             record_of[node as usize] = next as u32;
             next += 1;

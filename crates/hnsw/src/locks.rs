@@ -120,6 +120,10 @@ pub mod order {
     /// The guard over a space's index, being the graph of a dense space and
     /// the postings of a sparse one, for the space at `space` in the
     /// declaration.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a space's index, below MAX_SPACES, 4"
+    )]
     pub const fn space_index(space: usize) -> u8 {
         SPACE_BASE + (space as u8) * SPACE_STRIDE
     }
@@ -129,6 +133,7 @@ pub mod order {
         space_index(space) + 1
     }
 
+    #[expect(clippy::cast_possible_truncation, reason = "MAX_SPACES, 4")]
     const AFTER_SPACES: u8 = SPACE_BASE + (MAX_SPACES as u8) * SPACE_STRIDE;
     pub const VECTOR_METADATA: u8 = AFTER_SPACES;
     pub const COLUMNS: u8 = AFTER_SPACES + 1;
@@ -140,6 +145,10 @@ pub mod order {
     const LEAF_BASE: u8 = AFTER_SPACES + 6;
 
     /// A leaf. The rerank calibration of the dense space at `space`.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a space's index, below MAX_SPACES, 4"
+    )]
     pub const fn space_calibration(space: usize) -> u8 {
         LEAF_BASE + (space as u8) * 2
     }
@@ -149,6 +158,7 @@ pub mod order {
         space_calibration(space) + 1
     }
 
+    #[expect(clippy::cast_possible_truncation, reason = "MAX_SPACES, 4")]
     const AFTER_LEAVES: u8 = LEAF_BASE + (MAX_SPACES as u8) * 2;
     /// A leaf.
     pub const CREATED_AT: u8 = AFTER_LEAVES;

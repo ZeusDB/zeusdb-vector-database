@@ -255,6 +255,9 @@ impl PQ {
             sdc: Self::compute_sdc_table(&centroids, self.num_centroids),
             norms: Self::compute_centroid_norms(&centroids),
         };
+        if let Some(refusal) = Self::table_refusal(&derived, self.num_centroids) {
+            return Err(refusal);
+        }
 
         {
             let mut guard = self.centroids.write().unwrap();
@@ -266,6 +269,70 @@ impl PQ {
         }
 
         Ok(())
+    }
+
+    /// The words that refuse a codebook whose tables hold a value that is
+    /// not finite, naming the first: a squared norm before a squared distance
+    /// between two centroids of a subvector. Each table takes one pass with no
+    /// early exit, and a second finds the place only where the first finds a
+    /// value.
+    fn table_refusal(derived: &Derived, k: usize) -> Option<String> {
+        let finite = |table: &[f32]| {
+            table
+                .iter()
+                .fold(true, |all, value| all & value.is_finite())
+        };
+        if !finite(&derived.norms) {
+            let at = derived.norms.iter().position(|value| !value.is_finite())?;
+            return Some(format!(
+                "the codebook's centroid {} of subvector {} has a squared norm of {}, and every \
+                 squared norm is finite",
+                at % k,
+                at / k,
+                derived.norms[at]
+            ));
+        }
+        if !finite(&derived.sdc) {
+            let plane = Self::sdc_plane(k);
+            let at = derived.sdc.iter().position(|value| !value.is_finite())?;
+            let (subvector, mut offset) = (at / plane, at % plane);
+            for i in 0..k {
+                let row = k - i - 1;
+                if offset < row {
+                    return Some(format!(
+                        "the codebook's centroids {} and {} of subvector {} are a squared \
+                         distance of {} apart, and every squared distance between two centroids \
+                         is finite",
+                        i,
+                        i + 1 + offset,
+                        subvector,
+                        derived.sdc[at]
+                    ));
+                }
+                offset -= row;
+            }
+        }
+        None
+    }
+
+    /// The first codebook value past 2^62, being
+    /// [`NORM_BOUND`](crate::NORM_BOUND), as (subvector, centroid, value's
+    /// place, value). `None` for every codebook vectors within the bound
+    /// fit: a centroid's value is the mean of that value over the vectors of
+    /// its cluster, or one vector's own value, and every value of a vector
+    /// within the bound is at most its norm.
+    pub fn first_value_past_bound(&self) -> Option<(usize, usize, usize, f32)> {
+        let bound = crate::distance::NORM_BOUND_F32;
+        self.with_centroids(|centroids| {
+            centroids.iter().enumerate().find_map(|(s, sub)| {
+                sub.iter().enumerate().find_map(|(c, centroid)| {
+                    centroid
+                        .iter()
+                        .position(|value| value.abs() > bound)
+                        .map(|p| (s, c, p, centroid[p]))
+                })
+            })
+        })
     }
 
     /// Entries one subvector's plane of the symmetric distance table holds
@@ -608,6 +675,10 @@ impl PQ {
         let centroids = self.centroids.read().unwrap();
         let mut codes = vec![0u8; self.subvectors];
 
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a centroid's index, below 2^bits, at most 256"
+        )]
         for s in 0..self.subvectors {
             let start_idx = s * self.sub_dim;
             let end_idx = start_idx + self.sub_dim;
@@ -661,6 +732,10 @@ impl PQ {
             .map(|vector| {
                 let mut codes = vec![0u8; self.subvectors];
 
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "a centroid's index, below 2^bits, at most 256"
+                )]
                 for s in 0..self.subvectors {
                     let start_idx = s * self.sub_dim;
                     let end_idx = start_idx + self.sub_dim;
@@ -978,6 +1053,7 @@ impl PQ {
             } else {
                 let mut cumulative = 0.0;
                 let target = rng.random::<f32>() * total_distance;
+                let chosen = centroids.len();
 
                 for (idx, &distance) in distances.iter().enumerate() {
                     cumulative += distance;
@@ -985,6 +1061,23 @@ impl PQ {
                         centroids.push(data[idx].clone());
                         break;
                     }
+                }
+
+                // A draw of zero against a sum that overflowed makes the target
+                // a NaN, which no cumulative sum meets. The centroid is then the
+                // point where the running sum first overflows, which is where an
+                // infinite target is met. The loop above meets every target a
+                // finite sum makes, so this runs for no other draw.
+                if centroids.len() == chosen {
+                    let mut running = 0.0f32;
+                    let at = distances
+                        .iter()
+                        .position(|&distance| {
+                            running += distance;
+                            !running.is_finite()
+                        })
+                        .unwrap_or(distances.len() - 1);
+                    centroids.push(data[at].clone());
                 }
             }
         }
@@ -1386,5 +1479,103 @@ mod tests {
         assert_eq!(pq.code_norm_sq(&[1]), 4.0);
         // And the symmetric table moved with it.
         assert_eq!(pq.symmetric_distance(&[0], &[1]), 36.0 + 36.0);
+    }
+
+    /// A codebook whose squared norm or squared distance between two
+    /// centroids overflows, every value of it finite, is refused naming the
+    /// place, and the codebook installed before it stays with its tables.
+    #[test]
+    fn a_codebook_whose_tables_overflow_is_refused_naming_the_place() {
+        let pq = PQ::new(4, 2, 1, 2, None);
+        let held = vec![
+            vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+            vec![vec![2.0, 0.0], vec![0.0, 2.0]],
+        ];
+        pq.set_centroids(held.clone()).expect("codebook installs");
+
+        // 1.5e19 twice is a squared norm of 4.5e38, past the largest f32.
+        let norm = vec![
+            vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+            vec![vec![2.0, 0.0], vec![1.5e19, 1.5e19]],
+        ];
+        assert_eq!(
+            pq.set_centroids(norm).unwrap_err(),
+            "the codebook's centroid 1 of subvector 1 has a squared norm of inf, and every \
+             squared norm is finite"
+        );
+        // 1.2e19 either side of zero is 2.4e19 apart, a square of 5.76e38.
+        let distance = vec![
+            vec![vec![1.2e19, 0.0], vec![-1.2e19, 0.0]],
+            vec![vec![2.0, 0.0], vec![0.0, 2.0]],
+        ];
+        assert_eq!(
+            pq.set_centroids(distance).unwrap_err(),
+            "the codebook's centroids 0 and 1 of subvector 0 are a squared distance of inf \
+             apart, and every squared distance between two centroids is finite"
+        );
+        pq.with_centroids(|centroids| assert_eq!(centroids, &held));
+        assert_eq!(pq.code_norm_sq(&[0, 1]), 1.0 + 4.0);
+    }
+
+    /// `first_value_past_bound` names the first value whose magnitude passes
+    /// 2^62, by subvector, centroid and place, and none at 2^62 itself.
+    #[test]
+    fn the_first_codebook_value_past_the_bound_is_named() {
+        let at = f32::from_bits(0x5E80_0000);
+        let past = f32::from_bits(0x5E80_0001);
+        let pq = PQ::new(4, 2, 1, 2, None);
+        pq.set_centroids(vec![
+            vec![vec![at, 0.0], vec![0.0, -at]],
+            vec![vec![2.0, 0.0], vec![0.0, 2.0]],
+        ])
+        .unwrap();
+        assert_eq!(pq.first_value_past_bound(), None);
+        pq.set_centroids(vec![
+            vec![vec![at, 0.0], vec![0.0, -at]],
+            vec![vec![2.0, 0.0], vec![0.0, -past]],
+        ])
+        .unwrap();
+        assert_eq!(pq.first_value_past_bound(), Some((1, 1, 1, -past)));
+    }
+
+    /// A generator whose every word is zero, so every draw in `[0, 1)` is
+    /// zero and every draw from a range is its first value.
+    struct Zeros;
+
+    impl rand::TryRng for Zeros {
+        type Error = std::convert::Infallible;
+
+        fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+            Ok(0)
+        }
+
+        fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+            Ok(0)
+        }
+
+        fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
+            dst.fill(0);
+            Ok(())
+        }
+    }
+
+    /// k-means++ seeds every centroid it is asked for where its draw is zero
+    /// and the sum of the squared distances overflows, which makes its target
+    /// a NaN. The points are one value each, 2^62 either side of zero, every
+    /// one a vector within the bound, and four of them at 2^126 from the first
+    /// centroid sum to 2^128, past the largest f32.
+    #[test]
+    fn kmeans_plus_plus_seeds_every_centroid_where_its_target_is_not_a_number() {
+        let at = f32::from_bits(0x5E80_0000);
+        let data: Vec<Vec<f32>> = (0..8)
+            .map(|i| vec![if i % 2 == 0 { at } else { -at }])
+            .collect();
+        let pq = PQ::new(1, 1, 2, 8, None);
+        let seeded = pq
+            .kmeans_plus_plus_init(&data, 4, &mut Zeros)
+            .expect("k-means++ seeds");
+        assert_eq!(seeded.len(), 4);
+        assert_eq!(seeded[0], vec![at]);
+        assert_eq!(seeded[1], vec![-at]);
     }
 }

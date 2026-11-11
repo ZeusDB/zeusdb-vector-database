@@ -389,6 +389,17 @@ impl HNSWIndex {
             None => None,
         };
         dict.set_item("repair", repair)?;
+        let replaced = PyList::empty(py);
+        for value in recovery.replaced() {
+            let entry = PyDict::new(py);
+            entry.set_item("file", &value.file)?;
+            entry.set_item("field", &value.field)?;
+            entry.set_item("recorded", &value.recorded)?;
+            entry.set_item("taken", &value.taken)?;
+            entry.set_item("detail", &value.detail)?;
+            replaced.append(entry)?;
+        }
+        dict.set_item("replaced", replaced)?;
         Ok(dict.into())
     }
 
@@ -594,6 +605,13 @@ impl HNSWIndex {
     /// the engine's rules on the vector, and an exception the tokenizer
     /// raised, which is named with its class in the record's error.
     ///
+    /// Under `l2`, `dot` or `l1` a record whose vector has a Euclidean norm
+    /// past 2^62 is counted and named the same way, with its norm and the
+    /// bound, so no distance the index takes overflows. Under `cosine` no
+    /// vector is held to that bound, and one whose squares overflow or
+    /// underflow a float32 is normalized in float64 and stored at unit
+    /// length.
+    ///
     /// Every shape reads a record's metadata entry the same way. A mapping
     /// is the record's metadata, a string is kept under `text`, any other
     /// value is kept under `value`, and `None` is no metadata. A record
@@ -767,6 +785,8 @@ impl HNSWIndex {
     /// or a batch, as a list of lists or a two dimensional array. An empty
     /// list, tuple or one dimensional array raises `ValueError` as an empty
     /// search vector, and a two dimensional array with no rows as an empty
+    /// batch. Under `l2`, `dot` or `l1` a query whose Euclidean norm passes
+    /// 2^62 raises `ValueError` naming its norm and the bound, alone or in a
     /// batch. `top_k`, `ef_search` and `rerank` are Python integers, and a
     /// negative one raises `ValueError` naming it.
     // The argument list is the Python signature, so it is not free to be
@@ -864,6 +884,7 @@ impl HNSWIndex {
                 Self::validate_batch_array_shape(shape, dim)?;
 
                 let flat = readonly.as_slice()?;
+                #[expect(clippy::cast_possible_truncation, reason = "a value narrowed to the f32 the index stores, not an offset, a count, an index or an id")]
                 let batch: Vec<Vec<f32>> = flat
                     .chunks(dim)
                     .map(|chunk| chunk.iter().map(|&value| value as f32).collect())
@@ -930,6 +951,7 @@ impl HNSWIndex {
                 // is what NumPy hands back by default, was read one Python float at
                 // a time. Measured on a one record index at dimension 1,536 that
                 // was 84.41 microseconds a query against 8.43 for `float32`.
+                #[expect(clippy::cast_possible_truncation, reason = "a value narrowed to the f32 the index stores, not an offset, a count, an index or an id")]
                 let query_vector = if let Ok(array1d) = vector.cast::<PyArray1<f32>>() {
                     array1d.readonly().as_slice()?.to_vec()
                 } else if let Ok(array1d) = vector.cast::<PyArray1<f64>>() {
@@ -1367,9 +1389,12 @@ impl HNSWIndex {
     /// - `checkpoint_taken`: why the load took a checkpoint, `"upgrade"`,
     ///   `"abort"` or `"repair"`, or `None`.
     /// - `read_only`, `read_only_reason`: whether the index was opened read
-    ///   only, and why: the system's refusal, or the features the directory
+    ///   only, and why: the system's refusal, the features the directory
     ///   holds that this build does not know and its manifest marks
-    ///   `read_only`.
+    ///   `read_only`, the largest generation a journaled directory below
+    ///   format 5.0.0 records, or a value the directory holds past the bound
+    ///   on a vector's norm with its file and the bound, the last two in the
+    ///   words every save of it is refused in.
     /// - `repair`: where a load with `repair=True` cut the journal or set a
     ///   stale segment aside, a dict of `kept_through`, `discarded_from`,
     ///   `records_discarded`, `bytes_discarded` and `quarantine`, being the
@@ -1378,6 +1403,12 @@ impl HNSWIndex {
     ///   and the bytes set aside, and the folder they were copied into, or
     ///   `None` where the medium refused the write. `None` where no repair set
     ///   anything aside.
+    /// - `replaced`: each value the directory records that a load of format
+    ///   5.0.0 refuses and the load took another in place of, as a dict of
+    ///   `file`, `field`, `recorded`, `taken` and `detail`, being the file,
+    ///   the field, the value the file records, the value the load took and
+    ///   why, in the order the load met them. The next save writes `taken`.
+    ///   Empty where the load replaced nothing.
     #[getter]
     pub fn recovery(&self, py: Python<'_>) -> Result<Option<Py<PyAny>>, PyEngineError> {
         self.held("recovery", |_| {

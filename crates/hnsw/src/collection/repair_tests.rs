@@ -656,3 +656,284 @@ fn a_repaired_collection_holds_its_directory_exclusive() {
         assert_eq!(ids(&again), kept_ids(calls), "damaged {damaged}");
     }
 }
+
+/// A journaled directory whose fourth call holds records with a sparse half,
+/// committed by a live collection whose install of that call panicked, so
+/// its journal holds the four calls and the collection stopped. The three
+/// calls before it hold records with no sparse half. Returns the sequence of
+/// the fourth call's first record.
+fn journaled_with_a_panicked_call(path: &Path) -> u64 {
+    use super::SparseHalf;
+    use zeusdb_vector_core::{panic_arm, PanicPoint, SparseVector};
+    let declaration = Declaration::validate(DIM, "l2", 8, 50, 200, vec![])
+        .unwrap()
+        .with_sparse("terms", zeusdb_vector_sparse::SparseConfig::default())
+        .unwrap();
+    let collection = Collection::build(declaration, None);
+    collection
+        .journal_to(path.to_str().unwrap(), Durability::PerCall)
+        .unwrap();
+    for call in 0..3 {
+        let first = DAMAGED_CALL_RECORDS * call;
+        let batch = (first..first + DAMAGED_CALL_RECORDS).map(record).collect();
+        let added = collection
+            .run("add()", || {
+                Ok::<_, Error>(collection.add_records(batch, vec![], false))
+            })
+            .unwrap();
+        assert_eq!(added.total_errors, 0, "{:?}", added.errors);
+    }
+    let first = DAMAGED_CALL_RECORDS * 3;
+    let batch: Vec<ParsedRecord> = (first..first + DAMAGED_CALL_RECORDS)
+        .map(|i| {
+            let mut record = record(i);
+            record.sparse = Some(SparseHalf::Vector(SparseVector {
+                dims: vec![1 + i as u32],
+                values: vec![1.0],
+            }));
+            record
+        })
+        .collect();
+    panic_arm(PanicPoint::InstallBeforeSparse);
+    let stopped = collection.run("add()", || {
+        Ok::<_, Error>(collection.add_records(batch, vec![], false))
+    });
+    assert!(
+        matches!(stopped, Err(Error::Panicked { stopped: true, .. })),
+        "the install of the fourth call panicked and stopped the collection: {stopped:?}"
+    );
+    drop(collection);
+    1 + 4 * 3
+}
+
+/// A committed call whose install panics where the replay applies it is a
+/// record that will not apply. A plain load refuses it, naming the record
+/// and the panic, and opens nothing. A repair reads the checkpoint again,
+/// replays every call before that call, cuts at the call's first record and
+/// sets that call aside, and the directory opens plainly from then on.
+#[test]
+fn a_call_whose_install_panics_at_the_replay_is_cut_with_its_call() {
+    use super::run_without_index;
+    use zeusdb_vector_core::{panic_arm, PanicPoint};
+    let tmp = TempDir::new("repair-panic");
+    let path = tmp.at("index.zdb");
+    let first = journaled_with_a_panicked_call(&path);
+    let cause = "a panic injected at install:before_sparse";
+
+    panic_arm(PanicPoint::InstallBeforeSparse);
+    match run_without_index("load()", || plain(&path)) {
+        Err(Error::JournalReplayFailed {
+            sequence, detail, ..
+        }) => {
+            assert_eq!(
+                sequence, first,
+                "the refusal names the record that panicked"
+            );
+            assert!(detail.contains(cause), "{detail}");
+        }
+        Err(other) => panic!("a plain load refused with {other:?}"),
+        Ok(_) => panic!("a plain load opened the directory"),
+    }
+
+    panic_arm(PanicPoint::InstallBeforeSparse);
+    let (repaired, report) = match run_without_index("load()", || repair(&path)) {
+        Ok(opened) => opened,
+        Err(other) => panic!("a repair refused with {other:?}"),
+    };
+    assert_eq!(
+        ids(&repaired),
+        kept_ids(3),
+        "none of the fourth call is held"
+    );
+    let damage = report.damage.clone().unwrap();
+    assert_eq!(damage.kind, "apply");
+    assert_eq!(damage.sequence, first);
+    assert!(damage.detail.as_deref().unwrap_or("").contains(cause));
+    let cut = report.repair.clone().unwrap();
+    assert_eq!(cut.discarded_from, Some(first));
+    assert_eq!(cut.kept_through, first - 1);
+    assert_eq!(cut.records_discarded, DAMAGED_CALL_RECORDS as u64);
+    assert_eq!(report.replayed, 9, "the calls before the cut, applied once");
+    assert_eq!(report.checkpoint_taken, Some(CheckpointTaken::Repair));
+    let (_, folders, unsealed) = quarantine_of(&path);
+    assert_eq!(folders.len(), 1);
+    assert!(folders[0].ends_with(&format!("-{first}")), "{}", folders[0]);
+    assert!(!unsealed, "the repair's marker is gone");
+    let warning = report.repair_warning("index.zdb").unwrap();
+    assert!(warning.contains(&format!("record {first}")), "{warning}");
+    drop(repaired);
+
+    let (again, again_report) = plain(&path).unwrap();
+    assert_eq!(ids(&again), kept_ids(3));
+    assert_eq!(again_report.damage, None);
+    drop(again);
+    let checkpoint = Collection::load_checkpoint_only(path.to_str().unwrap(), None).unwrap();
+    assert_eq!(
+        ids(&checkpoint),
+        kept_ids(3),
+        "the repair's checkpoint holds the kept calls"
+    );
+}
+
+/// A committed record whose install panics where the upgrade replays a
+/// journal of format version 1 is a record that will not apply. A plain load
+/// refuses it, naming the record and the panic, and leaves the directory as
+/// it was. A repair keeps every record before it, since version 1 frames no
+/// call, sets the bytes from it on aside in the quarantine of the new
+/// journal's directory, and the upgrade's checkpoint seals the repair.
+#[test]
+fn a_version_1_record_whose_install_panics_at_the_upgrade_is_cut() {
+    use super::run_without_index;
+    use zeusdb_vector_core::{panic_arm, PanicPoint};
+    let tmp = TempDir::new("repair-legacy-panic");
+    let path = copy_fixture("v4.0.0-journaled-text", &tmp.0);
+    let storage = FsStorage::at(&path).unwrap();
+    let wal = storage.legacy_journal_path().to_path_buf();
+    let bytes = std::fs::read(&wal).unwrap();
+    let checkpoint = manifest(&path)["journal"]["sequence"].as_u64().unwrap();
+    let cause = "a panic injected at install:before_sparse";
+
+    // The records before the first insert that carries a sparse half, which
+    // is where the armed point fires, applied by hand onto the checkpoint.
+    let copy = tmp.at("expected.zdb");
+    super::journal_support::copy_tree(&path, &copy);
+    let (built, _) =
+        Collection::recover_with(copy.to_str().unwrap(), None, JournalPolicy::CheckpointOnly)
+            .unwrap();
+    let contents = read_legacy_journal(&bytes, "w").unwrap();
+    let mut damaged = None;
+    for record in contents
+        .records
+        .iter()
+        .filter(|record| record.sequence > checkpoint)
+    {
+        let operation = Operation::decode_legacy(record, built.dim(), "w").unwrap();
+        if matches!(
+            operation,
+            Operation::Insert {
+                sparse: Some(_),
+                ..
+            }
+        ) {
+            damaged = Some((record.sequence, record.offset as usize));
+            break;
+        }
+        built.apply_legacy(operation).unwrap();
+    }
+    let (damaged, at) = damaged.expect("the fixture's journal holds an insert with terms");
+    let expected = ids(&built);
+    drop(built);
+
+    panic_arm(PanicPoint::InstallBeforeSparse);
+    match run_without_index("load()", || plain(&path)) {
+        Err(Error::JournalReplayFailed {
+            sequence, detail, ..
+        }) => {
+            assert_eq!(
+                sequence, damaged,
+                "the refusal names the record that panicked"
+            );
+            assert!(detail.contains(cause), "{detail}");
+        }
+        Err(other) => panic!("a plain load refused with {other:?}"),
+        Ok(_) => panic!("a plain load opened the directory"),
+    }
+    assert_eq!(
+        manifest(&path)["format_version"],
+        json!("4.0.0"),
+        "a refused load leaves the directory as it was"
+    );
+    assert!(wal.exists());
+
+    panic_arm(PanicPoint::InstallBeforeSparse);
+    let (repaired, report) = match run_without_index("load()", || repair(&path)) {
+        Ok(opened) => opened,
+        Err(other) => panic!("a repair refused with {other:?}"),
+    };
+    assert_eq!(ids(&repaired), expected);
+    assert_eq!(report.upgraded_from.as_deref(), Some("4.0.0"));
+    assert_eq!(report.checkpoint_taken, Some(CheckpointTaken::Repair));
+    let damage = report.damage.clone().unwrap();
+    assert_eq!(damage.kind, "apply");
+    assert_eq!(damage.sequence, damaged);
+    assert!(damage.detail.as_deref().unwrap_or("").contains(cause));
+    let cut = report.repair.clone().unwrap();
+    assert_eq!(cut.discarded_from, Some(damaged));
+    assert_eq!(cut.bytes_discarded, (bytes.len() - at) as u64);
+    drop(repaired);
+    assert_eq!(manifest(&path)["format_version"], json!("5.0.0"));
+    assert!(!wal.exists(), "the file goes once the upgrade commits");
+    let (_, folders, unsealed) = quarantine_of(&path);
+    assert_eq!(folders.len(), 1);
+    assert!(!unsealed, "the repair's marker is gone");
+    let (again, again_report) = plain(&path).unwrap();
+    assert_eq!(ids(&again), expected);
+    assert_eq!(again_report.damage, None);
+}
+
+/// A repair names a record that will not apply in that record's own words,
+/// being what refused it, in its report, its warning and the quarantine's
+/// `repair.json`, without the words of a plain load's refusal around them.
+#[test]
+fn a_repair_names_a_record_that_will_not_apply_in_its_own_words() {
+    let tmp = TempDir::new("repair-apply-words");
+    let path = tmp.at("index.zdb");
+    journaled(&path, 6);
+    // The fourth call's third record names an internal id seven above the
+    // one the collection would issue, under a checksum that holds.
+    let sequence = 1 + 4 * 3 + 2;
+    let segments = Segments::of(&path);
+    let contents = segments.read(&expected_of(&path)).unwrap();
+    let live = contents
+        .records
+        .iter()
+        .find(|live| live.record.sequence == sequence)
+        .unwrap();
+    let (internal_id, level) = match Operation::decode(&live.record, DIM, "").unwrap() {
+        Operation::Insert {
+            internal_id, level, ..
+        } => (internal_id, level),
+        other => panic!("{other:?}"),
+    };
+    let mut payload = live.record.payload.to_vec();
+    Operation::stamp_insert(&mut payload, internal_id + 7, level);
+    let mut out = Vec::new();
+    encode_journal_record(sequence, live.record.kind, &payload, &mut out);
+    let at = live.record.offset as usize;
+    let mut bytes = segments.bytes[0].clone();
+    bytes[at..at + out.len()].copy_from_slice(&out);
+    std::fs::write(
+        journal_path(&path)
+            .unwrap()
+            .join(format!("{:020}.zdbseg", segments.numbers[0])),
+        &bytes,
+    )
+    .unwrap();
+
+    let words = format!(
+        "The journal and the checkpoint do not belong together: the record names internal id \
+         {} and the collection would issue {}.",
+        internal_id + 7,
+        internal_id
+    );
+    let (repaired, report) = repair(&path).unwrap();
+    assert_eq!(
+        report.damage.as_ref().unwrap().detail.as_deref(),
+        Some(words.as_str())
+    );
+    let warning = report.repair_warning("index.zdb").unwrap();
+    assert!(
+        warning.contains(&format!("(apply, at record {sequence}: {words})")),
+        "{warning}"
+    );
+    drop(repaired);
+    let (_, folders, _) = quarantine_of(&path);
+    let folder = journal_path(&path)
+        .unwrap()
+        .join("quarantine")
+        .join(&folders[0]);
+    let written: Value =
+        serde_json::from_str(&std::fs::read_to_string(folder.join("repair.json")).unwrap())
+            .unwrap();
+    assert_eq!(written["damage"]["detail"], json!(words));
+}

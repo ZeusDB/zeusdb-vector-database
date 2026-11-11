@@ -445,6 +445,26 @@ where
         store.append(T::decode(&values_raw));
     }
     read_trailer(hashed)?;
+    // A value no record can hold, being a raw value or a scalar cosine row's
+    // inverse norm that is not finite, refuses the dump once its checksum
+    // holds, so the caller rebuilds from the directory's own store.
+    if let Some((node, value)) = T::first_non_finite_row(store.values(), dimension) {
+        return Err(format!(
+            "its vectors hold {} in the row of node {}, internal id {}",
+            value,
+            node,
+            graph.origin_ids()[node]
+        ));
+    }
+    if let Some((node, value)) = T::first_non_finite_norm(store.values(), dimension, expected.kind)
+    {
+        return Err(format!(
+            "its vectors hold {} as the inverse norm of node {}, internal id {}",
+            value,
+            node,
+            graph.origin_ids()[node]
+        ));
+    }
 
     let restored = graph.nb_points();
     if restored != nb_point {
@@ -902,8 +922,16 @@ where
         origin_ids,
         record_of,
         region,
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the entry's layer, which the reader refuses at or past the dump's layer count, at most 16"
+        )]
         entry: PointId(header.entry_layer as u8, header.entry_rank as i32),
         m: expected.m,
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "ef_construction, which the reader holds to the value config.json records"
+        )]
         ef_construction: header.ef_construction as usize,
         level_scale: header.level_scale,
         nb_point,
@@ -1084,6 +1112,7 @@ impl AdjacencyWalk<'_> {
                 let (target_layer, target_rank, distance) = entry_at(self.region, self.at);
                 self.at += EDGE_BYTES;
                 list.push(LoadedEdge {
+                    #[expect(clippy::cast_possible_truncation, reason = "an edge's layer, read from one byte, and its rank, which edge_target refuses where it turns negative or passes its layer")]
                     target: PointId(target_layer as u8, target_rank as i32),
                     distance,
                 });

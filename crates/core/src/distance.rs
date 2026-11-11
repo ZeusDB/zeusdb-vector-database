@@ -731,6 +731,92 @@ pub(crate) fn cosine_normalized(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
+/// The largest Euclidean norm, 2^62, of a vector an index under `l2`, `dot`
+/// or `l1` takes, and of a query such an index searches for.
+///
+/// Within it every value those metrics compute in `f32` from vectors within
+/// it stays finite: a squared distance is at most 2^126, a dot product at
+/// most 2^124, an `l1` distance at most 2^71 at the widest dimension, the sum
+/// a k-means step takes over a cluster of fewer than 2^24 members at most
+/// 2^86, and 254 times a scale the scalar codec trains at most 2^63. A cosine
+/// index normalizes every vector, so the bound does not apply to it.
+pub const NORM_BOUND: f64 = 4_611_686_018_427_387_904.0;
+
+/// [`NORM_BOUND`] in `f32`, where 2^62 is exact, which bounds every value of
+/// a vector within it and so every value a codebook or a scalar codec fitted
+/// to such vectors holds.
+pub(crate) const NORM_BOUND_F32: f32 = f32::from_bits(0x5E80_0000);
+
+/// 2^123, the sum of squares in `f32` at or below which [`screen`] admits a
+/// vector of up to [`SCREEN_WIDTH`] values in one pass.
+const SQUARES_WITHIN: f32 = f32::from_bits(0x7D00_0000);
+
+/// The widest vector [`screen`] admits in one pass. Over this many values the
+/// rounding of a sum of squares in `f32`, taken in eight lanes, is below one
+/// part in 2^10, so a sum at most [`SQUARES_WITHIN`] is a sum below 2^124 in
+/// `f64` as well, being a norm below [`NORM_BOUND`].
+const SCREEN_WIDTH: usize = 1 << 16;
+
+/// What [`screen`] finds in the values of a vector.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Screen {
+    /// Every value is finite, and the Euclidean norm is within
+    /// [`NORM_BOUND`] where the bound applies.
+    Admitted,
+    /// The first value that is not finite, and its position.
+    NotFinite { index: usize, value: f32 },
+    /// The Euclidean norm, taken in `f64`, past [`NORM_BOUND`].
+    PastBound { norm: f64 },
+}
+
+/// Hold every value of `values` finite and, where `bounded`, its Euclidean
+/// norm, taken in `f64`, to [`NORM_BOUND`].
+///
+/// One pass takes the sum of squares in `f32` with the dot kernel. A sum at
+/// most 2^123 admits the vector: every value is finite and the norm is within
+/// the bound. A NaN, an infinity and a sum past 2^123 take a second pass,
+/// which finds the first value that is not finite, and then, where
+/// `bounded`, takes the norm in `f64`, where the square of every `f32` is
+/// exact.
+pub fn screen(values: &[f32], bounded: bool) -> Screen {
+    if values.len() <= SCREEN_WIDTH && dot(values, values) <= SQUARES_WITHIN {
+        return Screen::Admitted;
+    }
+    if let Some((index, &value)) = values
+        .iter()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Screen::NotFinite { index, value };
+    }
+    if bounded {
+        let norm = norm_f64(values);
+        if norm > NORM_BOUND {
+            return Screen::PastBound { norm };
+        }
+    }
+    Screen::Admitted
+}
+
+/// The Euclidean norm of `values`, taken in `f64`, where the square of every
+/// `f32` is exact and no sum of them overflows.
+pub fn norm_f64(values: &[f32]) -> f64 {
+    values
+        .iter()
+        .map(|&value| f64::from(value) * f64::from(value))
+        .sum::<f64>()
+        .sqrt()
+}
+
+/// What a refusal for a norm past [`NORM_BOUND`] says after it names the
+/// vector, in the form of the refusal of a value that is not finite.
+pub fn past_bound_words(norm: f64) -> String {
+    format!(
+        "has a Euclidean norm of {:e} (must be at most 2^62, {:e}, under l2, dot or l1)",
+        norm, NORM_BOUND
+    )
+}
+
 /// Cosine distance on vectors that are already unit length.
 ///
 /// # The precondition
@@ -1120,7 +1206,7 @@ impl Int8Dist {
 }
 
 /// Bytes a cosine row carries after its codes, being one `f32`.
-const INV_NORM_BYTES: usize = 4;
+pub(crate) const INV_NORM_BYTES: usize = 4;
 
 impl Distance<i8> for Int8Dist {
     #[inline]
@@ -2881,6 +2967,114 @@ mod tests {
         // A zero query has no direction either.
         let _lut2 = dist.install_query_lut(&[0.0f32; 4]).expect("query lut");
         assert_eq!(dist.eval(&[0u8; 2], &[1, 1]), 1.0);
+    }
+
+    /// 2^62 as an `f32`, and the next `f32` above it.
+    const AT_BOUND: f32 = f32::from_bits(0x5E80_0000);
+    const PAST_BOUND: f32 = f32::from_bits(0x5E80_0001);
+
+    /// The screen admits a vector whose norm is the bound and refuses the
+    /// next `f32` above it, refuses two values each below the bound whose
+    /// norm passes it, takes the norm in `f64` past the range of an `f32`
+    /// square, finds the first value that is not finite, holds nothing to the
+    /// bound where `bounded` is false, and takes the exact path past
+    /// `SCREEN_WIDTH`.
+    #[test]
+    fn the_screen_holds_a_vector_to_the_bound_on_its_norm() {
+        assert_eq!(f64::from(AT_BOUND), NORM_BOUND);
+        assert_eq!(f64::from(NORM_BOUND_F32), NORM_BOUND);
+        assert_eq!(screen(&[AT_BOUND, 0.0, 0.0], true), Screen::Admitted);
+        assert_eq!(screen(&[0.0, -AT_BOUND], true), Screen::Admitted);
+        assert_eq!(
+            screen(&[PAST_BOUND, 0.0], true),
+            Screen::PastBound {
+                norm: f64::from(PAST_BOUND)
+            }
+        );
+        // 1.5 * 2^61 twice is a norm of about 1.06 * 2^62.
+        let three_quarters = f32::from_bits(0x5E40_0000);
+        assert!(matches!(
+            screen(&[three_quarters, three_quarters], true),
+            Screen::PastBound { norm } if norm > NORM_BOUND
+        ));
+        assert_eq!(
+            screen(&[three_quarters, three_quarters], false),
+            Screen::Admitted
+        );
+
+        let largest = vec![f32::MAX; 8];
+        match screen(&largest, true) {
+            Screen::PastBound { norm } => {
+                // Each square is exact in f64, and so is their sum of eight.
+                let square = f64::from(f32::MAX) * f64::from(f32::MAX);
+                assert_eq!(norm, (8.0 * square).sqrt());
+            }
+            other => panic!("the largest values gave {other:?}"),
+        }
+        assert_eq!(screen(&largest, false), Screen::Admitted);
+
+        for bounded in [true, false] {
+            assert!(matches!(
+                screen(&[1.0, f32::NAN, f32::INFINITY], bounded),
+                Screen::NotFinite { index: 1, value } if value.is_nan()
+            ));
+            assert_eq!(
+                screen(&[f32::MAX, f32::NEG_INFINITY], bounded),
+                Screen::NotFinite {
+                    index: 1,
+                    value: f32::NEG_INFINITY
+                }
+            );
+        }
+
+        let wide = vec![1.0f32; SCREEN_WIDTH + 1];
+        assert_eq!(screen(&wide, true), Screen::Admitted);
+        let mut wide_past = wide;
+        wide_past[SCREEN_WIDTH] = PAST_BOUND;
+        assert!(matches!(screen(&wide_past, true), Screen::PastBound { .. }));
+    }
+
+    /// The one pass in `f32` admits no vector the norm in `f64` refuses and
+    /// refuses none it admits, for vectors whose norms lie either side of the
+    /// bound, at every width the grid runs and at the widest one.
+    #[test]
+    fn the_screen_agrees_with_the_norm_in_f64_either_side_of_the_bound() {
+        let mut generator = rng(0x5C2E_E400);
+        let mut widths = DIMS.to_vec();
+        widths.push(SCREEN_WIDTH);
+        for &dim in &widths {
+            for case in 0..64 {
+                let vector = random_vector(&mut generator, dim);
+                let norm = norm_f64(&vector);
+                // A scale that puts the norm within a factor of two of the
+                // bound on either side.
+                let target = NORM_BOUND * (0.5 + f64::from(case) / 42.0);
+                let scaled: Vec<f32> = vector
+                    .iter()
+                    .map(|&x| (f64::from(x) * target / norm) as f32)
+                    .collect();
+                let past = norm_f64(&scaled) > NORM_BOUND;
+                match screen(&scaled, true) {
+                    Screen::Admitted => assert!(!past, "dim {dim} case {case} admitted"),
+                    Screen::PastBound { norm } => {
+                        assert!(past, "dim {dim} case {case} refused");
+                        assert_eq!(norm, norm_f64(&scaled));
+                    }
+                    other => panic!("dim {dim} case {case} gave {other:?}"),
+                }
+            }
+        }
+    }
+
+    /// The words a refusal of a norm past the bound gives after it names the
+    /// vector.
+    #[test]
+    fn a_norm_past_the_bound_is_named_with_the_bound() {
+        assert_eq!(
+            past_bound_words(1e19),
+            "has a Euclidean norm of 1e19 (must be at most 2^62, 4.611686018427388e18, under \
+             l2, dot or l1)"
+        );
     }
 }
 

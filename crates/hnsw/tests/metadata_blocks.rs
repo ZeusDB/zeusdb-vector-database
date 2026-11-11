@@ -9,10 +9,11 @@
 //! every record holding two fields and once with none, and the difference is
 //! what the fields cost.
 
-use std::alloc::{GlobalAlloc, Layout, System};
+use std::alloc::{GlobalAlloc, Layout};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use zeusdb_vector_core::test_support::Bounded;
 
 use serde_json::{json, Value};
 use zeusdb_vector_hnsw::{Collection, Declaration, ParsedRecord};
@@ -34,21 +35,21 @@ fn count() {
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         count();
-        unsafe { System.alloc(layout) }
+        unsafe { Bounded.alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         count();
-        unsafe { System.alloc_zeroed(layout) }
+        unsafe { Bounded.alloc_zeroed(layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         count();
-        unsafe { System.realloc(ptr, layout, new_size) }
+        unsafe { Bounded.realloc(ptr, layout, new_size) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) }
+        unsafe { Bounded.dealloc(ptr, layout) }
     }
 }
 

@@ -625,6 +625,10 @@ fn compare_integer_to_float(integer: i128, float: f64) -> Option<CmpOrdering> {
     }
 
     let truncated = float.trunc();
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the integer part of a float, a cast that saturates, which the comparison relies on"
+    )]
     let integer_part = truncated as i128;
     Some(match integer.cmp(&integer_part) {
         CmpOrdering::Equal => truncated.partial_cmp(&float)?,

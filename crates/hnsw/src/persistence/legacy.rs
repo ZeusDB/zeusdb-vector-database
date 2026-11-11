@@ -23,7 +23,8 @@
 //! forward map of `mappings.bin`, for which the loader holds no count, at the
 //! distinct keys its bytes carry. A codebook is walked whole before anything
 //! is allocated for it and refused there if it is not the shape the
-//! configuration describes.
+//! configuration describes, and a codebook holding a value that is not
+//! finite is refused as it is read.
 //!
 //! **A value that reads is the value the old decode returned for the same
 //! bytes**, a map keeping the last copy of a key it holds twice. A file the
@@ -31,7 +32,7 @@
 //! after the last entry, which the old decode left unread and no release
 //! wrote, are refused.
 
-use super::framed::Shape;
+use super::framed::{non_finite_codebook, Shape};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::{BuildHasher, BuildHasherDefault, RandomState};
 use zeusdb_vector_core::Error;
@@ -63,6 +64,14 @@ enum Stop {
     },
     /// Bytes after the last entry, starting at `at`.
     Trailing { at: usize },
+    /// A codebook value that is not finite, at value `position` of centroid
+    /// `centroid` of subvector `subvector`.
+    NotFinite {
+        subvector: usize,
+        centroid: usize,
+        position: usize,
+        value: f32,
+    },
 }
 
 impl Stop {
@@ -95,6 +104,12 @@ impl Stop {
                 "the file continues past its last entry, from byte {} to byte {}",
                 at, bytes
             )),
+            Stop::NotFinite {
+                subvector,
+                centroid,
+                position,
+                value,
+            } => non_finite_codebook(file, subvector, centroid, position, value),
         }
     }
 }
@@ -420,17 +435,31 @@ fn measure(bytes: &[u8]) -> Result<((usize, usize, usize), bool), Stop> {
     Ok(((subvectors, centroids, width), uniform))
 }
 
-/// A codebook `measure` has read whole, at exactly its shape.
+/// A codebook `measure` has read whole, at exactly its shape, every value
+/// finite.
 fn codebook(bytes: &[u8], shape: (usize, usize, usize)) -> Result<Codebook, Stop> {
     let (subvectors, centroids, _) = shape;
     let mut wire = Wire::new(bytes);
     wire.len(1)?;
     let mut out = Vec::with_capacity(subvectors);
-    for _ in 0..subvectors {
+    for subvector in 0..subvectors {
         wire.len(1)?;
         let mut sub = Vec::with_capacity(centroids);
-        for _ in 0..centroids {
-            sub.push(floats_of(wire.floats()?));
+        for centroid in 0..centroids {
+            let values = floats_of(wire.floats()?);
+            if let Some((position, &value)) = values
+                .iter()
+                .enumerate()
+                .find(|(_, value)| !value.is_finite())
+            {
+                return Err(Stop::NotFinite {
+                    subvector,
+                    centroid,
+                    position,
+                    value,
+                });
+            }
+            sub.push(values);
         }
         out.push(sub);
     }

@@ -78,6 +78,8 @@ mod apply;
 #[cfg(test)]
 mod backup_tests;
 #[cfg(test)]
+mod bound_tests;
+#[cfg(test)]
 mod close_up_tests;
 mod construct;
 #[cfg(test)]
@@ -91,6 +93,8 @@ mod directory_tests;
 mod durability_tests;
 #[cfg(test)]
 mod features_tests;
+#[cfg(test)]
+mod finite_tests;
 #[cfg(test)]
 mod id_range_tests;
 #[cfg(test)]
@@ -111,7 +115,7 @@ mod mutation_tests;
 mod numbering_tests;
 mod page;
 mod persist;
-pub(crate) use persist::DumpOutcome;
+pub(crate) use persist::{BoundSources, DumpOutcome};
 #[cfg(test)]
 mod persist_tests;
 #[cfg(test)]
@@ -155,6 +159,7 @@ pub use query::{
 };
 pub use search::SparseHits;
 pub use stats::{QuantizationReport, QuantizerReport};
+pub(crate) use stop::panic_words;
 pub use stop::run_without_index;
 
 use crate::journal::Durability;
@@ -367,6 +372,24 @@ pub trait OperationSink: Send + std::fmt::Debug {
         None
     }
 
+    /// The generation that makes this sink's collection read only, where
+    /// the directory it was read from records the largest a manifest can
+    /// hold. The collection then refuses every mutation, a checkpoint, a
+    /// save into any directory and a backup in the words of
+    /// [`generation_exhausted`], since each records the next generation.
+    fn read_only_generation(&self) -> Option<u64> {
+        None
+    }
+
+    /// Whether this sink's collection is read only for a value its
+    /// directory holds past the bound on a vector's norm. The collection then
+    /// refuses every mutation, a checkpoint, a save into any directory and a
+    /// backup in the words of the sink's reason, since each would write that
+    /// value again.
+    fn read_only_bound(&self) -> bool {
+        false
+    }
+
     /// The interval policy's thread, for the tests that hold it to its
     /// lifetime and its cost. Compiled away outside them.
     #[cfg(test)]
@@ -382,6 +405,8 @@ pub(crate) struct Refusing {
     directory: String,
     reason: String,
     features: Option<Vec<String>>,
+    generation: Option<u64>,
+    bound: bool,
 }
 
 impl Refusing {
@@ -392,12 +417,21 @@ impl Refusing {
             directory: directory.display().to_string(),
             reason: reason.to_string(),
             features: sink.read_only_features().map(<[String]>::to_vec),
+            generation: sink.read_only_generation(),
+            bound: sink.read_only_bound(),
         })
     }
 
-    /// The refusal: [`Error::FeatureReadOnly`] for features and
-    /// [`Error::CollectionReadOnly`] for a medium.
+    /// The refusal: the generation's words for a generation, the reason's
+    /// own words for a value past the bound, [`Error::FeatureReadOnly`] for
+    /// features and [`Error::CollectionReadOnly`] for a medium.
     pub(crate) fn error(&self) -> Error {
+        if let Some(generation) = self.generation {
+            return Error::Engine(generation_exhausted(generation));
+        }
+        if self.bound {
+            return Error::Engine(self.reason.clone());
+        }
         match &self.features {
             Some(features) => Error::FeatureReadOnly {
                 path: self.directory.clone(),
@@ -535,6 +569,18 @@ pub struct Identity {
     pub snapshot: Option<u128>,
     /// The snapshot that directory was saved from.
     pub parent: Option<u128>,
+}
+
+/// The words a collection refuses a save in, and every mutation where it
+/// was read only for it, when the directory it was read from records
+/// `generation` and that is the largest a manifest can hold.
+pub(crate) fn generation_exhausted(generation: u64) -> String {
+    format!(
+        "This collection was read from a directory recording generation {}, the largest a \
+         manifest can hold, so no save can record the one after it. No release writes that \
+         generation, so the directory's manifest was edited.",
+        generation
+    )
 }
 
 impl Identity {
@@ -1431,6 +1477,14 @@ impl Collection {
         self.positions_agree_with(true)
     }
 
+    /// Whether the dense space's graph holds its own structure, with the
+    /// first rule it breaks where it does not; see
+    /// `VectorGraph::structure_holds`.
+    #[cfg(test)]
+    pub(crate) fn structure_holds(&self) -> Result<(), String> {
+        self.dense().index.read().unwrap().graph().structure_holds()
+    }
+
     /// [`Collection::positions_agree`] with the holes left unbounded, for a
     /// reader that holds no `writers`, which `get_stats` is. A removal batch
     /// lets its guards go before its close-up builds its copies, so such a
@@ -1479,6 +1533,10 @@ impl Collection {
                 continue;
             }
             held += 1;
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a position, below MAX_INTERNAL_ID, refused at admit and at load"
+            )]
             if graph.record_of_at(node) != at as u32 {
                 return false;
             }
@@ -1886,6 +1944,19 @@ impl Collection {
         slot.attached
             .as_ref()
             .is_some_and(|sink| sink.read_only_features().is_some())
+    }
+
+    /// The refusal of a collection read only for a value its directory
+    /// holds past the bound on a vector's norm, which refuses a save into any
+    /// directory and a backup as well as every mutation and checkpoint, in
+    /// the words of the sink's reason. `None` for every other collection.
+    pub(crate) fn sink_bound_refusal(&self) -> Option<Error> {
+        let slot = self.sink.lock().unwrap();
+        let sink = slot.attached.as_deref()?;
+        if !sink.read_only_bound() {
+            return None;
+        }
+        Refusing::of(sink).map(|refusing| refusing.error())
     }
 
     /// The directory a collection read from a medium it cannot write was

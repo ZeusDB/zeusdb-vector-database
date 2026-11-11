@@ -72,8 +72,10 @@ impl Collection {
     ///   subvector count is the declared one and its centroid count is two
     ///   to the declared bits, every value finite, and a calibration comes
     ///   under `quantized_with_raw` alone and parses. Scales are finite and
-    ///   positive. Then the install the live training runs, with the stamp
-    ///   the record carries, and no fit.
+    ///   positive, with 254 times each finite. Then the install the live
+    ///   training runs, with the stamp the record carries, and no fit, which
+    ///   refuses a codebook whose squared norms or squared distances between
+    ///   centroids are not finite.
     /// - `Clear`, `Compact`, `RebuildQuantized` and `AddMetadata` run their
     ///   bodies.
     ///

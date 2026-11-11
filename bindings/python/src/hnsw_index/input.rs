@@ -3,9 +3,11 @@
 //! `add` accepts five input shapes and everything that turns any of them into
 //! owned Rust lives here. What leaves this file is a list of [`Parsed`]
 //! records, which hold no Python object, which is what lets insertion
-//! release the interpreter lock. Every vector is processed for the space on
-//! the way through, by the collection's own rule, so a record is stored as
-//! the engine expects it. What a query vector is checked against once it is
+//! release the interpreter lock. Every vector is held finite and, under l2,
+//! dot or l1, to the bound on its norm by `Collection::screen_vector`, and
+//! then processed for the space on the way through, by the collection's own
+//! rule, so a record is stored as the engine expects it. What a query vector
+//! is checked against once it is
 //! out of Python is the engine's half of this module,
 //! `Collection::validate_query`, and its records carry this module's target.
 //!
@@ -50,7 +52,7 @@ use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use tracing::{error, trace};
-use zeusdb_vector_core::{Error, SparseVector};
+use zeusdb_vector_core::{past_bound_words, Error, Screen, SparseVector};
 
 /// A record's sparse half as it arrived: nothing, a vector of term ids and
 /// weights, or a text the space's text layer counts.
@@ -247,6 +249,10 @@ impl<'py> Rows<'py> {
         }
         Ok(match self {
             Rows::F32(array) => Cow::Borrowed(array.as_slice()?),
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a value narrowed to the f32 the index stores, not an offset, a count, an index or an id"
+            )]
             Rows::F64(array) => Cow::Owned(
                 array
                     .as_slice()?
@@ -726,23 +732,41 @@ impl HNSWIndex {
             let provided_id = Self::provided_id(ids_list.as_ref(), i)?;
             let label = || provided_id.clone().unwrap_or_else(|| format!("row_{}", i));
 
-            if let Some((component, value)) = Self::first_non_finite(raw_vector) {
-                error!(
-                    operation = "parse_numpy_context",
-                    error = "invalid_value",
-                    vector_id = %label(),
-                    index = component,
-                    value = value,
-                    "NumPy row contains a non-finite value"
-                );
-                errors.push(format!(
-                    "Vector {}: contains invalid value at index {}: {} (must be finite)",
-                    label(),
-                    component,
-                    value
-                ));
-                rejected += 1;
-                continue;
+            match self.inner.screen_vector(raw_vector) {
+                Screen::Admitted => {}
+                Screen::NotFinite {
+                    index: component,
+                    value,
+                } => {
+                    error!(
+                        operation = "parse_numpy_context",
+                        error = "invalid_value",
+                        vector_id = %label(),
+                        index = component,
+                        value = value,
+                        "NumPy row contains a non-finite value"
+                    );
+                    errors.push(format!(
+                        "Vector {}: contains invalid value at index {}: {} (must be finite)",
+                        label(),
+                        component,
+                        value
+                    ));
+                    rejected += 1;
+                    continue;
+                }
+                Screen::PastBound { norm } => {
+                    error!(
+                        operation = "parse_numpy_context",
+                        error = "past_bound",
+                        vector_id = %label(),
+                        norm = norm,
+                        "NumPy row's norm is past the bound"
+                    );
+                    errors.push(format!("Vector {}: {}", label(), past_bound_words(norm)));
+                    rejected += 1;
+                    continue;
+                }
             }
 
             // The record's metadata, read as a list batch reads it.
@@ -887,8 +911,9 @@ impl HNSWIndex {
     }
 
     /// A bare two dimensional array, one record a row, each under a generated
-    /// id. A row holding a value that is not finite is that row's error,
-    /// named by its position, and takes no id.
+    /// id. A row holding a value that is not finite, or under l2, dot or l1 a
+    /// row whose norm passes the bound, is that row's error, named by its
+    /// position, and takes no id.
     fn parse_numpy_input_safe(
         &self,
         rows: &Rows<'_>,
@@ -901,20 +926,37 @@ impl HNSWIndex {
         for (i, raw_vector) in flat.chunks(dim).enumerate() {
             // A bare array carries no ids, so a rejected row is named by its
             // position and no id is generated for it.
-            if let Some((component, value)) = Self::first_non_finite(raw_vector) {
-                error!(
-                    operation = "parse_numpy",
-                    error = "invalid_value",
-                    row = i,
-                    index = component,
-                    value = value,
-                    "NumPy row contains a non-finite value"
-                );
-                errors.push(format!(
-                    "Vector row_{}: contains invalid value at index {}: {} (must be finite)",
-                    i, component, value
-                ));
-                continue;
+            match self.inner.screen_vector(raw_vector) {
+                Screen::Admitted => {}
+                Screen::NotFinite {
+                    index: component,
+                    value,
+                } => {
+                    error!(
+                        operation = "parse_numpy",
+                        error = "invalid_value",
+                        row = i,
+                        index = component,
+                        value = value,
+                        "NumPy row contains a non-finite value"
+                    );
+                    errors.push(format!(
+                        "Vector row_{}: contains invalid value at index {}: {} (must be finite)",
+                        i, component, value
+                    ));
+                    continue;
+                }
+                Screen::PastBound { norm } => {
+                    error!(
+                        operation = "parse_numpy",
+                        error = "past_bound",
+                        row = i,
+                        norm = norm,
+                        "NumPy row's norm is past the bound"
+                    );
+                    errors.push(format!("Vector row_{}: {}", i, past_bound_words(norm)));
+                    continue;
+                }
             }
 
             let processed_vector = self.inner.process_vector_for_space(raw_vector.to_vec());
@@ -925,22 +967,13 @@ impl HNSWIndex {
         Ok(())
     }
 
-    /// Report the first non-finite component of a vector, if there is one
-    ///
-    /// The two NumPy branches read their rows straight out of the buffer, so
-    /// they skip the per-value check that `extract_single_vector_safe` runs.
-    /// A NaN that reaches the graph degrades every later query rather than
-    /// only the one that carried it, so both branches route through this.
-    fn first_non_finite(vector: &[f32]) -> Option<(usize, f32)> {
-        vector
-            .iter()
-            .enumerate()
-            .find(|(_, value)| !value.is_finite())
-            .map(|(index, value)| (index, *value))
-    }
-
     /// One record's vector, checked and processed for the space, with a
     /// failure returned as words `add` reports against the record.
+    ///
+    /// The two NumPy branches read their rows straight out of the buffer and
+    /// hold each to the same `Collection::screen_vector`, since a NaN that
+    /// reaches the graph degrades every later query rather than only the one
+    /// that carried it.
     fn extract_single_vector_safe(&self, data: &Bound<PyAny>) -> Result<Vec<f32>, String> {
         let vector = if let Ok(array1d) = data.cast::<PyArray1<f32>>() {
             array1d
@@ -970,12 +1003,16 @@ impl HNSWIndex {
                 vector.len()
             ));
         }
-        for (i, &val) in vector.iter().enumerate() {
-            if !val.is_finite() {
+        match self.inner.screen_vector(&vector) {
+            Screen::Admitted => {}
+            Screen::NotFinite { index, value } => {
                 return Err(format!(
                     "Vector contains invalid value at index {}: {}",
-                    i, val
+                    index, value
                 ));
+            }
+            Screen::PastBound { norm } => {
+                return Err(format!("Vector {}", past_bound_words(norm)));
             }
         }
 

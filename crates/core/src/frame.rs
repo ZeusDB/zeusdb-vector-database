@@ -331,7 +331,10 @@ fn take8(raw: &[u8], at: usize) -> [u8; 8] {
 
 /// The repairs a mutator applies after it has damaged a frame, so a mutation
 /// reaches the payload's reader rather than being refused by a checksum.
-/// For the fuzzers in the crates whose payloads are framed.
+/// For the fuzzers in the crates whose payloads are framed. Compiled under
+/// the `test-support` feature and in this crate's own tests, so the wheel
+/// carries none of it.
+#[cfg(any(test, feature = "test-support"))]
 pub mod fuzz {
     use super::*;
 
@@ -393,6 +396,10 @@ pub mod fuzz {
         }
 
         /// A value below `bound`, which is zero when `bound` is zero.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a draw taken modulo a usize bound, so it fits a usize"
+        )]
         pub fn below(&mut self, bound: usize) -> usize {
             if bound == 0 {
                 0
@@ -401,6 +408,10 @@ pub mod fuzz {
             }
         }
 
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the low byte of a shifted draw, which the cast takes by design"
+        )]
         pub fn byte(&mut self) -> u8 {
             (self.draw() >> 24) as u8
         }
@@ -675,6 +686,7 @@ mod tests {
     /// is measured rather than assumed.
     #[test]
     fn no_mutation_of_a_valid_frame_panics_the_reader() {
+        use crate::allocations::{bounded, read_bound};
         let payload: Vec<u8> = (0..4096u32)
             .map(|i| (i.wrapping_mul(31) % 251) as u8)
             .collect();
@@ -690,7 +702,10 @@ mod tests {
         let mut mutated_payloads = 0usize;
         for _ in 0..cases {
             let blob = fuzz::mutate(&mut rng, &good, FrameKind::TermDictionary);
-            if let Ok(framed) = unframe(&blob, FrameKind::TermDictionary, "t") {
+            let read = bounded(read_bound(blob.len()), || {
+                unframe(&blob, FrameKind::TermDictionary, "t")
+            });
+            if let Ok(framed) = read {
                 verified += 1;
                 if framed.payload != &payload[..] || framed.entries != 16 {
                     mutated_payloads += 1;

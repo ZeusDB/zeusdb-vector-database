@@ -248,6 +248,10 @@ impl ClosedUp {
             };
         }
         let mut new_of_old = vec![Position::NONE; extent];
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a position, below MAX_INTERNAL_ID, refused at admit and at load"
+        )]
         for (k, &old) in old_of_new.iter().enumerate() {
             new_of_old[old as usize] = k as u32;
         }
@@ -1118,9 +1122,16 @@ impl Collection {
         replacement: Option<(VectorGraph, Option<(f64, f64)>)>,
         expected_size: usize,
     ) -> usize {
+        let on_removal = replacement.is_none();
         let mut parts = self.build_close_up(replacement, expected_size);
         #[cfg(test)]
         reach(CloseUpPoint::Built);
+        // The kill point inside a close-up on removal, between the build and
+        // the swap. Compiled away when `debug_assertions` are off; see
+        // `zeusdb_vector_core::kill_at`.
+        if on_removal {
+            zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::RemovalMidCloseUp);
+        }
         self.swap_close_up(&mut parts);
         #[cfg(test)]
         reach(CloseUpPoint::Swapped);
@@ -2398,6 +2409,7 @@ impl Collection {
                     sparse: admitted.sparse.as_ref().map(SparseVector::as_ref),
                 };
                 Operation::encode_insert(&parts, buffer);
+                #[expect(clippy::cast_possible_truncation, reason = "a level, below LAYERS, 16")]
                 Operation::stamp_insert(buffer, admitted.internal_id as u64, admitted.level as u8);
                 self.append_record(OperationKind::Insert, buffer)?;
                 *handed_over += 1;
@@ -2570,6 +2582,7 @@ impl Collection {
             return refuse(err, id);
         }
         if attached && !defer {
+            #[expect(clippy::cast_possible_truncation, reason = "a level, below LAYERS, 16")]
             Operation::stamp_insert(buffer, internal_id as u64, level as u8);
             if let Err(err) = self.append_record(OperationKind::Insert, buffer) {
                 return refuse(err, id);

@@ -104,9 +104,8 @@ impl<T> VectorStore<T> {
         self.data.get(at..at + self.dim)
     }
 
-    /// Every stored value, node by node, for a test that compares two
-    /// stores.
-    #[cfg(test)]
+    /// Every stored value, node by node, for a dump reader that holds every
+    /// row to a rule in one pass and for a test that compares two stores.
     pub(crate) fn values(&self) -> &[T] {
         &self.data
     }

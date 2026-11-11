@@ -192,8 +192,20 @@ impl Collection {
             } => {
                 let first = centroids.first();
                 FittedRef::Codebook {
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "a codebook's subvector count, at most MAX_DIM"
+                    )]
                     subvectors: centroids.len() as u32,
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "a subvector's centroid count, at most 256"
+                    )]
                     centroids: first.map_or(0, Vec::len) as u32,
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "a subvector's width, at most MAX_DIM"
+                    )]
                     width: first.and_then(|c| c.first()).map_or(0, Vec::len) as u32,
                     values: Values::Nested(centroids),
                     calibration: calibration.as_deref(),

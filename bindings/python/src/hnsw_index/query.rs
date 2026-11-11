@@ -279,6 +279,10 @@ fn dense_vector(value: &Bound<PyAny>, position: usize) -> Result<Vec<f32>, PyEng
         return Ok(array.readonly().as_slice()?.to_vec());
     }
     if let Ok(array) = value.cast::<PyArray1<f64>>() {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a value narrowed to the f32 the index stores, not an offset, a count, an index or an id"
+        )]
         return Ok(array
             .readonly()
             .as_slice()?

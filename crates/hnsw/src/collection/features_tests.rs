@@ -715,7 +715,7 @@ fn a_feature_marked_read_only_opens_an_unjournaled_directory_read_only() {
     };
     assert_eq!(page(&opened), page(&collection));
     assert_eq!(recovery.read_only.as_deref(), Some(PROBE_REASON));
-    assert_eq!(recovery.read_only_features, vec!["probe".to_string()]);
+    assert_eq!(recovery.read_only_features(), vec!["probe"]);
     assert!(!recovery.journaled);
     assert_eq!(
         recovery.read_only_warning("D").unwrap(),

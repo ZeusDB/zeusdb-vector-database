@@ -76,7 +76,15 @@ pub(crate) fn encode_with(index: &PostingsIndex, id_of: &dyn Fn(usize) -> u32) -
         FrameEncoding::Engine,
         8 + index.live_nnz * NONZERO_BYTES + index.live * RECORD_HEADER_BYTES,
     );
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the slot count, at most MAX_INTERNAL_ID + 1, which is u32::MAX"
+    )]
     payload.extend((index.slot_count() as u32).to_le_bytes());
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the live count, at most the slot count"
+    )]
     payload.extend((index.live as u32).to_le_bytes());
     for (at, slot) in index.records.iter().enumerate() {
         if !slot.held() || index.dead.contains(at) {
@@ -84,6 +92,10 @@ pub(crate) fn encode_with(index: &PostingsIndex, id_of: &dyn Fn(usize) -> u32) -
         }
         let v = index.forward(*slot);
         payload.extend(id_of(at).to_le_bytes());
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a record's nonzero count, within the forward arena's ceiling MAX_FORWARD, below u32::MAX"
+        )]
         payload.extend((v.dims.len() as u32).to_le_bytes());
         for d in v.dims {
             payload.extend(d.to_le_bytes());
@@ -311,6 +323,7 @@ mod tests {
     use super::*;
     use crate::index::{Unlink, Weighting};
     use std::collections::HashMap;
+    use zeusdb_vector_core::test_support::{bounded, read_bound};
     use zeusdb_vector_core::{
         frame_fuzz, FsDir, Persist, Prepared, Restore, SparseVector, VectorIndex,
         FRAME_HEADER_BYTES,
@@ -603,7 +616,10 @@ mod tests {
     /// A seeded mutator over a valid artefact never panics the reader and
     /// never sizes an allocation from a field the payload has not earned,
     /// which is what the bounds above are for. The frame is repaired around
-    /// each mutation so the payload's reader sees it.
+    /// each mutation so the payload's reader sees it. Each read runs under
+    /// `bounded` at `read_bound` of the artefact's bytes, so such an
+    /// allocation is refused before it is made, whatever the machine could
+    /// grant.
     #[test]
     fn no_mutation_of_a_valid_artefact_panics_the_reader() {
         let index = filled();
@@ -615,9 +631,17 @@ mod tests {
             .unwrap_or(4_000usize);
         let mut accepted = 0usize;
         let mut past_frame = 0usize;
+        // The decoder reserves its slot table for every position below the
+        // slot count the payload names, which it holds to the caller's ids,
+        // so each read may also take a slot and a length for each position the
+        // caller holds.
+        let slot_table = std::mem::size_of::<crate::index::Slot>().max(std::mem::size_of::<f32>())
+            * bounds().ids_by_position.len();
         for _ in 0..cases {
             let blob = frame_fuzz::mutate(&mut rng, &good, FrameKind::SparsePostings);
-            match decode(&blob, index.config(), &bounds(), "p") {
+            match bounded(read_bound(blob.len()).saturating_add(slot_table), || {
+                decode(&blob, index.config(), &bounds(), "p")
+            }) {
                 Ok(restored) => {
                     accepted += 1;
                     // Whatever it accepted is a well formed index.

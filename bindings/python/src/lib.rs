@@ -8,6 +8,11 @@
 // rule a panic keeps, and converts what comes back, releasing the interpreter
 // lock around any call that may wait for an engine guard.
 
+// A narrowing cast in this crate's library code states its bound in an
+// `#[expect]` beside it, so a cast with no stated bound fails the lint gate,
+// and an `#[expect]` whose cast is gone fails it too. Test code is left out.
+#![cfg_attr(not(test), warn(clippy::cast_possible_truncation))]
+
 /// The part of a call that runs with the interpreter released: `$body`
 /// inside `Collection::run` on `$inner` as `$operation`, under `$py.detach`,
 /// with the result converted for the method that returns it.
@@ -173,7 +178,18 @@ impl From<PyEngineError> for PyErr {
 /// directory holding a feature this build does not know, which its manifest
 /// marks `read_only`, opens read only the same way whatever the medium, and
 /// every change, every save, `checkpoint`, `journal_to` and `backup` raises
-/// `FeatureReadOnly`.
+/// `FeatureReadOnly`. A journaled directory below format 5.0.0 whose
+/// identity records the largest generation a manifest can hold opens read
+/// only the same way, since its upgrade is a save and no save can record
+/// the generation after it: a `RuntimeWarning` names that generation, and
+/// every change, save, `checkpoint` and `backup` raises `RuntimeError` in
+/// the same words. A directory holding a value past the bound on a vector's
+/// norm, being a stored vector of an l2, dot or l1 index whose Euclidean
+/// norm passes 2^62, a codebook value past 2^62 or a scale past the largest
+/// one vectors within 2^62 fit, opens read only the same way, journaled or
+/// not: a `RuntimeWarning` names the value, its file and the bound, and
+/// every change, save, `checkpoint` and `backup` raises `RuntimeError` in
+/// the same words.
 ///
 /// `repair=True` loads a journal whose own history is broken: a corrupt
 /// record with records after it, damage in a segment that is not the last,
@@ -189,6 +205,12 @@ impl From<PyEngineError> for PyErr {
 /// or another checkpoint is refused as without it. On a medium this process
 /// cannot write, the kept calls are replayed in memory, nothing is set
 /// aside or changed, and the index opens read only.
+///
+/// A directory below format 5.0.0 whose manifest records `created_at` as
+/// anything but an RFC 3339 time, which a load of 5.0.0 refuses, opens with
+/// its `saved_at` in its place, or with the time of the load where that is
+/// not one either. A `RuntimeWarning` names both values, `index.recovery`
+/// reports them under `replaced`, and the next save writes the value taken.
 ///
 /// The whole load runs with the interpreter lock released, the graph rebuild
 /// it may fall back to included. Nothing in the load path touches Python:
@@ -273,7 +295,7 @@ fn load_index_body(
     let warning = recovery
         .repair_warning(path)
         .or_else(|| recovery.read_only_warning(path));
-    if let Some(message) = warning {
+    for message in warning.into_iter().chain(recovery.replaced_warning(path)) {
         let category = py.get_type::<pyo3::exceptions::PyRuntimeWarning>();
         let message = std::ffi::CString::new(message)
             .unwrap_or_else(|_| c"The directory was loaded with a warning.".to_owned());
@@ -379,3 +401,10 @@ fn engine(py: Python, m: &Bound<pyo3::types::PyModule>) -> PyResult<()> {
 
     Ok(())
 }
+
+// The test build's allocator, which holds every request to a ceiling and a
+// fuzzer's reads to a bound. See `zeusdb_vector_core::test_support`.
+#[cfg(test)]
+#[global_allocator]
+static ALLOCATOR: zeusdb_vector_core::test_support::Bounded =
+    zeusdb_vector_core::test_support::Bounded;

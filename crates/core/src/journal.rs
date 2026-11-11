@@ -460,6 +460,10 @@ pub fn encode_journal_record(
     out.clear();
     out.reserve(JOURNAL_RECORD_OVERHEAD_BYTES + payload.len());
     out.extend_from_slice(&sequence.to_le_bytes());
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a payload's length, at most JOURNAL_MAX_PAYLOAD, which the writer refuses past before it encodes a record"
+    )]
     out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     out.extend_from_slice(&kind.code().to_le_bytes());
     out.extend_from_slice(&0u16.to_le_bytes());

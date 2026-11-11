@@ -4,6 +4,7 @@
 #![allow(clippy::disallowed_types)]
 
 use super::*;
+use crate::allocations::{bounded, read_bound};
 use crate::frame::fuzz::{Rng, HOSTILE};
 use crate::storage::{FsStorage, Storage};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3359,7 +3360,7 @@ fn no_mutation_of_a_valid_legacy_journal_panics_the_reader() {
     let (mut past_header, mut whole, mut torn, mut corrupt) = (0usize, 0usize, 0usize, 0usize);
     for _ in 0..cases {
         let (blob, _) = mutate_legacy(&mut rng, &good, &table, false);
-        match read_legacy_journal(&blob, "t") {
+        match bounded(read_bound(blob.len()), || read_legacy_journal(&blob, "t")) {
             Ok(contents) => {
                 past_header += 1;
                 assert!(contents.good_bytes <= blob.len() as u64);
@@ -3406,7 +3407,7 @@ fn the_legacy_classification_matches_an_oracle_under_mutation() {
     for case in 0..cases {
         let (blob, wholes) = mutate_legacy(&mut rng, &good, &table, true);
         match (
-            read_legacy_journal(&blob, "t"),
+            bounded(read_bound(blob.len()), || read_legacy_journal(&blob, "t")),
             legacy_oracle(&good, &blob, &table, &wholes),
         ) {
             (Err(Error::JournalHeaderInvalid { .. }), Err(())) => {}
@@ -3936,7 +3937,8 @@ fn no_mutation_of_a_journal_of_segments_panics_the_reader() {
             }
         }
         let files = mutated.files();
-        match mutated.read(&files, &expected) {
+        let bound = read_bound(mutated.segments.iter().map(Vec::len).sum());
+        match bounded(bound, || mutated.read(&files, &expected)) {
             Ok(contents) => {
                 read += 1;
                 assert!(contents.next_sequence > expected.base.sequence);
@@ -4028,7 +4030,8 @@ fn the_segment_classification_matches_an_oracle_under_mutation() {
     for case in 0..cases {
         let (blob, wholes) = mutate_last_segment(&mut rng, &built);
         let predicted = segment_oracle(&built, &expected, &blob, &wholes);
-        let found = read_mutated(&built, &files, &blob, &expected);
+        let bound = read_bound(built.segments.iter().map(Vec::len).sum::<usize>() + blob.len());
+        let found = bounded(bound, || read_mutated(&built, &files, &blob, &expected));
         match (&predicted, found) {
             (Predicted::Header, Err(Error::JournalHeaderInvalid { .. })) => {}
             (Predicted::Refused, Err(Error::JournalSegmentsInvalid { .. })) => {}
@@ -4215,9 +4218,10 @@ fn no_mutation_of_a_journal_of_operations_panics_the_decoder() {
             }
         }
         let files = mutated.files();
+        let bound = read_bound(mutated.segments.iter().map(Vec::len).sum());
         for reading in [
-            mutated.read(&files, &expected),
-            read_for_repair(&mutated, &files, &expected),
+            bounded(bound, || mutated.read(&files, &expected)),
+            bounded(bound, || read_for_repair(&mutated, &files, &expected)),
         ] {
             let contents = match reading {
                 Ok(contents) => contents,
@@ -4234,7 +4238,7 @@ fn no_mutation_of_a_journal_of_operations_panics_the_decoder() {
                 Err(other) => panic!("unexpected error {other:?}"),
             };
             for live in &contents.records {
-                match Operation::decode(&live.record, 4, "f") {
+                match bounded(bound, || Operation::decode(&live.record, 4, "f")) {
                     Ok(Operation::Train {
                         fitted: Some(fitted),
                         ..

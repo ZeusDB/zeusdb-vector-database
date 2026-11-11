@@ -150,14 +150,15 @@
 //! 0.6.0 or earlier still holds those two, and opening it rebuilds the graph
 //! once and writes the new file on the next save. Nothing reads the old format.
 
+use crate::collection::BoundSources;
 use crate::collection::{
-    validate_index_parameters, validate_space_supports_quantization, Collection, DumpOutcome,
-    IdentityRecord, QuantizationConfig, QuantizationScheme, SparseDeclaration, StorageMode,
-    DEFAULT_SPACE,
+    panic_words, validate_index_parameters, validate_space_supports_quantization, Collection,
+    DumpOutcome, IdentityRecord, QuantizationConfig, QuantizationScheme, SparseDeclaration,
+    StorageMode, DEFAULT_SPACE,
 };
 use crate::journal::{
-    CheckpointTaken, Damage, Durability, JournalPolicy, JournalSink, ReadOnlyCause, ReadOnlySink,
-    Recovery,
+    CheckpointTaken, Damage, Durability, JournalPolicy, JournalSink, Note, PastBound,
+    ReadOnlyCause, ReadOnlySink, Recovery, Replaced,
 };
 use crate::RerankCalibration;
 use serde::{Deserialize, Serialize};
@@ -236,7 +237,7 @@ const STORAGE_MODES: [&str; 5] = [
 ];
 
 /// The two artefacts of a trained scalar quantized index.
-const INT8_SCALES_FILENAME: &str = "int8_scales.zdbint8";
+pub(crate) const INT8_SCALES_FILENAME: &str = "int8_scales.zdbint8";
 const INT8_ROWS_FILENAME: &str = "int8_rows.zdbint8";
 const INT8_SCALES_CONTENTS: &str =
     "the scales of a scalar quantized index, one a dimension, which every stored row decodes through";
@@ -1442,6 +1443,10 @@ fn framed_ids(bytes: &[u8], config: &IndexConfig) -> Result<MappedIds, Error> {
         refuse_past_last_id(at)?;
         refuse_unnamable(id, store.arena_len())?;
         store.insert_admitted(at, id);
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "an internal id, held below MAX_INTERNAL_ID by refuse_past_last_id above"
+        )]
         internal.push(internal_id as u32);
     }
     if store.len() != records.len() {
@@ -1523,6 +1528,10 @@ fn bincode_ids(bytes: &[u8], config: &IndexConfig) -> Result<MappedIds, Error> {
         refuse_past_last_id(at)?;
         refuse_unnamable(id, store.arena_len())?;
         store.insert_admitted(at, id);
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "an internal id, held below MAX_INTERNAL_ID by refuse_past_last_id above"
+        )]
         internal.push(internal_id as u32);
     }
     let mapped = MappedIds { store, internal };
@@ -2459,8 +2468,9 @@ fn load_quantization(
 /// bytes, every scale finite and positive, and the rows artefact carries
 /// `entries` records of a `u32` internal id and a row of the codec's width,
 /// ids strictly increasing and none above the saved id counter, in exactly
-/// `entries * (4 + width)` bytes. Every bound is checked before anything is
-/// allocated from a field.
+/// `entries * (4 + width)` bytes, and under cosine every row's inverse norm
+/// finite. Every bound is checked before anything is allocated from a
+/// field.
 fn load_int8_quantization(
     dir: &dyn Dir,
     manifest: &IndexManifest,
@@ -2521,8 +2531,7 @@ fn load_int8_quantization(
     }
 
     let codec = load_int8_scales(dir, manifest, dim)?;
-    let tail = if space == "cosine" { 4 } else { 0 };
-    let rows = load_int8_rows(dir, manifest, codec.dim() + tail)?;
+    let rows = load_int8_rows(dir, manifest, codec.dim(), space == "cosine")?;
     Ok(QuantizationArtefacts {
         config: QuantizationFile::Int8(config),
         centroids: None,
@@ -2586,10 +2595,15 @@ fn load_int8_scales(
 /// The rows artefact, held to its bounds, as (internal id, row) ascending.
 /// Empty where the manifest names none, which is what a trained index
 /// holding no record writes.
+///
+/// A row is `dim` codes, and where `norm` is set, as on a cosine index, the
+/// four bytes of the record's inverse norm after them, which is refused
+/// where it is not finite, since it scales every distance to the record.
 fn load_int8_rows(
     dir: &dyn Dir,
     manifest: &IndexManifest,
-    row_width: usize,
+    dim: usize,
+    norm: bool,
 ) -> Result<Int8Rows, Error> {
     if !manifest_names(manifest, INT8_ROWS_FILENAME) {
         return Ok(Int8Rows::default());
@@ -2599,6 +2613,7 @@ fn load_int8_rows(
         file: INT8_ROWS_FILENAME.to_string(),
         detail,
     };
+    let row_width = if norm { dim + 4 } else { dim };
     let stride = 4 + row_width;
     // The bound is the id ceiling's worth of rows, since an internal id is
     // a `u32` and every row below is held to that ceiling.
@@ -2646,6 +2661,17 @@ fn load_int8_rows(
             )));
         }
         previous = Some(id);
+        if norm {
+            let tail = &chunk[stride - 4..];
+            let value = f32::from_le_bytes([tail[0], tail[1], tail[2], tail[3]]);
+            if !value.is_finite() {
+                return Err(invalid(format!(
+                    "the row of internal id {} holds {} as its inverse norm, and every inverse \
+                     norm is finite",
+                    id, value
+                )));
+            }
+        }
         rows.push(id, &chunk[4..]);
     }
     debug!(target: LOG_TARGET, "{} loaded ({} rows)", INT8_ROWS_FILENAME, rows.len());
@@ -2720,6 +2746,10 @@ fn save_spaces(index: &Collection, dir: &dyn Dir, ledger: &mut SaveLedger) -> Re
     {
         let dense = index.dense_index();
         let internal = dense.ids_by_position();
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "an internal id, below MAX_INTERNAL_ID, held at admit and at load"
+        )]
         let id_of = |at: usize| internal.get(at).map_or(Position::NONE, |id| id as u32);
         space
             .index
@@ -3177,8 +3207,14 @@ fn install_centroids(pq: &PQ, centroids: Centroids) -> Result<(), Error> {
     // Going through set_centroids rather than writing the field rebuilds the
     // symmetric distance table from the codebook that has just been read, so a
     // loaded index can build a graph on real distances exactly as a freshly
-    // trained one does.
-    pq.set_centroids(centroids).map_err(Error::Engine)
+    // trained one does. The shape is held above, so its one refusal left is a
+    // squared norm or a squared distance between two centroids that is not
+    // finite, which names the place in pq_centroids.bin.
+    pq.set_centroids(centroids)
+        .map_err(|error| Error::DecodeFailed {
+            file: "pq_centroids.bin".to_string(),
+            error,
+        })
 }
 
 /// Restore quantization state (simplified for reconstruction)
@@ -3600,6 +3636,9 @@ fn load_locked(
         });
     }
 
+    // The load's own time, taken once, so a repair that reads the checkpoint
+    // again takes the same value wherever the load takes it.
+    let loaded_at = chrono::Utc::now().to_rfc3339();
     let Checkpoint {
         index: mut restored_index,
         manifest,
@@ -3607,17 +3646,38 @@ fn load_locked(
         identity,
         graph_rebuilt,
         read_only_features,
-    } = read_checkpoint(storage, tokenizer.clone())?;
+        replaced,
+    } = read_checkpoint(storage, tokenizer.clone(), &loaded_at)?;
 
     // Phase 3: The journal beside the directory, where the manifest names
     // one. Nothing below runs for a directory saved without one, so such a
     // directory loads exactly as it did.
     let format_version = manifest.format_version.clone();
+    // What the load says it did, from the checkpoint, before any journal.
+    let checkpoint_recovery = || {
+        let mut recovery =
+            Recovery::unjournaled(format_version.clone(), restored_from_aside, graph_rebuilt);
+        recovery
+            .notes
+            .extend(replaced.iter().cloned().map(Note::Replaced));
+        recovery
+    };
     let identity_sequence = manifest
         .identity
         .as_ref()
         .and_then(|record| record.sequence)
         .filter(|_| major >= SEGMENTED_FORMAT_MAJOR);
+    let raw_file = raw_vectors_file(&restored_index, graph_rebuilt);
+    // The first value past what the bound on a vector's norm allows, for a
+    // load that replays no journal. See `Collection::first_past_bound`.
+    let past_bound = |index: &Collection| {
+        index.first_past_bound(&BoundSources {
+            raw: raw_file,
+            journal: None,
+            counter: 0,
+            fitted: true,
+        })
+    };
     let Some(record) = manifest.journal else {
         // The journal sequence the directory's state holds, which a save of
         // it records again.
@@ -3633,10 +3693,15 @@ fn load_locked(
                  it is and not read"
             );
         }
-        let recovery = Recovery::unjournaled(format_version, restored_from_aside, graph_rebuilt);
+        let recovery = checkpoint_recovery();
         if !read_only_features.is_empty() {
             let reached = identity_sequence.unwrap_or(0);
             let cause = ReadOnlyCause::Features(read_only_features);
+            return Ok(read_only(restored_index, path, cause, reached, recovery));
+        }
+        if let Some(past) = past_bound(&restored_index) {
+            let reached = identity_sequence.unwrap_or(0);
+            let cause = ReadOnlyCause::Bound(past);
             return Ok(read_only(restored_index, path, cause, reached, recovery));
         }
         recovery.report(path);
@@ -3682,11 +3747,20 @@ fn load_locked(
                 "Opened the checkpoint alone; every mutation after the sequence it holds is in \
                  the journal beside it and was not applied"
             );
-            let mut recovery =
-                Recovery::unjournaled(format_version, restored_from_aside, graph_rebuilt);
+            let mut recovery = checkpoint_recovery();
             recovery.checkpoint_sequence = record.sequence;
             if !read_only_features.is_empty() {
                 let cause = ReadOnlyCause::Features(read_only_features);
+                return Ok(read_only(
+                    restored_index,
+                    path,
+                    cause,
+                    record.sequence,
+                    recovery,
+                ));
+            }
+            if let Some(past) = past_bound(&restored_index) {
+                let cause = ReadOnlyCause::Bound(past);
                 return Ok(read_only(
                     restored_index,
                     path,
@@ -3702,7 +3776,7 @@ fn load_locked(
         JournalPolicy::Repair(durability) => (durability, true),
     };
 
-    let mut recovery = Recovery::unjournaled(format_version, restored_from_aside, graph_rebuilt);
+    let mut recovery = checkpoint_recovery();
     recovery.journaled = true;
     recovery.checkpoint_sequence = record.sequence;
     let opened = Opened {
@@ -3717,6 +3791,10 @@ fn load_locked(
         repairing,
         lock,
         read_only_features,
+        loaded_at: &loaded_at,
+        raw_file,
+        counter: restored_index.id_counter(),
+        fitted: restored_index.can_use_quantization(),
     };
     if major >= SEGMENTED_FORMAT_MAJOR {
         let identity = identity.expect("a 5.x manifest was held to record an identity");
@@ -3738,16 +3816,21 @@ struct Checkpoint {
     /// its manifest marks `read_only`, in name order, which make the load
     /// read only.
     read_only_features: Vec<String>,
+    /// The values the directory records that a load of 5.0.0 refuses, each
+    /// with the value the load took in its place.
+    replaced: Vec<Replaced>,
 }
 
 /// Phases 1 and 2 of a load: every artefact of the directory `storage`
 /// keeps read and held to its manifest, and the collection built from them
 /// at the identity the manifest records. A repair reads the checkpoint again
 /// where a record it replayed would not apply, so the call that record began
-/// is applied whole or not at all.
+/// is applied whole or not at all. `loaded_at` is the load's own time, which
+/// [`restored_created_at`] takes where the manifest holds no other.
 fn read_checkpoint(
     storage: &dyn Storage,
     tokenizer: Option<Arc<dyn Tokenizer>>,
+    loaded_at: &str,
 ) -> Result<Checkpoint, Error> {
     // Phase 1: Load all ZeusDB components
     debug!(target: LOG_TARGET, "Phase 1: Loading ZeusDB components...");
@@ -3978,7 +4061,8 @@ fn read_checkpoint(
     // from. Until this ran, a save of a loaded index wrote that load time to
     // manifest.json as the creation, so a directory that had been through one
     // load and save claimed to have been created then.
-    restored_index.set_created_at(manifest.created_at.clone());
+    let (created_at, replaced) = restored_created_at(&manifest, loaded_at);
+    restored_index.set_created_at(created_at);
 
     // The collection the directory names, at the generation and snapshot it
     // records, with the time and the sequence its manifest records, so its
@@ -4008,7 +4092,47 @@ fn read_checkpoint(
         identity,
         graph_rebuilt,
         read_only_features: reading.read_only,
+        replaced: replaced.into_iter().collect(),
     })
+}
+
+/// The creation time a load restores from `manifest`, and what it replaced,
+/// where it replaced anything.
+///
+/// A save writes the creation time the collection holds, and a load of 5.x
+/// refuses a manifest whose `created_at` is not an RFC 3339 time, which
+/// [`check_manifest_fields`] has already held a 5.x manifest to. So a
+/// `created_at` below 5.x that is not one is replaced, by the manifest's
+/// `saved_at` where that is an RFC 3339 time and by `loaded_at` otherwise,
+/// and the save after the load writes a manifest its own load reads.
+fn restored_created_at(manifest: &IndexManifest, loaded_at: &str) -> (String, Option<Replaced>) {
+    let is_time = |value: &str| chrono::DateTime::parse_from_rfc3339(value).is_ok();
+    if is_time(&manifest.created_at) {
+        return (manifest.created_at.clone(), None);
+    }
+    let (taken, source) = if is_time(&manifest.saved_at) {
+        (manifest.saved_at.clone(), "its saved_at".to_string())
+    } else {
+        (
+            loaded_at.to_string(),
+            format!(
+                "the time of this load, since its saved_at, '{}', is not one either",
+                manifest.saved_at
+            ),
+        )
+    };
+    let detail = format!(
+        "manifest.json records created_at as '{}', which is not an RFC 3339 time and which a \n         load of format 5.0.0 refuses, so the load took '{}', {}, in its place",
+        manifest.created_at, taken, source
+    );
+    let replaced = Replaced {
+        file: "manifest.json".to_string(),
+        field: "created_at".to_string(),
+        recorded: manifest.created_at.clone(),
+        taken: taken.clone(),
+        detail,
+    };
+    (taken, Some(replaced))
 }
 
 /// Hold a 5.x manifest's fields to what a save writes, before any artefact
@@ -4182,14 +4306,36 @@ struct Opened<'a> {
     /// its manifest marks `read_only`, which make the load read only
     /// whatever the medium.
     read_only_features: Vec<String>,
+    /// The load's own time, which a checkpoint read again takes as the
+    /// first read took it.
+    loaded_at: &'a str,
+    /// The file the checkpoint's raw vectors were read from, the internal
+    /// id counter it held and whether it held a fitted quantizer, which name
+    /// the file a value past the bound on a vector's norm came from.
+    raw_file: &'static str,
+    counter: usize,
+    fitted: bool,
 }
 
 impl Opened<'_> {
+    /// The first value the replayed collection holds past what the bound on
+    /// a vector's norm allows, with a replayed record's file named as
+    /// `journal`. See [`Collection::first_past_bound`].
+    fn past_bound(&self, index: &Collection, journal: &str) -> Option<PastBound> {
+        index.first_past_bound(&BoundSources {
+            raw: self.raw_file,
+            journal: Some(journal),
+            counter: self.counter,
+            fitted: self.fitted,
+        })
+    }
+
     /// The checkpoint read again into a collection of its own, at the
     /// collection and the sequence the load holds the journal to, for a
     /// repair whose replay met a record that would not apply.
     fn reopened(&self) -> Result<Collection, Error> {
-        let mut index = read_checkpoint(self.storage, self.tokenizer.clone())?.index;
+        let mut index =
+            read_checkpoint(self.storage, self.tokenizer.clone(), self.loaded_at)?.index;
         index.set_collection_id(self.directory_id);
         index.set_journal_sequence(self.record.sequence);
         Ok(index)
@@ -4415,6 +4561,14 @@ impl Opened<'_> {
             recovery.repair = plan.as_ref().map(|plan| plan.report(None));
             return Ok(read_only(index, self.path, cause, reached, recovery));
         }
+        // A collection holding a value past the bound on a vector's norm
+        // opens read only before anything is written, as one on a medium that
+        // refuses writes does, since this build writes no such value.
+        if let Some(past) = self.past_bound(&index, &file_name_of(journal)) {
+            recovery.repair = plan.as_ref().map(|plan| plan.report(None));
+            let cause = ReadOnlyCause::Bound(past);
+            return Ok(read_only(index, self.path, cause, reached, recovery));
+        }
         // The stale segments this load deletes and the records it takes rest
         // on the directory it read, which a save in an earlier process may
         // have moved into place without its sync landing, so the directory
@@ -4618,7 +4772,7 @@ impl Opened<'_> {
                 damage_segment: 0,
                 damage_at: record.offset,
                 damage_sequence: record.sequence,
-                detail: unapplied.error.to_string(),
+                detail: unapplied.cut_detail(),
             });
             kept = place;
             index = self.reopened()?;
@@ -4657,6 +4811,23 @@ impl Opened<'_> {
 
         if let Some(cause) = self.read_only_cause() {
             recovery.repair = plan.as_ref().map(|plan| plan.report(None));
+            return Ok(read_only(index, self.path, cause, reached, recovery));
+        }
+        // The upgrade below is a save, and a save records the generation after
+        // the directory's. A directory at the largest generation opens read only
+        // here, before anything is written, as one on a medium that refuses
+        // writes does.
+        let identity = index.identity();
+        if identity.next(0).is_none() {
+            recovery.repair = plan.as_ref().map(|plan| plan.report(None));
+            let cause = ReadOnlyCause::Generation(identity.generation);
+            return Ok(read_only(index, self.path, cause, reached, recovery));
+        }
+        // A collection holding a value past the bound on a vector's norm
+        // opens read only here too, before the upgrade writes it again.
+        if let Some(past) = self.past_bound(&index, &file_name_of(wal)) {
+            recovery.repair = plan.as_ref().map(|plan| plan.report(None));
+            let cause = ReadOnlyCause::Bound(past);
             return Ok(read_only(index, self.path, cause, reached, recovery));
         }
         zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::UpgradeAfterReplay);
@@ -4803,6 +4974,18 @@ struct Unapplied {
 }
 
 impl Unapplied {
+    /// The detail a repair records for the record it cuts for. For a record
+    /// that would not apply it is the words of what refused it, without the
+    /// plain load's refusal around them, which says the directory was not
+    /// opened. For a record that would not decode it is the decoder's
+    /// refusal.
+    fn cut_detail(&self) -> String {
+        match &self.error {
+            Error::JournalReplayFailed { detail, .. } => detail.clone(),
+            other => other.to_string(),
+        }
+    }
+
     /// The cut a repair makes for the record at `place` among `records`,
     /// whose call begins at `start`, being that call's first record, so no
     /// call is applied in part. `numbers` are the segments' numbers.
@@ -4828,7 +5011,7 @@ impl Unapplied {
             damage_segment: segment_of(damaged.sequence),
             damage_at: damaged.offset,
             damage_sequence: damaged.sequence,
-            detail: self.error.to_string(),
+            detail: self.cut_detail(),
         }
     }
 }
@@ -4855,10 +5038,10 @@ fn replay_live(
                 },
             )
         })?;
-        let applied = match live.state {
+        let applied = applied_or_panicked(|| match live.state {
             RecordState::Committed => index.apply(operation),
             RecordState::Withdrawn => index.apply_withdrawn(operation),
-        };
+        });
         applied.map_err(|error| {
             let error = Error::JournalReplayFailed {
                 file: file.to_string(),
@@ -4901,7 +5084,7 @@ fn replay_legacy_records(
                 },
             )
         })?;
-        index.apply_legacy(operation).map_err(|error| {
+        applied_or_panicked(|| index.apply_legacy(operation)).map_err(|error| {
             let error = Error::JournalReplayFailed {
                 file: file.to_string(),
                 sequence: record.sequence,
@@ -4919,6 +5102,21 @@ fn replay_legacy_records(
     Ok(())
 }
 
+/// Apply one record, taking a panic inside its install as the refusal of a
+/// record that will not apply, with the panic's words. A panic may leave the
+/// record part applied, so the collection it was applied to is not used
+/// again: a load that does not repair drops it with its refusal, and a
+/// repair reads the checkpoint again and replays the calls before the
+/// record's call onto that.
+fn applied_or_panicked(apply: impl FnOnce() -> Result<(), Error>) -> Result<(), Error> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(apply)).unwrap_or_else(|payload| {
+        Err(Error::Engine(format!(
+            "The engine failed inside the install of the record: {}",
+            panic_words(&*payload).trim_end_matches('.')
+        )))
+    })
+}
+
 /// The segment's file a record of `sequence` sits in, being the last
 /// segment named at or below it.
 fn segment_file<'a>(numbers: &[u64], files: &'a [String], sequence: u64) -> &'a str {
@@ -4929,12 +5127,32 @@ fn segment_file<'a>(numbers: &[u64], files: &'a [String], sequence: u64) -> &'a 
         .map_or("", String::as_str)
 }
 
+/// The file a loaded collection's raw vectors were read from: `vectors.bin`
+/// where the load built the graph again from it or the graph keeps a raw
+/// vector beside each code, and the graph dump otherwise.
+fn raw_vectors_file(index: &Collection, graph_rebuilt: bool) -> &'static str {
+    if graph_rebuilt || index.writes_raw_vectors() {
+        "vectors.bin"
+    } else {
+        GRAPH_DUMP_FILENAME
+    }
+}
+
+/// The last part of `path`, being the name a warning gives a journal.
+fn file_name_of(path: &Path) -> String {
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
+}
+
 /// The collection a load hands back read only, where the medium refused its
-/// first write or the directory holds features this build does not know and
-/// its manifest marks `read_only`: every record replayed, nothing on the
-/// medium changed, and a sink attached that refuses every mutation.
-/// `reached` is the last sequence the replay reached, which a save into
-/// another directory records.
+/// first write, the directory holds features this build does not know and
+/// its manifest marks `read_only`, the directory records the largest
+/// generation, or the collection holds a value past the bound on a vector's
+/// norm: every record replayed, nothing on the medium changed, and a sink
+/// attached that refuses every mutation. `reached` is the last sequence the
+/// replay reached, which a save into another directory records.
 fn read_only(
     index: Collection,
     path: &str,
@@ -4944,8 +5162,15 @@ fn read_only(
 ) -> (Collection, Recovery) {
     index.set_journal_sequence(reached);
     recovery.read_only = Some(cause.reason());
-    if let ReadOnlyCause::Features(features) = &cause {
-        recovery.read_only_features = features.clone();
+    match &cause {
+        ReadOnlyCause::Features(features) => recovery
+            .notes
+            .extend(features.iter().cloned().map(Note::ReadOnlyFeature)),
+        ReadOnlyCause::Generation(generation) => {
+            recovery.notes.push(Note::ReadOnlyGeneration(*generation))
+        }
+        ReadOnlyCause::Bound(_) => recovery.notes.push(Note::ReadOnlyBound),
+        ReadOnlyCause::Medium(_) => {}
     }
     index.attach_sink(Box::new(ReadOnlySink::new(
         std::path::PathBuf::from(path),
@@ -5455,5 +5680,9 @@ pub(crate) fn get_index_info(_path: &str) -> Option<IndexManifest> {
     None
 }
 
+#[cfg(test)]
+mod fuzz_tests;
+#[cfg(test)]
+pub(crate) mod memory;
 #[cfg(test)]
 mod tests;

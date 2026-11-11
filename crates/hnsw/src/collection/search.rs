@@ -92,7 +92,7 @@ use std::time::Instant;
 use tracing::{debug, error, instrument, trace, warn};
 use zeusdb_vector_core::{
     matches_filter, Admit, And, Bitmap, Budget, Candidates, ColumnStore, Error, FieldLookup,
-    Filter, Fusion, Hits, IdStore, IdfScope, MetadataStore, Position, Selection, SparseRef,
+    Filter, Fusion, Hits, IdStore, IdfScope, MetadataStore, Position, Screen, Selection, SparseRef,
     VectorIndex,
 };
 
@@ -841,9 +841,10 @@ impl Collection {
     /// The batch search path, for query vectors that are not yet processed
     /// for the space.
     ///
-    /// Every vector is checked for its width and for non-finite values before
-    /// any is searched, so one bad vector is findable in a batch of thousands
-    /// and refuses the whole call. A batch of five or fewer runs in turn under
+    /// Every vector is checked for its width, for non-finite values and, under
+    /// l2, dot or l1, for a norm past `NORM_BOUND` before any is searched, so
+    /// one bad vector is findable in a batch of thousands and refuses the
+    /// whole call. A batch of five or fewer runs in turn under
     /// one set of guards and a larger one fans across rayon.
     #[instrument(target = LOG_TARGET, level = "debug", skip(self, vectors, filter_conditions, params), fields(
         batch_size = vectors.len(),
@@ -879,14 +880,18 @@ impl Collection {
                 });
             }
 
-            // The same value check the single query path applies. A non-finite
-            // component survives normalization, because the norm of a vector
-            // containing one is not greater than zero, and the search then
-            // returns hits whose scores carry no distance information. The
-            // message names the batch entry as well as the component, so one
-            // bad vector is findable in a batch of thousands.
-            for (component, &value) in vector.iter().enumerate() {
-                if !value.is_finite() {
+            // The same value check the single query path applies, with the
+            // bound on the norm under l2, dot or l1. A non-finite component
+            // would reach the traversal, and the search would then return hits
+            // whose scores carry no distance information. The message names
+            // the batch entry as well as the component, so one bad vector is
+            // findable in a batch of thousands.
+            match self.dense().screen(vector) {
+                Screen::Admitted => {}
+                Screen::NotFinite {
+                    index: component,
+                    value,
+                } => {
                     error!(
                         target: LOG_TARGET,
                         operation = "batch_search_validation",
@@ -900,6 +905,16 @@ impl Collection {
                         index: component,
                         value,
                     });
+                }
+                Screen::PastBound { norm } => {
+                    error!(
+                        target: LOG_TARGET,
+                        operation = "batch_search_validation",
+                        vector_index = i,
+                        norm = norm,
+                        "Vector in batch has a norm past the bound"
+                    );
+                    return Err(Error::BatchVectorPastBound { position: i, norm });
                 }
             }
         }

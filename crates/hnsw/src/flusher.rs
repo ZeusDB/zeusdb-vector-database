@@ -127,6 +127,10 @@ struct State {
 impl Flusher {
     /// Start the thread over `handle`, syncing `interval` after the first
     /// commit that dirties the file.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the interval's milliseconds for a log record, which a u64 holds, since every interval is built from a u64 count of milliseconds"
+    )]
     pub(crate) fn start(
         handle: JournalSyncHandle,
         path: PathBuf,

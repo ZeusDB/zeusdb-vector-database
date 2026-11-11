@@ -33,19 +33,30 @@
 //!
 //! # The matrix
 //!
-//! Thirty-six points: eleven inside an `add`, three of them reached only
+//! Thirty-seven points: eleven inside an `add`, three of them reached only
 //! where its commit fails and one only where it replaces a held record, two
 //! in a roll by size, ten inside a checkpoint, five inside a backup, four
 //! inside the upgrade of a journal of format version 1, three inside a
-//! repair, and one with the lock held. The script's segments roll at a
+//! repair, one with the lock held, and one inside the close-up on removal.
+//! The script's segments roll at a
 //! length set so its last step passes it and no earlier step does. The
 //! ordinary gate runs a reduced matrix, being every point once: the add,
 //! overwrite, roll, checkpoint and backup points under the per-call arm, the
 //! backup points at the second backup, the three failing points under the
-//! failing arm at each step it fails, the lock, the upgrade over one fixture
-//! and the repair of one class of damage. `ZEUSDB_KILL_MATRIX=full` runs
-//! every point at every step under every arm, the upgrade over every fixture
-//! and the repair of every class.
+//! failing arm at each step it fails, the lock, the upgrade over one fixture,
+//! the repair of one class of damage and the close-up on removal under the
+//! per-call arm. `ZEUSDB_KILL_MATRIX=full` runs every point at every step
+//! under every arm, the upgrade over every fixture, the repair of every class
+//! and the close-up under the three durability arms.
+//!
+//! # The close-up on removal
+//!
+//! One more raw collection takes 4,100 records before the script, and its
+//! script removes them all as its first step and then runs the script. That
+//! removal leaves more holes than the bound and closes the positions up,
+//! and the point inside the close-up is after the removal's record is
+//! committed, so every record it names is absent once the directory opens
+//! again, and the rest of the script resumes from there.
 //!
 //! # The quantized collections
 //!
@@ -135,7 +146,12 @@ enum Step {
     Checkpoint,
     /// Write a backup into the script's one backup directory.
     Backup,
+    /// Remove every record the collection took before the script.
+    RemoveBase,
 }
+
+/// The close-up collection's first step, before the script.
+static REMOVE_BASE: Step = Step::RemoveBase;
 
 /// Every step, in order. Every record index is added exactly once, and
 /// replaced at most once by an overwrite, so a record present that no
@@ -165,6 +181,11 @@ const HIGHEST_RECORD: usize = 27;
 /// it, by index from `HIGHEST_RECORD + 1`.
 const BASE_RECORDS: usize = 1000;
 
+/// The records the close-up collection takes before the script and removes
+/// as its first step, which is more than the 4,096 holes a collection keeps
+/// whatever it holds, so the removal closes up.
+const CLOSE_UP_RECORDS: usize = 4_100;
+
 /// The collection the script runs over.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Shape {
@@ -175,6 +196,9 @@ enum Shape {
     Int8,
     /// A product quantized one under `quantized_only`, trained the same way.
     Pq,
+    /// A raw one that takes records before the script and removes them all
+    /// as its first step, which closes up.
+    CloseUp,
 }
 
 impl Shape {
@@ -183,6 +207,7 @@ impl Shape {
             Shape::Raw => "raw",
             Shape::Int8 => "int8",
             Shape::Pq => "pq",
+            Shape::CloseUp => "close_up",
         }
     }
 
@@ -190,6 +215,7 @@ impl Shape {
         match name {
             "int8" => Shape::Int8,
             "pq" => Shape::Pq,
+            "close_up" => Shape::CloseUp,
             _ => Shape::Raw,
         }
     }
@@ -199,7 +225,32 @@ impl Shape {
         match self {
             Shape::Raw => 0,
             Shape::Int8 | Shape::Pq => BASE_RECORDS,
+            Shape::CloseUp => CLOSE_UP_RECORDS,
         }
+    }
+
+    /// The records it takes before the script and still holds at its end.
+    fn kept(self) -> usize {
+        match self {
+            Shape::CloseUp => 0,
+            _ => self.base(),
+        }
+    }
+
+    /// Its steps in order, being the script, after the removal of the base
+    /// on the close-up collection.
+    fn steps(self) -> Vec<&'static Step> {
+        match self {
+            Shape::CloseUp => std::iter::once(&REMOVE_BASE).chain(SCRIPT).collect(),
+            _ => SCRIPT.iter().collect(),
+        }
+    }
+
+    /// The ids of the records it takes before the script.
+    fn base_ids(self) -> Vec<String> {
+        (HIGHEST_RECORD + 1..=self.highest())
+            .map(|i| format!("r{i}"))
+            .collect()
     }
 
     /// The highest record index it ever holds.
@@ -210,7 +261,7 @@ impl Shape {
     /// The quantization it declares.
     fn quantization(self, declaration: &Declaration) -> Option<QuantizationConfig> {
         match self {
-            Shape::Raw => None,
+            Shape::Raw | Shape::CloseUp => None,
             Shape::Int8 => Some(
                 declaration
                     .scalar_quantization(
@@ -234,7 +285,7 @@ impl Shape {
     /// collection's own codec or codebook on a quantized one.
     fn stored(self, collection: &Collection, vector: Vec<f32>) -> Vec<f32> {
         match self {
-            Shape::Raw => vector,
+            Shape::Raw | Shape::CloseUp => vector,
             Shape::Int8 => {
                 let codec = collection
                     .int8_codec()
@@ -337,12 +388,13 @@ const REPAIR_POINTS: &[KillPoint] = &[
 /// The corpus, drawn the same way in every process, so the parent knows what
 /// vector each record was given.
 fn corpus() -> Vec<Vec<f32>> {
-    let mut vectors = Vec::with_capacity(HIGHEST_RECORD + 1 + BASE_RECORDS);
+    let records = BASE_RECORDS.max(CLOSE_UP_RECORDS);
+    let mut vectors = Vec::with_capacity(HIGHEST_RECORD + 1 + records);
     // A generator of its own rather than the engine's, because the parent
     // and the child have to agree on the bytes and nothing else depends on
     // them. One multiplicative step per value.
     let mut state: u64 = 0x5eed_0148;
-    for _ in 0..=HIGHEST_RECORD + BASE_RECORDS {
+    for _ in 0..=HIGHEST_RECORD + records {
         let mut vector = Vec::with_capacity(DIM);
         for _ in 0..DIM {
             state = state
@@ -579,9 +631,12 @@ fn acknowledged(path: &Path) -> Acknowledged {
 /// Every acknowledged record present with the vector and the metadata of
 /// the form it was acknowledged in, or of its overwritten form where the
 /// step in flight replaces it, nothing present that the script never added,
-/// and no record of a call that returned refused present. What is not held
-/// is the presence of an unacknowledged record, which is correct either
-/// way. Returns the records present that no acknowledgement names.
+/// and no record of a call that returned refused present. A removal of the
+/// base in flight is past its commit, since its one point is inside the
+/// close-up that follows the commit, so every record it names is absent.
+/// What is not held is the presence of an unacknowledged record, which is
+/// correct either way. Returns the records present that no acknowledgement
+/// names.
 fn holds(
     collection: &Collection,
     expected: &Acknowledged,
@@ -593,12 +648,27 @@ fn holds(
         Some(Step::Overwrite(records)) => records.iter().map(|i| format!("r{i}")).collect(),
         _ => BTreeSet::new(),
     };
-    holds_present(collection, &expected.present, vectors, &replacing, shape)?;
+    let removing: BTreeSet<String> = match in_flight {
+        Some(Step::RemoveBase) => shape.base_ids().into_iter().collect(),
+        _ => BTreeSet::new(),
+    };
+    let present: BTreeMap<String, Form> = expected
+        .present
+        .iter()
+        .filter(|(id, _)| !removing.contains(*id))
+        .map(|(id, form)| (id.clone(), *form))
+        .collect();
+    holds_present(collection, &present, vectors, &replacing, shape)?;
     let live: BTreeSet<String> = collection
         .ids()
         .iter()
         .map(|(_, id)| id.to_string())
         .collect();
+    if let Some(id) = removing.iter().find(|id| live.contains(*id)) {
+        return Err(format!(
+            "record {id}, which the removal in flight names past its commit, is present"
+        ));
+    }
     for id in &expected.refused {
         if live.contains(id) {
             return Err(format!(
@@ -614,7 +684,7 @@ fn holds(
             return Err(format!("record {id} was never in the script"));
         }
     }
-    Ok(live.len() - expected.present.len())
+    Ok(live.iter().filter(|id| !present.contains_key(*id)).count())
 }
 
 /// Every record of `present` held in its form, or in its overwritten form
@@ -803,7 +873,8 @@ fn the_kill_matrixs_child() {
                 .expect("the journal opens beside the directory");
         }
         // The records a quantized collection takes before the script, which
-        // train it.
+        // train it, and those the close-up collection removes as its first
+        // step.
         if shape.base() > 0 {
             let base: Vec<usize> = (HIGHEST_RECORD + 1..=shape.highest()).collect();
             let added = collection.add_records(
@@ -812,14 +883,17 @@ fn the_kill_matrixs_child() {
                 false,
             );
             assert_eq!(added.total_errors, 0, "{:?}", added.errors);
-            assert!(collection.is_quantized(), "the base trains the collection");
+            assert!(
+                shape == Shape::CloseUp || collection.is_quantized(),
+                "the base trains the collection"
+            );
             let ids: Vec<String> = base.iter().map(|i| format!("r{i}")).collect();
             acknowledge(&acknowledgements, &format!("base add {}", ids.join(",")));
         }
         (collection, 0)
     };
 
-    for (index, step) in SCRIPT.iter().enumerate().skip(start_at) {
+    for (index, step) in shape.steps().into_iter().enumerate().skip(start_at) {
         match (target_step == Some(index)).then_some(point).flatten() {
             Some(point) => zeusdb_vector_core::kill_arm(point, &marker),
             None => zeusdb_vector_core::kill_disarm(),
@@ -879,6 +953,16 @@ fn the_kill_matrixs_child() {
             }
             Step::Remove(records) => {
                 let ids: Vec<String> = records.iter().map(|i| format!("r{i}")).collect();
+                collection.remove_points(&ids).expect("the removal runs");
+                acknowledge(
+                    &acknowledgements,
+                    &format!("step {index} remove {}", ids.join(",")),
+                );
+            }
+            // A step re-run after a recovery finds the records it names
+            // already gone, which a removal reports as missing.
+            Step::RemoveBase => {
+                let ids = shape.base_ids();
                 collection.remove_points(&ids).expect("the removal runs");
                 acknowledge(
                     &acknowledgements,
@@ -953,6 +1037,7 @@ fn points_of(step: usize) -> Vec<KillPoint> {
         Step::Checkpoint => CHECKPOINT_POINTS.to_vec(),
         Step::Backup => BACKUP_POINTS.to_vec(),
         Step::Remove(_) | Step::Update(_) => Vec::new(),
+        Step::RemoveBase => vec![KillPoint::RemovalMidCloseUp],
     };
     if step == ROLL_STEP {
         points.extend_from_slice(ROLL_POINTS);
@@ -1037,6 +1122,14 @@ fn cases(full: bool) -> Vec<Case> {
                 ..case("repair", 0, *point)
             });
         }
+    }
+    // The close-up on removal, at the first step of the collection that
+    // removes its base, under each arm the matrix runs.
+    for &arm in arms {
+        cases.push(Case {
+            shape: Shape::CloseUp,
+            ..case(arm, 0, KillPoint::RemovalMidCloseUp)
+        });
     }
     // The quantized collections: every checkpoint and backup point at each
     // step that saves, under the three durability arms.
@@ -1303,7 +1396,7 @@ fn the_kill_matrix_holds_at_every_point() {
         }
         let dir = work.0.join(format!("{name}.zdb"));
         let marker = work.0.join(format!("{name}.marker"));
-        let in_flight = Some(&SCRIPT[case.step]);
+        let in_flight = Some(case.shape.steps()[case.step]);
 
         // The child, armed at this point.
         let status = child_command(&dir, case.arm, case.shape)
@@ -1388,7 +1481,7 @@ fn the_kill_matrix_holds_at_every_point() {
         assert!(expected.finished, "resuming {name} did not reach the end");
         assert_eq!(
             expected.present.len(),
-            HIGHEST_RECORD - expected.refused.len() + case.shape.base(),
+            HIGHEST_RECORD - expected.refused.len() + case.shape.kept(),
             "the finished script holds every record but the one it removes and those refused"
         );
         let (recovered, _) = Collection::recover(&dir.to_string_lossy(), None, Durability::NoSync)

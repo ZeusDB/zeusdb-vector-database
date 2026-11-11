@@ -44,8 +44,8 @@
 /// Eleven inside an `add`, three of them reached only where its commit
 /// fails and one only in an overwrite, two in a roll by size, ten inside a
 /// checkpoint, five inside a backup, four inside the upgrade of a journal of
-/// format version 1, three inside a repair, and one with the lock held, each
-/// named for the step it follows.
+/// format version 1, three inside a repair, one with the lock held, and one
+/// inside the close-up on removal, each named for the step it follows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(usize)]
 pub enum KillPoint {
@@ -132,6 +132,11 @@ pub enum KillPoint {
     /// After `journal_to` takes the collection's lock and before anything is
     /// written.
     LockHeld,
+    /// Inside the close-up a removal batch runs where it leaves more holes
+    /// than the bound, after every structure's part is built off to the side
+    /// and before any is swapped in, which is after the batch's record is
+    /// committed.
+    RemovalMidCloseUp,
 }
 
 impl KillPoint {
@@ -173,6 +178,7 @@ impl KillPoint {
         KillPoint::RepairAfterCut,
         KillPoint::RepairAfterCheckpoint,
         KillPoint::LockHeld,
+        KillPoint::RemovalMidCloseUp,
     ];
 
     /// What a case names the point, which is what a directory and a marker
@@ -215,6 +221,7 @@ impl KillPoint {
             KillPoint::RepairAfterCut => "repair:after_cut",
             KillPoint::RepairAfterCheckpoint => "repair:after_checkpoint",
             KillPoint::LockHeld => "lock:held",
+            KillPoint::RemovalMidCloseUp => "removal:mid_close_up",
         }
     }
 

@@ -1020,3 +1020,61 @@ def test_vector_shape_counts_the_records_the_input_holds():
                       {"id": "e", "values": [0.1]}]).vector_shape == (2, 2)
     assert index.add(np.array([[0.1, 0.2], [np.nan, 0.2]],
                               dtype=np.float32)).vector_shape == (2, 2)
+
+
+# ------------------------------------------------------------
+# A vector past the bound on a vector's norm
+# ------------------------------------------------------------
+# 2^62 as a float32, the largest norm an index under l2, dot or l1 takes, and
+# the next float32 above it.
+AT_BOUND = float(np.float32(2.0 ** 62))
+PAST_BOUND = float(np.nextafter(np.float32(2.0 ** 62), np.float32(np.inf)))
+
+
+def past_bound_words(norm):
+    """What a refusal says of a norm past the bound after it names the
+    vector, with the norm as the engine prints it."""
+    return (f"has a Euclidean norm of {repr(float(norm)).replace('e+', 'e')} "
+            f"(must be at most 2^62, 4.611686018427388e18, under l2, dot or l1)")
+
+
+@pytest.mark.parametrize("space", ["l2", "dot", "l1"])
+def test_add_refuses_a_vector_past_the_bound_on_its_norm(space):
+    """Under l2, dot and l1, add() refuses a record whose Euclidean norm
+    passes 2^62 as that record's error, naming its norm and the bound, in
+    each input shape, and takes a record at the bound, so no record makes a
+    distance overflow. The records around a refused one go in."""
+    index = VectorDatabase().create("hnsw", dim=4, space=space, expected_size=20)
+    at = [AT_BOUND, 0.0, 0.0, 0.0]
+    past = [0.0, -PAST_BOUND, 0.0, 0.0]
+    words = past_bound_words(PAST_BOUND)
+
+    result = index.add({"ids": ["a1", "p1"], "embeddings": np.array([at, past], dtype=np.float32)})
+    assert (result.total_inserted, result.errors) == (1, [f"Vector p1: {words}"])
+    result = index.add(np.array([past, at], dtype=np.float32))
+    assert (result.total_inserted, result.errors) == (1, [f"Vector row_0: {words}"])
+    result = index.add([{"id": "p2", "values": past}, {"id": "a2", "values": at}])
+    assert (result.total_inserted, result.errors) == (1, [f"Vector p2: Vector {words}"])
+    result = index.add({"id": "p3", "values": past})
+    assert (result.total_inserted, result.errors) == (0, [f"Vector p3: Vector {words}"])
+    assert len(index) == 3 and "a1" in index and "a2" in index
+    assert not any(name in index for name in ("p1", "p2", "p3"))
+    hits = index.search(at, top_k=3)
+    assert len(hits) == 3 and all(np.isfinite(hit["score"]) for hit in hits)
+
+
+@pytest.mark.parametrize("values", [
+    [3.0e38, -3.0e38, 3.0e38, -3.0e38],
+    [float(np.finfo(np.float32).max), 0.0, 0.0, 0.0],
+    [1e-30, -2e-30, 0.0, 1e-30],
+])
+def test_a_cosine_vector_whose_squares_leave_the_float32_range_is_stored_at_unit_length(values):
+    """Under cosine add() takes a vector whose squares overflow or underflow a
+    float32 and stores it at unit length in the direction it had, where it
+    was stored as the zero vector or unchanged."""
+    index = VectorDatabase().create("hnsw", dim=4, space="cosine", expected_size=10)
+    assert index.add({"id": "big", "values": values}).is_success()
+    [stored] = index.get_records("big", return_vector=True)
+    vector = np.asarray(stored["vector"], dtype=np.float64)
+    assert abs(np.linalg.norm(vector) - 1.0) < 1e-6
+    assert (np.sign(vector) == np.sign(np.asarray(values, dtype=np.float64))).all()

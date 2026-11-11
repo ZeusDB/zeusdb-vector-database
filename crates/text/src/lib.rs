@@ -36,6 +36,10 @@
 //! recorded as such: an index that used one must be handed the same
 //! implementation again when it is opened.
 #![warn(unreachable_pub)]
+// A narrowing cast in this crate's library code states its bound in an
+// `#[expect]` beside it, so a cast with no stated bound fails the lint gate,
+// and an `#[expect]` whose cast is gone fails it too. Test code is left out.
+#![cfg_attr(not(test), warn(clippy::cast_possible_truncation))]
 
 mod dictionary;
 mod tokenizer;
@@ -48,3 +52,10 @@ pub use tokenizer::{SimpleTokenizer, Tokenizer, TokenizerConfig};
 pub use vectorize::{
     count_query, count_record, count_record_with, tokenize, vectorize_query, vectorize_record,
 };
+
+// The test build's allocator, which holds every request to a ceiling and a
+// fuzzer's reads to a bound. See `zeusdb_vector_core::test_support`.
+#[cfg(test)]
+#[global_allocator]
+static ALLOCATOR: zeusdb_vector_core::test_support::Bounded =
+    zeusdb_vector_core::test_support::Bounded;

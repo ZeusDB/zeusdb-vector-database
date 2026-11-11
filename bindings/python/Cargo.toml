@@ -78,3 +78,9 @@ chrono = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+# The engine again, with its test support turned on, for the allocator the test
+# build holds every request to a ceiling with. cargo applies a dev-dependency's
+# features to this crate's test targets and to nothing else.
+zeusdb-vector-core = { workspace = true, features = ["test-support"] }

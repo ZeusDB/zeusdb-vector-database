@@ -53,7 +53,7 @@ impl Stop {
 
 /// What a panic said: its message where it carries one as text, and a
 /// phrase saying it carried none otherwise.
-fn panic_words(payload: &(dyn Any + Send)) -> String {
+pub(crate) fn panic_words(payload: &(dyn Any + Send)) -> String {
     if let Some(words) = payload.downcast_ref::<&str>() {
         (*words).to_string()
     } else if let Some(words) = payload.downcast_ref::<String>() {

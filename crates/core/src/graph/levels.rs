@@ -116,6 +116,10 @@ impl LevelGenerator {
     pub(super) fn generate(&mut self) -> usize {
         let xsi = self.rng.sample(self.unif);
         let level = -xsi.ln() * self.scale;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a drawn level from f64, a cast that saturates, and a level at or above the ceiling is drawn again below"
+        )]
         let mut ulevel = level.floor() as usize;
         // Very low probability at the default scale. Cf the law above.
         if ulevel >= self.maxlevel {

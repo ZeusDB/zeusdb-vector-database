@@ -69,6 +69,10 @@
 //! match a target by prefix, so a record carrying this crate's name would fall
 //! outside both and be dropped.
 #![warn(unreachable_pub)]
+// A narrowing cast in this crate's library code states its bound in an
+// `#[expect]` beside it, so a cast with no stated bound fails the lint gate,
+// and an `#[expect]` whose cast is gone fails it too. Test code is left out.
+#![cfg_attr(not(test), warn(clippy::cast_possible_truncation))]
 
 mod calibrate;
 #[cfg(test)]
@@ -100,3 +104,10 @@ pub(crate) fn identity_positions(max: usize) -> &'static [u32] {
     let all = IDS.get_or_init(|| (0..=1u32 << 20).collect());
     &all[..=max.min(1 << 20)]
 }
+
+// The test build's allocator, which holds every request to a ceiling and a
+// fuzzer's reads to a bound. See `zeusdb_vector_core::test_support`.
+#[cfg(test)]
+#[global_allocator]
+static ALLOCATOR: zeusdb_vector_core::test_support::Bounded =
+    zeusdb_vector_core::test_support::Bounded;

@@ -212,6 +212,10 @@ pub(super) fn plan_segments<'a>(
                 continue;
             }
             let name = name_of(file);
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a byte offset held to the segment's length on the same line, so lossless on every 64-bit target"
+            )]
             let from = if i == place {
                 (cut.at as usize).min(segment.len())
             } else {
@@ -269,6 +273,10 @@ pub(super) fn plan_legacy<'a>(
     base_sequence: u64,
 ) -> Plan<'a> {
     let name = name_of(file);
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a byte offset held to the file's length on the same line, so lossless on every 64-bit target"
+    )]
     let from = (cut.at as usize).min(bytes.len());
     Plan {
         damage: damage_of(cut, file),

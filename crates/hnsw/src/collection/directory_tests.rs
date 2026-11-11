@@ -119,7 +119,7 @@ fn collection(space: &str, shape: Shape, vectors: &[Vec<f32>]) -> Collection {
 
 /// Every record, sorted by id, as its internal id, its vector's bits and its
 /// fields.
-fn everything(collection: &Collection) -> Vec<(String, usize, Vec<u32>, String)> {
+pub(super) fn everything(collection: &Collection) -> Vec<(String, usize, Vec<u32>, String)> {
     let names = collection.internal_ids();
     let views = collection
         .records(names.iter().map(|(_, id)| id.clone()).collect(), true, true)

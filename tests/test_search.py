@@ -685,8 +685,7 @@ def test_search_non_finite_query_values():
 
     # The batch path applies the same value check, and the message names the
     # entry in the batch as well as the component within it. Without the check
-    # the vector is normalized to itself, because the norm of a vector
-    # containing NaN is not greater than zero, and the search returns hits
+    # the NaN would reach the traversal, and the search would return hits
     # whose scores carry no distance information.
     with pytest.raises(
         ValueError, match=r"Vector 0 in batch contains invalid value at index 0: NaN"
@@ -1295,3 +1294,67 @@ def test_a_search_through_removed_records_returns_the_live_records_nearest_the_q
         arms = [[{**arm, "vector": q}] for q in queries]
         queried = [page(index.query(a, top_k=10)) for a in arms]
         assert queried == exact, ef_search
+
+
+# ------------------------------------------------------------
+# A query past the bound on a vector's norm
+# ------------------------------------------------------------
+# 2^62 as a float32, the largest norm an index under l2, dot or l1 searches
+# for, and the next float32 above it.
+AT_BOUND = float(np.float32(2.0 ** 62))
+PAST_BOUND = float(np.nextafter(np.float32(2.0 ** 62), np.float32(np.inf)))
+
+
+def past_bound_words(norm):
+    """What a refusal says of a norm past the bound after it names the
+    vector, with the norm as the engine prints it."""
+    return (f"has a Euclidean norm of {repr(float(norm)).replace('e+', 'e')} "
+            f"(must be at most 2^62, 4.611686018427388e18, under l2, dot or l1)")
+
+
+@pytest.mark.parametrize("space", ["l2", "dot", "l1"])
+def test_search_refuses_a_query_past_the_bound_on_its_norm(space):
+    """Under l2, dot and l1, search() refuses a query whose Euclidean norm
+    passes 2^62 with ValueError naming the norm and the bound, alone, in a
+    batch and as the dense arm of query(), and searches a query at the bound
+    with finite scores."""
+    index = VectorDatabase().create("hnsw", dim=4, space=space, expected_size=20)
+    added = index.add({"ids": [f"r{i}" for i in range(8)],
+                       "embeddings": np.arange(32, dtype=np.float32).reshape(8, 4)})
+    assert added.is_success(), added.errors
+    at = [AT_BOUND, 0.0, 0.0, 0.0]
+    past = [0.0, 0.0, -PAST_BOUND, 0.0]
+    words = past_bound_words(PAST_BOUND)
+
+    hits = index.search(at, top_k=3)
+    assert len(hits) == 3 and all(np.isfinite(hit["score"]) for hit in hits)
+    with pytest.raises(ValueError) as refusal:
+        index.search(past, top_k=3)
+    assert str(refusal.value) == f"Search vector {words}"
+    with pytest.raises(ValueError) as refusal:
+        index.search(np.array(past, dtype=np.float32), top_k=3)
+    assert str(refusal.value) == f"Search vector {words}"
+    for batch in ([at, past], [at] * 6 + [past]):
+        with pytest.raises(ValueError) as refusal:
+            index.search(batch, top_k=3)
+        assert str(refusal.value) == f"Vector {len(batch) - 1} in batch {words}"
+    with pytest.raises(ValueError) as refusal:
+        index.query(arms=[{"vector": past}], top_k=3)
+    assert f"Search vector {words}" in str(refusal.value)
+
+
+def test_a_cosine_query_past_the_bound_is_normalized_and_searched():
+    """Under cosine no query is held to the bound, and a query whose squares
+    overflow a float32 is normalized to unit length and finds the records the
+    same query scaled down finds, in the same order."""
+    index = VectorDatabase().create("hnsw", dim=4, space="cosine", expected_size=20)
+    rng = np.random.default_rng(2249)
+    vectors = rng.standard_normal((16, 4)).astype(np.float32)
+    assert index.add({"ids": [f"r{i}" for i in range(16)], "embeddings": vectors}).is_success()
+    direction = vectors[5] / np.linalg.norm(vectors[5])
+    huge = (direction.astype(np.float64) * 3.0e38).astype(np.float32)
+    plain = index.search(direction.tolist(), top_k=3)
+    scaled = index.search(huge.tolist(), top_k=3)
+    assert scaled[0]["id"] == "r5" == plain[0]["id"]
+    assert [hit["id"] for hit in scaled] == [hit["id"] for hit in plain]
+    assert all(np.isfinite(hit["score"]) for hit in scaled)

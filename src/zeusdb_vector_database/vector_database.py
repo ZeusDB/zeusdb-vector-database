@@ -520,7 +520,18 @@ class VectorDatabase:
         this build does not know, which its manifest marks read_only, opens
         read only the same way whatever the medium, and there every change,
         every save, checkpoint(), journal_to() and backup() raises
-        RuntimeError (FeatureReadOnly).
+        RuntimeError (FeatureReadOnly). A journaled directory below format
+        5.0.0 whose identity records the largest generation a manifest can
+        hold opens read only the same way, since its upgrade is a save and
+        no save can record the generation after it, and every change,
+        save, checkpoint() and backup() raises RuntimeError naming that
+        generation. A directory a release before 0.14.0 wrote from vectors
+        past the bound on a vector's norm, being a stored vector of an l2,
+        dot or l1 index whose Euclidean norm passes 2^62, a codebook value
+        past 2^62 or a scale past the largest one vectors within 2^62 fit,
+        opens read only the same way, journaled or not: a RuntimeWarning
+        names the value, its file and the bound, and every change, save,
+        checkpoint() and backup() raises RuntimeError in the same words.
 
         Args:
             path: Path to the .zdb directory containing the saved index
@@ -581,6 +592,12 @@ class VectorDatabase:
         dropped, and a segment deleted or moved under a live index is one the
         directory can no longer replay, so drop the index before touching the
         journal.
+
+        A directory below format 5.0.0 whose manifest records created_at as
+        anything but an RFC 3339 time opens with its saved_at in its place,
+        or with the time of the load where that is not one either. A
+        RuntimeWarning names both values, index.recovery reports them under
+        "replaced", and the next save writes the value taken.
 
         Example:
             >>> vdb = VectorDatabase()

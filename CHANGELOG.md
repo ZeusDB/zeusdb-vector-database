@@ -21,7 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`load(path, repair=True)`** loads a directory whose journal is damaged. It replays every whole call before the first call the damage touches, copies that call and every byte after it in the journal into `<path>.zdbjournal/quarantine/<UTC time>-<first sequence set aside>/` with a `repair.json` that describes them, cuts the journal there, and saves the directory. It raises `RuntimeError` where a sync of the quarantine, of the journal after the cut or of the quarantine once the repair's checkpoint lands fails, and a failed sync of the quarantine before the cut leaves the journal as it was. A `RuntimeWarning` names the damage, the records set aside and the folder. The next `load(path, repair=True)` completes a repair that stopped part way. A directory with no damage loads as it does without `repair`. On a medium that this process cannot write, the load replays the kept calls in memory, sets nothing aside and opens the index read only. `repair=True` with `checkpoint_only=True` raises `ValueError`.
 
-- **`recovery`**, a dict that describes what the load that built the index did, being the format it read, the records it replayed, withdrew and skipped, the damage it found, the checkpoint it took and why, whether it opened the index read only and why, and what a repair set aside. It is `None` on an index made in the process.
+- **`recovery`**, a dict that describes what the load that built the index did, being the format it read, the records it replayed, withdrew and skipped, the damage it found, the checkpoint it took and why, whether it opened the index read only and why, what a repair set aside, and each value it replaced. It is `None` on an index made in the process.
 
 - **`identity` holds `saved_at` and `sequence`**, the time the manifest of the directory `snapshot` names records for its save, and the journal sequence that directory holds.
 
@@ -61,7 +61,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **A save writes each record's stored vector, code or scalar row once, in the graph dump.** The dump is version 2, with a 128 byte header, an identity region, a rows region and a topology region that each carry a checksum of their own, and a trailer. `vectors.bin` holds the raw vectors that a trained product quantized index keeps beside its codes under `quantized_with_raw`.
 
-- **`load()` reads a 5.0.0 directory's rows from its graph dump.** It raises `RuntimeError` naming the dump and the check where the dump's length, header, identity region or rows region fails a check, or where a raw graph's row holds a NaN or an infinity, and `FileNotFoundError` where the directory lacks the dump. Where the topology region alone fails, it rebuilds the graph from the rows the dump holds and sets `recovery["graph_rebuilt"]`.
+- **`load()` reads a 5.0.0 directory's rows from its graph dump.** It raises `RuntimeError` naming the dump and the check where the dump's length, header, identity region or rows region fails a check, or where a raw graph's row, or a scalar quantized `cosine` row's inverse norm, holds a NaN or an infinity, and `FileNotFoundError` where the directory lacks the dump. Where the topology region alone fails, it rebuilds the graph from the rows the dump holds and sets `recovery["graph_rebuilt"]`.
 
 - **`ZEUSDB_LOAD_REBUILD_GRAPH=1` rebuilds the graph from the rows the dump holds**, which the load verifies first.
 
@@ -110,6 +110,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A search with no filter, on an index that holds fewer records than its search width and a graph node that a removal left, scores every record the index holds**, one distance a record, and returns the nearest `top_k` of them wherever they lie in the graph. `query()` and `explain()` report that arm as exact.
 
 - **The graph keeps a candidate neighbour that lies exactly as far from a kept neighbour as from the new record.** On vectors whose distances tie, as integer vectors' often do, the graph and the pages a search returns differ from those 0.13.0 builds.
+
+- **`add()` refuses a record of an `l2`, `dot` or `l1` index whose vector has a Euclidean norm past 2^62.** `errors` names the record, its norm and the bound, and the records around it go in. `search()` and each dense arm of `query()` raise `ValueError` naming the norm and the bound for such a query, and a batch names the query's position. A `cosine` index takes any finite vector.
+
+- **A directory that holds a value past that bound opens read only**, being a stored vector of an `l2`, `dot` or `l1` index whose Euclidean norm passes 2^62, a codebook value past 2^62, or a scalar scale past the largest one that vectors within the bound fit. `load()` reads every record, writes nothing, issues a `RuntimeWarning` naming the value, its file and the bound, and sets `recovery["read_only"]`, with a `read_only_reason` in the same words. `add()` reports each record as an error in those words, and every other mutation, `save()` into any directory, `checkpoint()`, `journal_to()` and `backup()` raise `RuntimeError` in them. Searches run.
+
+- **A journaled directory below format 5.0.0 whose identity records the largest generation a manifest can hold opens read only.** `load()` replays the journal in memory, writes nothing, issues a `RuntimeWarning` naming the generation, and sets `recovery["read_only"]`, with a `read_only_reason` in the same words. `add()` reports each record as an error in those words, and every other mutation, `save()` into any directory, `checkpoint()`, `journal_to()` and `backup()` raise `RuntimeError` in them.
+
+- **`load()` replaces a `created_at` that is not an RFC 3339 time in the manifest of a directory below format 5.0.0.** It takes the manifest's `saved_at`, or the time of the load where `saved_at` is not one either, and issues a `RuntimeWarning` naming the value recorded and the value taken. `recovery["replaced"]` lists each value a load replaced as a dict of `file`, `field`, `recorded`, `taken` and `detail`, and is empty where the load replaced none. The next save writes the value taken.
+
+- **The docstrings of `load()`, `add()`, `search()` and `recovery`** describe the bound on a vector's norm, the read-only load of a directory past it and of a journaled directory at the largest generation, and the replaced `created_at`.
 
 ### Fixed
 
@@ -173,6 +183,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`query()` and `explain()` price a dense arm with no filter, on an index whose every graph node holds a record, from the traversal that arm runs.**
 
+- **Under `cosine`, a vector whose squares overflow or underflow a `float32` is stored at unit length**, and a query is normalized the same way. The norm of such a vector is taken in `float64`, and every other vector stores the values it stored before.
+
+- **`load()` raises `RuntimeError` for a product quantized directory whose codebook holds a NaN or an infinity**, naming `pq_centroids.bin`, the subvector, the centroid and the value's place, at every format version.
+
+- **`load()` raises `RuntimeError` for a codebook in which a centroid's squared norm, or the squared distance between two centroids of a subvector, is not finite, and for a scalar scale for which 254 times the scale is not finite.** The message names `pq_centroids.bin` or `int8_scales.zdbint8` and the place.
+
+- **`load()` builds the graph again from a directory's records where its version 1 graph dump holds a NaN or an infinity in a raw row or as a scalar quantized `cosine` row's inverse norm**, and sets `recovery["graph_rebuilt"]`.
+
+- **`load()` raises `RuntimeError` for a scalar quantized `cosine` directory whose `int8_rows.zdbint8` holds a NaN or an infinity as an inverse norm**, naming the file and the record.
+
+- **A journal record whose install panics while `load()` replays it counts as a record that cannot be applied.** `load()` raises `RuntimeError` naming the record, its segment and what the panic said, and `load(path, repair=True)` sets the record's call and every byte after it aside, as damage of kind `apply`.
+
+- **Product quantizer training seeds all centroids also when the sum of the squared seeding distances is not finite.**
+
 ### Internal
 
 - Every workflow job names its runner image. The jobs that ran on `ubuntu-latest` run on `ubuntu-24.04`, and the Windows wheel is built on `windows-2025-vs2026` in place of `windows-latest`. These are the images each job ran on for 0.13.0. A change of runner image is a change to a workflow file.
@@ -218,6 +242,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The sparse index refuses a record at a position it holds as removed, before it writes anything, and its consistency check holds each posting list's count of removed postings to the postings on it whose record is removed.
 
 - The default Rust log filter quiets `rayon`, `pyo3` and `serde_json`, and a test holds each name to `Cargo.lock`.
+
+- Each crate turns on `clippy::cast_possible_truncation` for its library code, and each narrowing cast carries an `#[expect]` that states its bound.
+
+- The frame mutator and the graph dump mutator compile under the core crate's `test-support` feature and in its tests alone. The text crate's tests take the feature through a dev-dependency.
 
 ### Format
 

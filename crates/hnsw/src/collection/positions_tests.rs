@@ -11,12 +11,16 @@
 //! removal batch leaves. Each run declares one field and a sparse space, and
 //! the runs cover raw, product quantized with and without raw vectors, and
 //! scalar quantized declarations, each with a training size the sequence
-//! crosses. The writes include churn, overwrites of most of the records call
-//! after call, so the close-up on removal runs in every sequence and in the
-//! replay of a journal.
+//! crosses, under `l2`, and three more: a raw collection under cosine whose
+//! sparse space is a text space under the built-in tokenizer, a scalar
+//! quantized one under dot and a raw one under `l1`. The writes
+//! include churn, overwrites of most of the records call after call, so the
+//! close-up on removal runs in every sequence and in the replay of a journal.
+//! `ZEUSDB_PROPERTY_STEPS` sets the steps of every sequence for a deep run.
 //!
 //! After every step the collection answers what the model answers. Its
-//! positions agree, its holes and its close-ups on removal are the model's,
+//! graph holds its own structure, its positions agree, its holes and its
+//! close-ups on removal are the model's,
 //! its records, ids, fields and sparse halves are the model's, `count`,
 //! `list` and `get_records` are the model's, every exact path is brute force
 //! over the model, and every traversal returns the page the same graph
@@ -41,6 +45,7 @@ use zeusdb_vector_core::{
     Operation, OperationKind, Position, SparseVector, VectorIndex,
 };
 use zeusdb_vector_sparse::{SparseConfig, Unlink, Weighting};
+use zeusdb_vector_text::SimpleTokenizer;
 
 use super::{
     Collection, Declaration, Int8Scale, OperationSink, ParsedRecord, SparseHalf, StorageMode,
@@ -135,6 +140,39 @@ const EF: usize = 40;
 /// leaves more than this and more than the records held closes them up.
 const ALLOWANCE: usize = 4_096;
 
+/// The steps each sequence takes, unless `ZEUSDB_PROPERTY_STEPS` sets
+/// another number for a deep run.
+fn steps() -> usize {
+    std::env::var("ZEUSDB_PROPERTY_STEPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(90)
+}
+
+/// Term `n` of the vocabulary a text space's records are written from.
+/// There are `TERMS` of them, so a text space issues the ids a sparse space
+/// draws its dimensions from.
+fn term_word(n: usize) -> String {
+    format!("w{n}")
+}
+
+/// Ids sorted and counted into dimensions in increasing order, each with
+/// how often it occurs, which is how a text space counts terms.
+fn counted(mut ids: Vec<u32>) -> (Vec<u32>, Vec<f32>) {
+    ids.sort_unstable();
+    let mut dims: Vec<u32> = Vec::new();
+    let mut values: Vec<f32> = Vec::new();
+    for id in ids {
+        if dims.last() == Some(&id) {
+            *values.last_mut().unwrap() += 1.0;
+        } else {
+            dims.push(id);
+            values.push(1.0);
+        }
+    }
+    (dims, values)
+}
+
 /// The close-ups on removal this thread has run, live and in replays.
 fn close_ups() -> usize {
     super::insert::CLOSE_UPS_ON_REMOVAL.with(|count| count.get())
@@ -184,6 +222,13 @@ struct Model {
     /// checkpoint replays: the checkpoint loads with no holes, and the
     /// journal's removal batches follow the same rule.
     replay: Option<Replayed>,
+    /// The id a text space has issued each term, where the run declares one.
+    /// A term takes the next id the first time a record carries it, and a
+    /// clear forgets every term.
+    terms: Option<HashMap<String, u32>>,
+    /// The terms the text space has interned in the run, a term interned
+    /// again after a clear counted again.
+    interned: usize,
 }
 
 /// The holes and the close-ups on removal of a replay since its checkpoint.
@@ -223,7 +268,7 @@ impl Model {
         self.counter += 1;
         let sparse = match &record.sparse {
             Some(SparseHalf::Vector(vector)) => Some((vector.dims.clone(), vector.values.clone())),
-            Some(SparseHalf::Terms(_)) => unreachable!("no text layer is declared"),
+            Some(SparseHalf::Terms(terms)) => Some(self.count_record(terms)),
             None => None,
         };
         if sparse.is_some() {
@@ -240,10 +285,52 @@ impl Model {
         );
     }
 
+    /// A record's terms counted as a text space counts them: a term new to
+    /// the space takes the next id, in the order the record carries them.
+    fn count_record(&mut self, terms: &[String]) -> (Vec<u32>, Vec<f32>) {
+        let issued = self
+            .terms
+            .as_mut()
+            .expect("a record carries terms only where a text space is declared");
+        let mut new_terms = 0usize;
+        let ids = terms
+            .iter()
+            .map(|term| {
+                let next = u32::try_from(issued.len()).unwrap();
+                *issued.entry(term.clone()).or_insert_with(|| {
+                    new_terms += 1;
+                    next
+                })
+            })
+            .collect();
+        self.interned += new_terms;
+        counted(ids)
+    }
+
+    /// A query's text counted as a text space counts it: split where a
+    /// character is neither a letter nor a digit and lowercased, as the
+    /// built-in tokenizer does, with a term no record has carried dropped.
+    fn count_query(&self, text: &str) -> SparseVector {
+        let issued = self
+            .terms
+            .as_ref()
+            .expect("a text query is asked only where a text space is declared");
+        let ids = text
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|run| !run.is_empty())
+            .filter_map(|run| issued.get(&run.to_lowercase()).copied())
+            .collect();
+        let (dims, values) = counted(ids);
+        SparseVector { dims, values }
+    }
+
     fn clear(&mut self) {
         self.held.clear();
         self.counter = 0;
         self.sparse_slots = 0;
+        if let Some(terms) = &mut self.terms {
+            terms.clear();
+        }
         self.closed_up();
     }
 
@@ -323,11 +410,29 @@ fn sparse_half(rng: &mut Rng) -> Option<SparseHalf> {
     Some(SparseHalf::Vector(SparseVector { dims, values }))
 }
 
-fn record(rng: &mut Rng, id: String) -> ParsedRecord {
+/// A text half seven times in ten, of one to five of the first `reach`
+/// terms of the vocabulary, a term now and then repeated, as a tokenizer
+/// hands a record's terms over.
+fn text_half(rng: &mut Rng, reach: usize) -> Option<SparseHalf> {
+    if !rng.chance(70) {
+        return None;
+    }
+    let terms = (0..1 + rng.below(5))
+        .map(|_| term_word(rng.below(reach)))
+        .collect();
+    Some(SparseHalf::Terms(terms))
+}
+
+/// One record, its sparse half a text half of the first `reach` terms
+/// where `text` names a reach.
+fn record(rng: &mut Rng, id: String, text: Option<usize>) -> ParsedRecord {
     ParsedRecord {
         id,
         vector: vector(rng),
-        sparse: sparse_half(rng),
+        sparse: match text {
+            Some(reach) => text_half(rng, reach),
+            None => sparse_half(rng),
+        },
         metadata: fields(rng),
     }
 }
@@ -344,10 +449,13 @@ struct Probe {
     /// and one on both.
     filters: Vec<(&'static str, Filter)>,
     idf: Vec<IdfScope>,
+    /// Texts the text arm is asked, where the run declares a text space.
+    /// Each mixes case and punctuation and holds a term no record carries.
+    texts: Vec<String>,
 }
 
 impl Probe {
-    fn new(rng: &mut Rng, weighting: &Weighting) -> Self {
+    fn new(rng: &mut Rng, weighting: &Weighting, text: bool) -> Self {
         let filter = |value: Value| {
             let map: HashMap<String, Value> = serde_json::from_value(value).unwrap();
             compile_filter(&map).unwrap()
@@ -373,6 +481,14 @@ impl Probe {
             idf: match weighting {
                 Weighting::Bm25 { .. } => vec![IdfScope::Corpus, IdfScope::Global],
                 _ => vec![IdfScope::Corpus],
+            },
+            texts: if text {
+                vec![
+                    "w0 W7, w20 - w31 absent".to_string(),
+                    "W3 w3 w45; w12 nothing".to_string(),
+                ]
+            } else {
+                Vec::new()
             },
         }
     }
@@ -636,6 +752,14 @@ fn pages(collection: &Collection, probe: &Probe) -> Vec<Page> {
             }
         }
     }
+    for text in &probe.texts {
+        for filter in std::iter::once(None).chain(probe.filters.iter().map(|(_, f)| Some(f))) {
+            for &idf in &probe.idf {
+                let hits = collection.search_text(text, filter, K, idf).unwrap();
+                out.push(bits(hits));
+            }
+        }
+    }
     out
 }
 
@@ -650,6 +774,9 @@ fn check(
     probe: &Probe,
     step: &str,
 ) {
+    if let Err(broken) = collection.structure_holds() {
+        panic!("{step}: the graph's structure: {broken}");
+    }
     assert!(collection.positions_agree(), "{step}: the positions agree");
     let (extent, held) = {
         let ids = collection.ids.read().unwrap();
@@ -823,6 +950,21 @@ fn check(
                     page,
                     brute_sparse(model, weighting, query, filter, idf),
                     "{step}: the sparse arm under {:?} {:?}",
+                    filter.is_some(),
+                    idf
+                );
+            }
+        }
+    }
+    for text in &probe.texts {
+        let query = model.count_query(text);
+        for filter in std::iter::once(None).chain(probe.filters.iter().map(|(_, f)| Some(f))) {
+            for &idf in &probe.idf {
+                let page = bits(collection.search_text(text, filter, K, idf).unwrap());
+                assert_eq!(
+                    page,
+                    brute_sparse(model, weighting, &query, filter, idf),
+                    "{step}: the text arm for {text:?} under {:?} {:?}",
                     filter.is_some(),
                     idf
                 );
@@ -1106,6 +1248,11 @@ fn saved_files(dir: &Path) -> BTreeMap<String, Vec<u8>> {
 /// takes.
 struct Run {
     kind: Kind,
+    /// The dense space's metric.
+    space: &'static str,
+    /// Whether the sparse space is a text space under the built-in
+    /// tokenizer.
+    text: bool,
     weighting: Weighting,
     rng: Rng,
     model: Model,
@@ -1125,22 +1272,29 @@ struct Run {
 impl Run {
     fn label(&self, what: &str) -> String {
         format!(
-            "{:?} {:?} step {} ({what})",
-            self.kind, self.weighting, self.step
+            "{:?} {}{} {:?} step {} ({what})",
+            self.kind,
+            self.space,
+            if self.text { " text" } else { "" },
+            self.weighting,
+            self.step
         )
     }
 
     fn declaration(&self) -> (Declaration, Option<super::QuantizationConfig>) {
-        let declaration = Declaration::validate(DIM, "l2", 8, 40, 256, vec!["cat".to_string()])
-            .unwrap()
-            .with_sparse(
-                "terms",
-                SparseConfig {
-                    weighting: self.weighting,
-                    ..SparseConfig::default()
-                },
-            )
-            .unwrap();
+        let config = SparseConfig {
+            weighting: self.weighting,
+            ..SparseConfig::default()
+        };
+        let declared =
+            Declaration::validate(DIM, self.space, 8, 40, 256, vec!["cat".to_string()]).unwrap();
+        let declaration = if self.text {
+            declared
+                .with_text("terms", config, Arc::new(SimpleTokenizer))
+                .unwrap()
+        } else {
+            declared.with_sparse("terms", config).unwrap()
+        };
         let quantization = match self.kind {
             Kind::Raw => None,
             Kind::PqWithRaw => Some(
@@ -1200,11 +1354,16 @@ impl Run {
             self.model.removal_batch(1);
         }
         let name = self.fresh_name();
-        let mut record = record(&mut self.rng, name);
-        record.sparse = Some(SparseHalf::Vector(SparseVector {
-            dims: vec![self.rng.below(TERMS as usize) as u32],
-            values: vec![2.0],
-        }));
+        let mut record = self.new_record(collection, name);
+        let dim = self.rng.below(TERMS as usize);
+        record.sparse = Some(if self.text {
+            SparseHalf::Terms(vec![term_word(dim), term_word(dim)])
+        } else {
+            SparseHalf::Vector(SparseVector {
+                dims: vec![dim as u32],
+                values: vec![2.0],
+            })
+        });
         let was = collection.is_quantized();
         let added = collection.add_records(vec![record.clone()], vec![], false);
         assert_eq!(
@@ -1217,6 +1376,20 @@ impl Run {
         self.trained_if(was, collection);
         assert!(self.slot_count_held());
         self.check(collection, "slot count held");
+    }
+
+    /// A record named `name`, its vector processed for the dense space, as
+    /// the binding processes a record's vector before the collection takes
+    /// it.
+    ///
+    /// A text run's records draw from a vocabulary that widens by one term
+    /// every second step, so new terms arrive through the whole sequence and
+    /// its journals intern them.
+    fn new_record(&mut self, collection: &Collection, name: String) -> ParsedRecord {
+        let reach = (4 + self.step / 2).min(TERMS as usize);
+        let mut record = record(&mut self.rng, name, self.text.then_some(reach));
+        record.vector = collection.process_vector_for_space(record.vector);
+        record
     }
 
     /// Close the model's positions up where the collection trained during
@@ -1271,7 +1444,7 @@ impl Run {
             if records.iter().any(|r: &ParsedRecord| r.id == name) {
                 continue;
             }
-            records.push(record(&mut self.rng, name));
+            records.push(self.new_record(collection, name));
         }
         let added = collection.add_records(records.clone(), vec![], false);
         assert_eq!(
@@ -1299,7 +1472,7 @@ impl Run {
     fn overwrite_names(&mut self, collection: &Collection, names: Vec<String>, what: &str) {
         let records: Vec<ParsedRecord> = names
             .into_iter()
-            .map(|name| record(&mut self.rng, name))
+            .map(|name| self.new_record(collection, name))
             .collect();
         let was = collection.is_quantized();
         let added = collection.add_records(records.clone(), vec![], true);
@@ -1336,7 +1509,7 @@ impl Run {
                 if records.iter().any(|r| r.id == name) {
                     continue;
                 }
-                records.push(record(&mut self.rng, name));
+                records.push(self.new_record(collection, name));
             }
             let was = collection.is_quantized();
             let added = collection.add_records(records.clone(), vec![], false);
@@ -1602,6 +1775,7 @@ impl Run {
             self.hold_slot_count(collection);
         }
         let dir = self.temp.at(&format!("journal-{}", self.step));
+        let interned = self.model.interned;
         collection
             .journal_to(dir.to_str().unwrap(), Durability::default())
             .unwrap();
@@ -1629,6 +1803,9 @@ impl Run {
             }
         }
         assert!(collection.detach_sink().is_some());
+        if self.model.interned > interned {
+            tally("a term interned in a journal");
+        }
         let replay = self.model.replay.take().unwrap();
         let label = self.label("recovered");
         let live_pages = pages(collection, &self.probe);
@@ -1680,15 +1857,21 @@ impl Run {
 }
 
 /// One seeded sequence of `steps` operations on a collection of `kind`
-/// with a sparse space under `weighting`.
-fn run(kind: Kind, weighting: Weighting, seed: u64, steps: usize) {
+/// under the metric `space`, with a sparse space under `weighting`, a text
+/// space under the built-in tokenizer where `text` is set.
+fn run(kind: Kind, space: &'static str, text: bool, weighting: Weighting, seed: u64, steps: usize) {
     let mut rng = Rng(seed);
-    let probe = Probe::new(&mut rng, &weighting);
+    let probe = Probe::new(&mut rng, &weighting, text);
     let mut run = Run {
         kind,
+        space,
+        text,
         weighting,
         rng,
-        model: Model::default(),
+        model: Model {
+            terms: text.then(HashMap::new),
+            ..Model::default()
+        },
         names: 0,
         removed: Vec::new(),
         temp: TempDir::new(),
@@ -1700,6 +1883,14 @@ fn run(kind: Kind, weighting: Weighting, seed: u64, steps: usize) {
     };
     let (declaration, quantization) = run.declaration();
     let mut collection = Collection::build(declaration, quantization);
+    // The queries processed for the dense space once, as the binding
+    // processes a query before a search takes it.
+    run.probe.queries = run
+        .probe
+        .queries
+        .iter()
+        .map(|query| collection.process_vector_for_space(query.clone()))
+        .collect();
     let mut trained = false;
     let mut saves = 0;
     let mut journals = 0;
@@ -1743,7 +1934,7 @@ fn run(kind: Kind, weighting: Weighting, seed: u64, steps: usize) {
         assert!(trained, "{kind:?}: the sequence crossed the training size");
     }
     let tallied = TALLY.with(|tally| std::mem::take(&mut *tally.borrow_mut()));
-    eprintln!("{kind:?} {:?}: {tallied:?}", run.weighting);
+    eprintln!("{}: {tallied:?}", run.label("the run"));
     for what in [
         "insert",
         "overwrite",
@@ -1768,42 +1959,65 @@ fn run(kind: Kind, weighting: Weighting, seed: u64, steps: usize) {
             "{kind:?}: the sequence never ran {what}"
         );
     }
+    assert!(
+        !text || tallied.contains_key("a term interned in a journal"),
+        "{kind:?}: no journal of the text run interned a term"
+    );
 }
+
+const BM25: Weighting = Weighting::Bm25 { k1: 1.2, b: 0.75 };
 
 #[test]
 fn positions_follow_every_write_on_a_raw_collection() {
-    run(Kind::Raw, Weighting::Dot, 0x5eed_0001, 90);
-    run(
-        Kind::Raw,
-        Weighting::Bm25 { k1: 1.2, b: 0.75 },
-        0x5eed_0002,
-        90,
-    );
+    run(Kind::Raw, "l2", false, Weighting::Dot, 0x5eed_0001, steps());
+    run(Kind::Raw, "l2", false, BM25, 0x5eed_0002, steps());
 }
 
 #[test]
 fn positions_follow_every_write_on_a_product_quantized_collection_with_raw_vectors() {
-    run(
-        Kind::PqWithRaw,
-        Weighting::Bm25 { k1: 1.2, b: 0.75 },
-        0x5eed_0003,
-        90,
-    );
+    run(Kind::PqWithRaw, "l2", false, BM25, 0x5eed_0003, steps());
 }
 
 #[test]
 fn positions_follow_every_write_on_a_product_quantized_collection_without_raw_vectors() {
-    run(Kind::PqOnly, Weighting::Dot, 0x5eed_0004, 90);
+    run(
+        Kind::PqOnly,
+        "l2",
+        false,
+        Weighting::Dot,
+        0x5eed_0004,
+        steps(),
+    );
 }
 
 #[test]
 fn positions_follow_every_write_on_a_scalar_quantized_collection() {
+    run(Kind::Int8, "l2", false, BM25, 0x5eed_0005, steps());
+}
+
+/// A text space's terms are interned as records arrive and in a journal's
+/// replay, so every page the text arm answers rests on the ids being the
+/// ones the live collection issued.
+#[test]
+fn positions_follow_every_write_on_a_raw_collection_with_a_text_space() {
+    run(Kind::Raw, "cosine", true, BM25, 0x5eed_0224_0006, steps());
+}
+
+#[test]
+fn positions_follow_every_write_on_a_scalar_quantized_collection_under_dot() {
     run(
         Kind::Int8,
-        Weighting::Bm25 { k1: 1.2, b: 0.75 },
-        0x5eed_0005,
-        90,
+        "dot",
+        false,
+        Weighting::Dot,
+        0x5eed_0224_0007,
+        steps(),
     );
+}
+
+#[test]
+fn positions_follow_every_write_on_a_raw_collection_under_l1() {
+    run(Kind::Raw, "l1", false, BM25, 0x5eed_0224_0008, steps());
 }
 
 // ============================================================================
@@ -2656,7 +2870,7 @@ fn a_replay_closes_up_at_the_points_the_live_collection_did() {
         let live_at = live.ids().slot_of(&name);
         assert_eq!(replayed_at, live_at, "{name}");
     }
-    let probe = Probe::new(&mut Rng(0x5eed_0205), &bm25);
+    let probe = Probe::new(&mut Rng(0x5eed_0205), &bm25, false);
     assert_eq!(pages(&replayed, &probe), pages(&live, &probe));
 }
 
@@ -2698,7 +2912,7 @@ fn positions_after_a_recovery_may_differ_and_nothing_depends_on_them() {
     assert_eq!(live.ids().slot_of("r4100"), Some(0));
     assert_eq!(recovered.ids().slot_of("r4100"), Some(1_100));
     assert_eq!(recovered.internal_ids(), live.internal_ids());
-    let probe = Probe::new(&mut Rng(0x5eed_0206), &bm25);
+    let probe = Probe::new(&mut Rng(0x5eed_0206), &bm25, false);
     assert_eq!(pages(&recovered, &probe), pages(&live, &probe));
     assert!(recovered.detach_sink().is_some());
     let (a, b) = (temp.at("live"), temp.at("recovered"));

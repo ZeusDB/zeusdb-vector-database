@@ -785,6 +785,10 @@ impl RerankCalibration {
             return floor;
         };
         let scaled = depth * self.page_scale(top_k);
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a fetch from a finite positive f64, a cast that saturates by design"
+        )]
         let wanted = if scaled.is_finite() && scaled > 0.0 {
             scaled.round() as usize
         } else {
@@ -1047,6 +1051,10 @@ pub(crate) fn measure_rerank_fetches(
             continue;
         }
         pool.sort_unstable();
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a rank from f64, a cast that saturates, clamped to the pool on its line"
+        )]
         let position =
             ((RERANK_CALIBRATION_TARGET * pool.len() as f64).ceil() as usize).clamp(1, pool.len());
         out.push(pool[position - 1]);
@@ -1096,6 +1104,10 @@ pub fn calibrate_rerank_from_sample(
     let mut points: Vec<(f64, f64)> = Vec::with_capacity(fit_fetches.len());
     let last = fit_fetches.len() - 1;
     for (i, fraction) in RERANK_CALIBRATION_FIT_FRACTIONS.iter().enumerate() {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a record count from f64, a cast that saturates, held to the total on its line"
+        )]
         let records = ((total as f64 * fraction).round() as usize).min(total);
         let pages: &[usize] = if i == last {
             &RERANK_CALIBRATION_PAGES
@@ -1169,6 +1181,10 @@ pub fn calibrate_rerank_from_sample(
             .take(RERANK_CALIBRATION_QUERIES)
             .count(),
         target: RERANK_CALIBRATION_TARGET,
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "an elapsed time in milliseconds, which a u64 holds for 584 million years"
+        )]
         millis: started.elapsed().as_millis() as u64,
     })
 }

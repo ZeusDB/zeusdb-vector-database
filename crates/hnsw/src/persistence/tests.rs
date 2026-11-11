@@ -11,14 +11,15 @@
 //! The format version a directory declares, held to the form every release
 //! has written it in.
 
+use super::memory::MemDir;
 use super::older::rewrite_before_five;
 use super::*;
 use crate::collection::{Declaration, ParsedRecord};
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use zeusdb_vector_core::frame_fuzz;
-use zeusdb_vector_core::test_support::clustered;
+use zeusdb_vector_core::test_support::{bounded, clustered, read_bound};
+use zeusdb_vector_core::{checksum_of, frame_fuzz};
 
 // ============================================================================
 // HELPERS
@@ -386,7 +387,9 @@ fn replace(path: &Path, name: &str, bytes: &[u8]) {
 
 /// Every framed artefact reads back what was written, ids that are not
 /// ASCII, an empty id and one of 65,536 bytes among them, and floats by their
-/// bits, a NaN and a negative zero among them.
+/// bits, a NaN and a negative zero among a vector's, and a negative zero and
+/// a negative subnormal among a codebook's, every value of which its reader
+/// holds finite.
 #[test]
 fn every_framed_artefact_reads_back_what_was_written() {
     let long = "x".repeat(65_536);
@@ -436,7 +439,7 @@ fn every_framed_artefact_reads_back_what_was_written() {
     let codebook: Vec<Vec<Vec<f32>>> = (0..4)
         .map(|s| {
             (0..16)
-                .map(|c| vec![s as f32 + 0.5, -(c as f32), f32::from_bits(0x7fc0_0001)])
+                .map(|c| vec![s as f32 + 0.5, -(c as f32), f32::from_bits(0x8000_0001)])
                 .collect()
         })
         .collect();
@@ -643,8 +646,72 @@ fn a_framed_codebook_is_held_to_its_shape_before_it_is_built() {
     assert!(refused(framed::write_codebook(&ragged)).contains("differ in length"));
 }
 
-/// No mutation of any of the four framed artefacts panics its reader, and
-/// the repairs carry most of them past the frame into the payload's reader.
+/// The cases the framed artefact fuzzer runs, unless `ZEUSDB_FUZZ_CASES` sets
+/// another number for a deep run.
+fn framed_cases() -> usize {
+    std::env::var("ZEUSDB_FUZZ_CASES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4_000)
+}
+
+/// A manifest naming `files` and holding no other field a reader looks at,
+/// for a reader handed a directory in memory.
+fn manifest_naming(files: &[&str]) -> IndexManifest {
+    serde_json::from_value(json!({
+        "format_version": "4.0.0",
+        "zeusdb_version": "0.0.0",
+        "created_at": "",
+        "saved_at": "",
+        "total_vectors": 0,
+        "index_type": "hnsw",
+        "has_quantization": true,
+        "quantization_trained": true,
+        "storage_mode": "quantized_only",
+        "files_included": files,
+        "files_excluded": [],
+        "total_size_mb": 0.0,
+    }))
+    .unwrap()
+}
+
+/// `name` held alone in a directory in memory, under a manifest that records
+/// its length and digest as a save does, or the length and digest of `base`
+/// where `repaired` is false, so that the length or the digest refuses it.
+fn held_alone(name: &str, blob: &[u8], base: &[u8], repaired: bool) -> (MemDir, IndexManifest) {
+    let recorded = if repaired { blob } else { base };
+    let mut manifest = manifest_naming(&[name]);
+    manifest.file_digests.insert(
+        name.to_string(),
+        ArtefactDigest {
+            bytes: recorded.len() as u64,
+            checksum: Some(format!("{:016x}", checksum_of(recorded))),
+        },
+    );
+    let dir = MemDir::holding([(name.to_string(), blob.to_vec())].into_iter().collect());
+    (dir, manifest)
+}
+
+/// The count the frame of `blob` names, for a blob whose frame verifies, as
+/// the frame of every blob a reader accepts does.
+fn named_entries(blob: &[u8], kind: FrameKind) -> u64 {
+    unframe(blob, kind, "named").map_or(u64::MAX, |framed| framed.entries)
+}
+
+/// No mutation of any of the six framed artefacts panics its reader, the
+/// repairs carry most of them past the frame into the payload's reader, and
+/// every read a reader accepts holds exactly the shape its frame declares:
+/// as many records as the frame's count names, internal ids in increasing
+/// order and no higher than the counter, rows of the declared width at ids
+/// the mappings hold, a codebook of the declared shape, a finite positive
+/// scale for every dimension, and scalar rows of the declared width. A
+/// refusal is the reader's `Error`. Every read runs under `bounded` at
+/// `read_bound` of the bytes it is handed, so no allocation it makes is
+/// sized from a count it has not yet checked against them, and a request
+/// past the bound ends the run naming its size. The two scalar artefacts
+/// are read through a directory in memory whose manifest records each
+/// mutated file's length and digest, as a save does, in seven cases of
+/// eight.
 #[test]
 fn no_mutation_of_a_framed_artefact_panics_its_reader() {
     let ids = store(&[(1, "r1"), (3, "r3"), (4, "\u{e9}"), (7, "r7")]);
@@ -657,24 +724,162 @@ fn no_mutation_of_a_framed_artefact_panics_its_reader() {
     let (codes, _) =
         framed::write_codes(2, codes.iter().map(|(i, c)| (*i, c.as_slice())), 4).unwrap();
     let codebook = framed::write_codebook(&vec![vec![vec![0.25f32; 1]; 4]; 2]).unwrap();
-
+    let dim = 2;
+    let scale_bytes: Vec<u8> = [0.5f32, 0.25]
+        .iter()
+        .flat_map(|scale| scale.to_le_bytes())
+        .collect();
+    let scales = framed(FrameKind::Int8Scales, dim as u64, &scale_bytes);
+    let rows_payload: Vec<u8> = [1u32, 3, 4, 7]
+        .iter()
+        .flat_map(|&id| {
+            let mut row = id.to_le_bytes().to_vec();
+            row.extend([7u8; 2]);
+            row
+        })
+        .collect();
+    let rows = framed(FrameKind::Int8Rows, 4, &rows_payload);
+    let counter = 8;
+    let increasing = |held: &[usize]| held.windows(2).all(|pair| pair[0] < pair[1]);
     let mut rng = frame_fuzz::Rng(0x5eed_0182_f4a3_0001);
-    let cases = 4_000;
-    let mut reached = [0usize; 4];
+    let cases = framed_cases();
+    let mut reached = [0usize; 6];
     for _ in 0..cases {
         let blob = frame_fuzz::mutate(&mut rng, &mappings, FrameKind::IdMappings);
         reached[0] += usize::from(unframe(&blob, FrameKind::IdMappings, "m").is_ok());
-        let _ = framed_ids(&blob, &config(8));
+        let read = bounded(read_bound(blob.len()), || {
+            framed_ids(&blob, &config(counter))
+        });
+        if let Ok(read) = read {
+            let held: Vec<usize> = read.iter().map(|(internal_id, _)| internal_id).collect();
+            assert_eq!(
+                held.len() as u64,
+                named_entries(&blob, FrameKind::IdMappings),
+                "accepted mappings holding another count of records than their frame names"
+            );
+            assert!(
+                increasing(&held),
+                "accepted mappings whose internal ids do not increase: {held:?}"
+            );
+            assert!(
+                held.iter().all(|&internal_id| internal_id <= counter),
+                "accepted mappings past the counter {counter}: {held:?}"
+            );
+        }
+
         let blob = frame_fuzz::mutate(&mut rng, &vectors, FrameKind::RawVectors);
         reached[1] += usize::from(unframe(&blob, FrameKind::RawVectors, "v").is_ok());
-        let _ = framed_vectors(&blob, ids.view(), 2);
+        let read = bounded(read_bound(blob.len()), || {
+            framed_vectors(&blob, ids.view(), 2)
+        });
+        if let Ok(read) = read {
+            let held: Vec<usize> = read.iter().map(|(internal_id, _)| internal_id).collect();
+            assert_eq!(
+                held.len() as u64,
+                named_entries(&blob, FrameKind::RawVectors),
+                "accepted vectors holding another count of rows than their frame names"
+            );
+            assert!(
+                increasing(&held),
+                "accepted vectors whose internal ids do not increase: {held:?}"
+            );
+            for (internal_id, row) in read.iter() {
+                assert_eq!(row.len(), 2 * 4, "an accepted vector of another width");
+                assert!(
+                    ids.iter().any(|(held, _)| held == internal_id),
+                    "an accepted vector at internal id {internal_id}, which the mappings do not \
+                     hold"
+                );
+            }
+        }
+
         let blob = frame_fuzz::mutate(&mut rng, &codes, FrameKind::PqCodes);
         reached[2] += usize::from(unframe(&blob, FrameKind::PqCodes, "c").is_ok());
-        let _ = framed::Rows::read(&blob, FrameKind::PqCodes, "c", 1, 2, |_| String::new())
-            .map(|rows| rows.iter().count());
+        let read = bounded(read_bound(blob.len()), || {
+            framed::Rows::read(&blob, FrameKind::PqCodes, "c", 1, 2, |_| String::new())
+        });
+        if let Ok(read) = read {
+            let held: Vec<usize> = read.iter().map(|(internal_id, _)| internal_id).collect();
+            assert_eq!(
+                held.len() as u64,
+                named_entries(&blob, FrameKind::PqCodes),
+                "accepted codes holding another count of rows than their frame names"
+            );
+            assert!(
+                increasing(&held),
+                "accepted codes whose internal ids do not increase: {held:?}"
+            );
+            assert!(
+                read.iter().all(|(_, code)| code.len() == 2),
+                "accepted codes of another width"
+            );
+        }
+
         let blob = frame_fuzz::mutate(&mut rng, &codebook, FrameKind::PqCodebook);
         reached[3] += usize::from(unframe(&blob, FrameKind::PqCodebook, "b").is_ok());
-        let _ = framed::read_codebook(&blob, "b", shape(2, 4, 1));
+        let read = bounded(read_bound(blob.len()), || {
+            framed::read_codebook(&blob, "b", shape(2, 4, 1))
+        });
+        if let Ok(read) = read {
+            assert_eq!(
+                read.len() as u64,
+                named_entries(&blob, FrameKind::PqCodebook),
+                "an accepted codebook holding another count of subvectors than its frame names"
+            );
+            assert!(
+                read.len() == 2
+                    && read.iter().all(|centroids| {
+                        centroids.len() == 4 && centroids.iter().all(|c| c.len() == 1)
+                    }),
+                "an accepted codebook of another shape"
+            );
+        }
+
+        let blob = frame_fuzz::mutate(&mut rng, &scales, FrameKind::Int8Scales);
+        reached[4] += usize::from(unframe(&blob, FrameKind::Int8Scales, "s").is_ok());
+        let (dir, manifest) = held_alone(INT8_SCALES_FILENAME, &blob, &scales, rng.below(8) != 0);
+        let read = bounded(read_bound(blob.len()), || {
+            load_int8_scales(&dir, &manifest, dim)
+        });
+        if let Ok(codec) = read {
+            assert_eq!(
+                codec.dim() as u64,
+                named_entries(&blob, FrameKind::Int8Scales),
+                "an accepted codec holding another count of scales than its frame names"
+            );
+            assert_eq!(codec.dim(), dim, "an accepted codec of another width");
+            assert!(
+                codec
+                    .scales()
+                    .iter()
+                    .all(|scale| scale.is_finite() && *scale > 0.0),
+                "an accepted codec whose scales are not finite and positive: {:?}",
+                codec.scales()
+            );
+        }
+
+        let blob = frame_fuzz::mutate(&mut rng, &rows, FrameKind::Int8Rows);
+        reached[5] += usize::from(unframe(&blob, FrameKind::Int8Rows, "r").is_ok());
+        let (dir, manifest) = held_alone(INT8_ROWS_FILENAME, &blob, &rows, rng.below(8) != 0);
+        let read = bounded(read_bound(blob.len()), || {
+            load_int8_rows(&dir, &manifest, dim, false)
+        });
+        if let Ok(read) = read {
+            let held: Vec<usize> = read.iter().map(|(internal_id, _)| internal_id).collect();
+            assert_eq!(
+                held.len() as u64,
+                named_entries(&blob, FrameKind::Int8Rows),
+                "accepted scalar rows holding another count of rows than their frame names"
+            );
+            assert!(
+                increasing(&held),
+                "accepted scalar rows whose internal ids do not increase: {held:?}"
+            );
+            assert!(
+                read.iter().all(|(_, row)| row.len() == dim),
+                "accepted scalar rows of another width"
+            );
+        }
     }
     for (kind, reached) in reached.iter().enumerate() {
         assert!(

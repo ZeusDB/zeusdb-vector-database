@@ -150,6 +150,10 @@ impl TermDictionary {
             FrameEncoding::Engine,
             4 + terms.iter().map(|t| 4 + t.len()).sum::<usize>(),
         );
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the term count, below u32::MAX, since intern refuses past it with TermIdsExhausted"
+        )]
         payload.extend((terms.len() as u32).to_le_bytes());
         for term in &terms {
             let len = u32::try_from(term.len())
@@ -209,6 +213,10 @@ impl TermDictionary {
             if dictionary.ids.contains_key(term) {
                 return Err(corrupt(format!("term {} repeats an earlier term", id)));
             }
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a term's id at load, below the term count the payload records as a u32"
+            )]
             dictionary.ids.insert(Box::from(term), id as u32);
         }
         if at != payload.len() {
@@ -366,6 +374,7 @@ pub(crate) mod tests {
     #[test]
     fn no_mutation_of_a_valid_dictionary_panics_the_reader() {
         use zeusdb_vector_core::frame_fuzz;
+        use zeusdb_vector_core::test_support::{bounded, read_bound};
         let mut d = TermDictionary::new();
         for i in 0..200u32 {
             d.intern(&format!("term{}x{}", i, "é".repeat(i as usize % 4)))
@@ -380,7 +389,9 @@ pub(crate) mod tests {
         let mut past_frame = 0usize;
         for _ in 0..cases {
             let blob = frame_fuzz::mutate(&mut rng, &good, FrameKind::TermDictionary);
-            match TermDictionary::decode(&blob, "terms") {
+            match bounded(read_bound(blob.len()), || {
+                TermDictionary::decode(&blob, "terms")
+            }) {
                 Ok(back) => assert!(back.len() <= 200 + 64),
                 Err(Error::DecodeFailed { error, .. }) => {
                     if !error.contains("frame") && !error.contains("file") {

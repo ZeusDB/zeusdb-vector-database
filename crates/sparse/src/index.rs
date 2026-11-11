@@ -948,6 +948,10 @@ impl PostingsIndex {
         self.fwd_dims.extend_from_slice(vector.dims);
         self.fwd_values.extend_from_slice(vector.values);
         self.records[slot_index] = Slot { start, len };
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a record's length summed in f64 and kept as the f32 the scorer reads, not an offset, a count, an index or an id"
+        )]
         let length = vector.values.iter().map(|&v| v as f64).sum::<f64>() as f32;
         self.lengths[slot_index] = length;
         self.live_length += length as f64;
@@ -957,6 +961,10 @@ impl PostingsIndex {
             let slot = match self.slots_by_dim.get(&d) {
                 Some(&s) => s,
                 None => {
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "a new list's slot, below 2^32, since each list holds a distinct u32 dimension"
+                    )]
                     let s = self.lists.len() as u32;
                     self.lists.push(PostingList::default());
                     self.slots_by_dim.insert(d, s);
@@ -1191,6 +1199,10 @@ impl Persist for PostingsIndex {
     /// which is an index whose positions are its internal ids, as an index
     /// filled on its own is. A collection writes through
     /// [`PostingsIndex::write_with`].
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a position as an internal id, for an index filled on its own, below its record table's length"
+    )]
     fn write(&self, prefix: &str, dir: &dyn Dir, ledger: &mut dyn Ledger) -> Result<(), Error> {
         crate::persist::write(self, prefix, dir, ledger, &|at| at as u32)
     }

@@ -28,11 +28,15 @@ their version message rather than a parse error.
 import gc
 import hashlib
 import json
+import re
 import shutil
+import struct
+import warnings
 from pathlib import Path
 
 import numpy as np
 import pytest
+from helpers import checksum, reframe, repair_manifest, unframe
 from zeusdb_vector_database import VectorDatabase
 
 FIXTURES = Path(__file__).parent / "fixtures" / "formats"
@@ -294,3 +298,292 @@ def test_the_directory_fixtures_are_as_the_releases_wrote_them():
         for file in m["files_included"]:
             if file not in ("hnsw_index.hnsw.graph", "hnsw_index.hnsw.data"):
                 assert (folder / "index.zdb" / file).is_file(), (name, file)
+
+
+# ============================================================================
+# EVERY FIXTURE SAVED AT 5.0.0
+# ============================================================================
+
+def opened_copy(name, tmp_path):
+    """A copy of the fixture `name`, journaled or not, and the directory in it
+    to load."""
+    return copy_of(name, tmp_path) if name in NAMES else index_copy(name, tmp_path)
+
+
+def everything(index):
+    """Every record the index holds, by id, as its vector's float32 bytes in
+    hexadecimal and its metadata."""
+    ids = [record_id for record_id, _ in index.list(number=len(index) + 1)]
+    assert len(ids) == len(index)
+    return {record["id"]: (np.asarray(record["vector"], dtype="<f4").tobytes().hex(),
+                           record["metadata"])
+            for record in index.get_records(ids, return_vector=True)}
+
+
+@pytest.mark.parametrize("name", NAMES + DIRECTORIES)
+def test_every_fixture_saved_at_5_0_0_opens_again_with_the_same_records(tmp_path, name):
+    """Each fixture, loaded and written into a new folder, by save(), or by
+    backup() for a journaled one, whose save is its own checkpoint, is written
+    at 5.0.0, and the copy opens with every record the load held, each with
+    its vector bit for bit and its metadata, and with no other record."""
+    index = VectorDatabase().load(str(opened_copy(name, tmp_path)))
+    held = everything(index)
+    saved = tmp_path / f"{name}-saved.zdb"
+    if name in NAMES:
+        index.backup(str(saved))
+    else:
+        index.save(str(saved))
+    del index
+    gc.collect()
+    assert manifest(saved)["format_version"] == "5.0.0"
+    reopened = VectorDatabase().load(str(saved))
+    assert everything(reopened) == held
+
+
+# ============================================================================
+# A VALUE A LOAD OF 5.0.0 REFUSES
+# ============================================================================
+
+# A created_at that is not an RFC 3339 time.
+NOT_A_TIME = "9999999999999999999999999999999999999999"
+
+
+def loaded_with_warnings(path):
+    """The index a load of `path` opens, and the words of every
+    RuntimeWarning the load raised."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        index = VectorDatabase().load(str(path))
+    return index, [str(w.message) for w in caught if issubclass(w.category, RuntimeWarning)]
+
+
+@pytest.mark.parametrize("name,saved_at", [
+    ("v4.0.0-raw-l2", None), ("v4.0.0-raw-l2", "yesterday"), ("v3.0.0-journaled", None),
+])
+def test_a_created_at_that_is_not_an_rfc_3339_time_is_replaced_at_the_load(tmp_path, name,
+                                                                          saved_at):
+    """A directory below 5.0.0 whose created_at is not an RFC 3339 time opens
+    with its saved_at in its place, or with the time of the load where its
+    saved_at is not one either. A save of it, and the upgrade a journaled
+    directory takes at its load, write a manifest the next load opens with
+    nothing replaced. The load's RuntimeWarning and index.recovery each name
+    the value recorded and the value taken."""
+    path = opened_copy(name, tmp_path)
+    original = manifest(path)
+    rewritten = dict(original, created_at=NOT_A_TIME)
+    if saved_at is not None:
+        rewritten["saved_at"] = saved_at
+    (path / "manifest.json").write_text(json.dumps(rewritten, indent=2), encoding="utf-8",
+                                        newline="\n")
+
+    index, messages = loaded_with_warnings(path)
+    first = index.recovery
+    count = len(index)
+    if name in NAMES:
+        written = path
+    else:
+        written = tmp_path / f"{name}-saved.zdb"
+        index.save(str(written))
+    del index
+    gc.collect()
+    reopened, again = loaded_with_warnings(written)
+    assert len(reopened) == count
+    assert again == []
+    assert reopened.recovery["replaced"] == []
+
+    taken = manifest(written)["created_at"]
+    if saved_at is None:
+        assert taken == original["saved_at"]
+    else:
+        assert taken not in (NOT_A_TIME, saved_at)
+    [entry] = first["replaced"]
+    assert (entry["file"], entry["field"], entry["recorded"], entry["taken"]) == (
+        "manifest.json", "created_at", NOT_A_TIME, taken)
+    assert NOT_A_TIME in entry["detail"] and taken in entry["detail"]
+    [message] = messages
+    assert NOT_A_TIME in message and taken in message
+
+
+# ============================================================================
+# THE LARGEST GENERATION
+# ============================================================================
+
+# What every save of a directory at the largest generation is refused with.
+AT_THE_LARGEST = (
+    "This collection was read from a directory recording generation 18446744073709551615, the "
+    "largest a manifest can hold, so no save can record the one after it. No release writes that "
+    "generation, so the directory's manifest was edited.")
+
+
+def files_of(folder):
+    """Every file under `folder` but the lock, with its bytes."""
+    return sorted((p.relative_to(folder).as_posix(), p.read_bytes())
+                  for p in folder.rglob("*") if p.is_file() and p.suffix != ".zdblock")
+
+
+@pytest.mark.parametrize("name", ["v4.0.0-journaled-text", "v4.0.0-raw-l2"])
+def test_a_directory_at_the_largest_generation_refuses_every_save(tmp_path, name):
+    """A directory below 5.0.0 whose identity records the largest generation a
+    manifest can hold refuses every save in the words that name it. A
+    journaled one, whose load would upgrade it by a save, opens read only: its
+    journal is replayed in memory, nothing on disk changes, a RuntimeWarning
+    gives those words, and every change, checkpoint() and save is refused in
+    them. An unjournaled one opens as it did and takes changes."""
+    path = opened_copy(name, tmp_path)
+    m = manifest(path)
+    m["identity"]["generation"] = 2 ** 64 - 1
+    (path / "manifest.json").write_text(json.dumps(m, indent=2), encoding="utf-8", newline="\n")
+    before = files_of(path.parent)
+
+    index, messages = loaded_with_warnings(path)
+    copy = tmp_path / "copy.zdb"
+    if name in NAMES:
+        holds(index, expected_of(name))
+        assert index.recovery["read_only"] is True
+        assert index.recovery["read_only_reason"] == AT_THE_LARGEST
+        [message] = messages
+        assert AT_THE_LARGEST in message and "opened read only" in message
+        refused = index.add({"ids": ["new"], "embeddings": np.zeros((1, 8), dtype=np.float32)})
+        assert refused.total_errors == 1 and AT_THE_LARGEST in refused.errors[0], refused.errors
+        for change in (lambda: index.remove_point("r0"),
+                       lambda: index.checkpoint(),
+                       lambda: index.save(str(path)),
+                       lambda: index.save(str(copy)),
+                       lambda: index.backup(str(copy))):
+            with pytest.raises(RuntimeError) as refusal:
+                change()
+            assert AT_THE_LARGEST in str(refusal.value)
+    else:
+        assert index.recovery["read_only"] is False
+        assert messages == []
+        added = index.add({"ids": ["new"], "embeddings": np.zeros((1, 8), dtype=np.float32)})
+        assert added.is_success(), added.errors
+        with pytest.raises(RuntimeError) as refusal:
+            index.save(str(copy))
+        assert AT_THE_LARGEST in str(refusal.value)
+    del index
+    gc.collect()
+    assert not copy.exists()
+    assert files_of(path.parent) == before
+
+
+# ============================================================================
+# A VALUE PAST THE BOUND ON A VECTOR'S NORM
+# ============================================================================
+
+# What a load's reason for a value past the bound says after the value.
+PAST_THE_BOUND = " This build writes no such value, so the collection is read only."
+# The bound, 2^62, in the words of a stored vector or a codebook value.
+BOUND_WORDS = "2^62 (4.611686018427388e18)"
+
+
+def set_float(directory, name, at, value):
+    """The four bytes at `at` of the framed artefact `name` set to `value`,
+    framed again, and the manifest's record of the file made to agree."""
+    path = directory / name
+    _, _, payload = unframe(path.read_bytes())
+    payload = bytearray(payload)
+    payload[at:at + 4] = struct.pack("<f", value)
+    reframe(path, payload=bytes(payload))
+    repair_manifest(directory, name)
+
+
+def set_in_version_1_row(directory, node, at, value):
+    """The four bytes at `at` of node `node`'s row in the version 1 dump of
+    `directory` set to `value`, the dump's checksum and the manifest's record
+    of it made to agree. The rows follow the 96 byte header, the layer table
+    of 16 counts, every node's eight byte origin id and the adjacency."""
+    path = directory / "hnsw_index.zdbgraph"
+    blob = bytearray(path.read_bytes())
+    width = int.from_bytes(blob[20:24], "little") * (4 if blob[17] == 1 else 1)
+    rows = (96 + 64 + 8 * int.from_bytes(blob[40:48], "little")
+            + int.from_bytes(blob[64:72], "little"))
+    start = rows + node * width + at
+    blob[start:start + 4] = struct.pack("<f", value)
+    end = len(blob) - 16
+    blob[end:end + 8] = checksum(bytes(blob[96:end])).to_bytes(8, "little")
+    path.write_bytes(bytes(blob))
+    repair_manifest(directory, "hnsw_index.zdbgraph")
+
+
+def a_scale_of_1e30(path):
+    set_float(path, "int8_scales.zdbint8", 0, 1e30)
+    return (r"int8_scales\.zdbint8 holds a scale of (\S+) at dimension 0, past (\S+), the largest "
+            r"scale vectors whose norm is within 2\^62 fit\.",
+            [float(np.float32(1e30)), float(np.float32(2.0 ** 62) / np.float32(127))])
+
+
+def a_codebook_value_of_5e18(path):
+    _, _, payload = unframe((path / "pq_centroids.bin").read_bytes())
+    width = int.from_bytes(payload[4:8], "little")
+    set_float(path, "pq_centroids.bin", 8 + 4 * width, 5e18)
+    return (r"pq_centroids\.bin holds (\S+) at value 0 of centroid 1 of subvector 0, past "
+            + re.escape(BOUND_WORDS) + r", the largest value a codebook fitted to vectors whose "
+            r"norm is within 2\^62 holds\.",
+            [float(np.float32(5e18))])
+
+
+def a_raw_vector_of_norm_1e19(path):
+    set_float(path, "vectors.bin", 4 + 4 + 4, 1e19)
+    return (r"vectors\.bin holds the vector of 'r\d+', whose Euclidean norm is (\S+), past "
+            + re.escape(BOUND_WORDS) + r", the largest norm an index under l2 takes\.",
+            None)
+
+
+def a_dump_row_of_norm_1e19(path):
+    set_in_version_1_row(path, 2, 4, 1e19)
+    return (r"hnsw_index\.zdbgraph holds the vector of 'r\d+', whose Euclidean norm is (\S+), "
+            r"past " + re.escape(BOUND_WORDS) + r", the largest norm an index under l2 takes\.",
+            None)
+
+
+@pytest.mark.parametrize("name,edit", [
+    ("v4.0.0-int8-l2", a_scale_of_1e30),
+    ("v4.0.0-pq-l2-raw", a_codebook_value_of_5e18),
+    ("v4.0.0-pq-l2-raw", a_raw_vector_of_norm_1e19),
+    ("v4.0.0-journaled-text", a_dump_row_of_norm_1e19),
+])
+def test_a_directory_holding_a_value_past_the_bound_opens_read_only(tmp_path, name, edit):
+    """A directory 0.13.0 writes from vectors past the bound on a vector's
+    norm, here holding a scale, a codebook value or a raw vector past what
+    vectors within it give, every value finite, opens read only, whether or
+    not it is journaled: nothing on disk changes, a RuntimeWarning names the
+    value, the file and the bound, and every change, checkpoint() and save
+    is refused in the same words. Its searches run."""
+    path = opened_copy(name, tmp_path)
+    pattern, values = edit(path)
+    before = files_of(path.parent)
+
+    index, messages = loaded_with_warnings(path)
+    assert index.recovery["read_only"] is True
+    reason = index.recovery["read_only_reason"]
+    assert reason.endswith(PAST_THE_BOUND), reason
+    found = re.fullmatch(pattern + re.escape(PAST_THE_BOUND), reason)
+    assert found, reason
+    named = [float(group) for group in found.groups()]
+    if values is None:
+        assert 9.9e18 < named[0] < 1.1e19, reason
+    else:
+        # A codebook value and a scale are float32 values, named as such.
+        assert [np.float32(n) for n in named] == [np.float32(v) for v in values], reason
+    [message] = messages
+    assert reason in message and "opened read only" in message, message
+
+    hits = index.search([0.25] * index.dim, top_k=5)
+    assert len(hits) == 5
+    copy = tmp_path / "copy.zdb"
+    first = index.list(number=1)[0][0]
+    refused = index.add({"ids": ["new"], "embeddings": np.zeros((1, index.dim), dtype=np.float32)})
+    assert refused.total_errors == 1 and reason in refused.errors[0], refused.errors
+    for change in (lambda: index.remove_point(first),
+                   lambda: index.checkpoint(),
+                   lambda: index.save(str(path)),
+                   lambda: index.save(str(copy)),
+                   lambda: index.backup(str(copy))):
+        with pytest.raises(RuntimeError) as refusal:
+            change()
+        assert reason in str(refusal.value)
+    del index
+    gc.collect()
+    assert not copy.exists()
+    assert files_of(path.parent) == before
