@@ -1386,6 +1386,33 @@ def test_one_cosine_index_reports_one_scale_whatever_the_filter():
     assert checked >= 3, "no record was returned by both paths, so nothing was compared"
 
 
+@pytest.mark.parametrize("space", ["cosine", "l2"])
+def test_the_exact_scan_scores_a_coded_record_as_the_traversal_scores_it(space):
+    """On an index that keeps codes alone, a filter that admits every record
+    of an index within the scan threshold takes the exact scan, and the scan
+    scores each record a traversal returns with the bits the traversal gives
+    it, under cosine and under l2, so the two paths order the records they
+    share by the same scores."""
+    corpus = _pq_corpus(n=3000, dim=32)
+    metadatas = [{"tag": "every"} for _ in range(len(corpus))]
+    index = _pq_index(space, "quantized_only", corpus, metadatas=metadatas)
+    queries = np.random.default_rng(225).normal(size=(20, corpus.shape[1])).astype(np.float32) * 3.0
+    compared = 0
+    for q, query in enumerate(queries.tolist()):
+        traversed = index.search(query, top_k=50, ef_search=400)
+        assert len(traversed) == 50, (space, q)
+        scanned = {h["id"]: h["score"] for h in
+                   index.search(query, filter={"tag": "every"}, top_k=len(corpus))}
+        assert len(scanned) == len(corpus), (space, q)
+        for hit in traversed:
+            compared += 1
+            assert scanned[hit["id"]] == hit["score"], (
+                f"{space} query {q}: the scan scores {hit['id']} as {scanned[hit['id']]!r} and "
+                f"the traversal as {hit['score']!r}"
+            )
+    assert compared == 20 * 50
+
+
 def test_a_quantized_cosine_score_is_comparable_with_a_raw_cosine_score():
     """Two indexes over one corpus, one raw and one quantized, one scale.
 

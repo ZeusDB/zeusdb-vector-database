@@ -246,7 +246,7 @@ impl HNSWIndex {
                 // either kind of space, and then the space's, which is
                 // read with no guard taken.
                 if self.inner.takes_text() {
-                    vector.as_ref().validate()?;
+                    vector.as_ref().validate_bounded()?;
                     return Err(Error::SparseVectorOnTextSpace.into());
                 }
                 Ok(ParsedArm::Sparse { vector, idf })

@@ -3668,8 +3668,9 @@ fn load_locked(
         .and_then(|record| record.sequence)
         .filter(|_| major >= SEGMENTED_FORMAT_MAJOR);
     let raw_file = raw_vectors_file(&restored_index, graph_rebuilt);
-    // The first value past what the bound on a vector's norm allows, for a
-    // load that replays no journal. See `Collection::first_past_bound`.
+    // The first value past what the bound on a vector's norm or on a sparse
+    // value allows, for a load that replays no journal. See
+    // `Collection::first_past_bound`.
     let past_bound = |index: &Collection| {
         index.first_past_bound(&BoundSources {
             raw: raw_file,
@@ -4311,7 +4312,8 @@ struct Opened<'a> {
     loaded_at: &'a str,
     /// The file the checkpoint's raw vectors were read from, the internal
     /// id counter it held and whether it held a fitted quantizer, which name
-    /// the file a value past the bound on a vector's norm came from.
+    /// the file a value past the bound on a vector's norm or on a sparse
+    /// value came from.
     raw_file: &'static str,
     counter: usize,
     fitted: bool,
@@ -4561,9 +4563,10 @@ impl Opened<'_> {
             recovery.repair = plan.as_ref().map(|plan| plan.report(None));
             return Ok(read_only(index, self.path, cause, reached, recovery));
         }
-        // A collection holding a value past the bound on a vector's norm
-        // opens read only before anything is written, as one on a medium that
-        // refuses writes does, since this build writes no such value.
+        // A collection holding a value past the bound on a vector's norm or
+        // on a sparse value opens read only before anything is written, as
+        // one on a medium that refuses writes does, since this build writes
+        // no such value.
         if let Some(past) = self.past_bound(&index, &file_name_of(journal)) {
             recovery.repair = plan.as_ref().map(|plan| plan.report(None));
             let cause = ReadOnlyCause::Bound(past);
@@ -4823,8 +4826,9 @@ impl Opened<'_> {
             let cause = ReadOnlyCause::Generation(identity.generation);
             return Ok(read_only(index, self.path, cause, reached, recovery));
         }
-        // A collection holding a value past the bound on a vector's norm
-        // opens read only here too, before the upgrade writes it again.
+        // A collection holding a value past the bound on a vector's norm or
+        // on a sparse value opens read only here too, before the upgrade
+        // writes it again.
         if let Some(past) = self.past_bound(&index, &file_name_of(wal)) {
             recovery.repair = plan.as_ref().map(|plan| plan.report(None));
             let cause = ReadOnlyCause::Bound(past);
@@ -5150,7 +5154,8 @@ fn file_name_of(path: &Path) -> String {
 /// first write, the directory holds features this build does not know and
 /// its manifest marks `read_only`, the directory records the largest
 /// generation, or the collection holds a value past the bound on a vector's
-/// norm: every record replayed, nothing on the medium changed, and a sink
+/// norm or on a sparse value: every record replayed, nothing on the medium
+/// changed, and a sink
 /// attached that refuses every mutation. `reached` is the last sequence the
 /// replay reached, which a save into another directory records.
 fn read_only(

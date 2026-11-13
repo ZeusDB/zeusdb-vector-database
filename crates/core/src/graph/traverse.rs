@@ -31,11 +31,13 @@ pub(super) trait Topology {
     /// The element type stored vectors hold. The bounds are the vendored
     /// `Distance` trait's own, since it is what evaluates them.
     type Elem: Send + Sync;
-    /// The distance evaluated between a query and a stored vector.
-    type Dist: Distance<Self::Elem>;
+    /// What evaluates the distance between a query and a stored vector,
+    /// being the scorer of the path the traversal runs on.
+    type Dist: Distance<Self::Elem> + Copy;
 
-    /// The distance, which the traversal evaluates rather than reads.
-    fn distance(&self) -> &Self::Dist;
+    /// The scorer, which the traversal takes once and evaluates every
+    /// distance with.
+    fn distance(&self) -> Self::Dist;
 
     /// Nodes the graph holds, which bounds every node index.
     fn nb_points(&self) -> usize;
@@ -131,7 +133,9 @@ impl Visited {
     }
 }
 
-/// Bytes one cache line holds on every target this ships to.
+/// Bytes one cache line holds on every target this ships to. Compiled where
+/// the prefetch that reads it is.
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 const CACHE_LINE: usize = 64;
 
 /// Leading cache lines of a neighbour's vector to hint before it is scored.
@@ -180,7 +184,9 @@ const CACHE_LINE: usize = 64;
 ///
 /// Eight is the value chosen. It is the smallest count that covers a whole row
 /// at both dimensions the hint is worth anything at, and nothing above it can
-/// add there because the clamp discards it.
+/// add there because the clamp discards it. Compiled where the prefetch that
+/// reads it is.
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
 const PREFETCH_LINES: usize = 8;
 
 /// Hint the memory system for the vectors a neighbour list is about to be

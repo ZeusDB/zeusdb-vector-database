@@ -28,6 +28,17 @@ thread_local! {
     static BOUND: Cell<usize> = const { Cell::new(usize::MAX) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Whether this thread's requests are counted, which they are inside
+    /// [`counted`].
+    static COUNTING: Cell<bool> = const { Cell::new(false) };
+    /// Bytes this thread has been granted less bytes it has given back since
+    /// [`counted`] began, and the largest that figure has been.
+    static HELD: Cell<isize> = const { Cell::new(0) };
+    static PEAK: Cell<isize> = const { Cell::new(0) };
+}
+
 /// [`System`], with every request held to [`CEILING`] and each thread's
 /// requests to that thread's bound.
 pub struct Bounded;
@@ -54,6 +65,26 @@ fn admit(size: usize) -> bool {
     false
 }
 
+/// Count a block of `granted` bytes that took the place of one of `released`
+/// bytes on this thread, where the thread is inside [`counted`]. A request
+/// the allocator did not meet, which hands back null, moves nothing. The
+/// count is this crate's own tests', and every other build compiles none.
+#[inline(always)]
+#[cfg_attr(not(test), allow(unused_variables))]
+fn count(block: *mut u8, granted: usize, released: usize) {
+    #[cfg(test)]
+    {
+        if block.is_null() || !COUNTING.try_with(Cell::get).unwrap_or(false) {
+            return;
+        }
+        let _ = HELD.try_with(|held| {
+            let now = held.get() + granted as isize - released as isize;
+            held.set(now);
+            let _ = PEAK.try_with(|peak| peak.set(peak.get().max(now)));
+        });
+    }
+}
+
 // SAFETY: each method hands its arguments to `System` unchanged, or returns
 // null from an allocation, which `GlobalAlloc` allows for a request it cannot
 // meet.
@@ -61,7 +92,9 @@ unsafe impl GlobalAlloc for Bounded {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if admit(layout.size()) {
             // SAFETY: the caller's contract for `alloc`, passed on unchanged.
-            unsafe { System.alloc(layout) }
+            let block = unsafe { System.alloc(layout) };
+            count(block, layout.size(), 0);
+            block
         } else {
             std::ptr::null_mut()
         }
@@ -71,7 +104,9 @@ unsafe impl GlobalAlloc for Bounded {
         if admit(layout.size()) {
             // SAFETY: the caller's contract for `alloc_zeroed`, passed on
             // unchanged.
-            unsafe { System.alloc_zeroed(layout) }
+            let block = unsafe { System.alloc_zeroed(layout) };
+            count(block, layout.size(), 0);
+            block
         } else {
             std::ptr::null_mut()
         }
@@ -82,13 +117,16 @@ unsafe impl GlobalAlloc for Bounded {
             // SAFETY: the caller's contract for `realloc`, passed on
             // unchanged. A null return leaves `ptr` allocated, as `realloc`
             // requires.
-            unsafe { System.realloc(ptr, layout, new_size) }
+            let block = unsafe { System.realloc(ptr, layout, new_size) };
+            count(block, new_size, layout.size());
+            block
         } else {
             std::ptr::null_mut()
         }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        count(ptr, 0, layout.size());
         // SAFETY: the caller's contract for `dealloc`, passed on unchanged.
         unsafe { System.dealloc(ptr, layout) }
     }
@@ -110,6 +148,56 @@ impl Drop for Restore {
 pub fn bounded<R>(bound: usize, read: impl FnOnce() -> R) -> R {
     let _restore = Restore(BOUND.with(|held| held.replace(bound)));
     read()
+}
+
+/// What [`counted`] measured of one call, in bytes this thread was granted
+/// less bytes it gave back, from the level the thread held when the call
+/// began.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Held {
+    /// The level when the call ended. Below zero where the call gave back
+    /// more than it was granted.
+    pub(crate) end: isize,
+    /// The highest level during the call, at least zero.
+    pub(crate) peak: isize,
+}
+
+/// The state of the count before a [`counted`] call, put back when the call
+/// ends, by return or by unwind.
+#[cfg(test)]
+struct Uncounted(bool, isize, isize);
+
+#[cfg(test)]
+impl Drop for Uncounted {
+    fn drop(&mut self) {
+        let _ = COUNTING.try_with(|counting| counting.set(self.0));
+        let _ = HELD.try_with(|held| held.set(self.1));
+        let _ = PEAK.try_with(|peak| peak.set(self.2));
+    }
+}
+
+/// `body`, run with every block this thread is granted and gives back
+/// counted, and what the count read. Another thread's requests are not
+/// counted, so the figures are the call's own whatever else the process
+/// runs. A call is not made inside another.
+#[cfg(test)]
+pub(crate) fn counted<R>(body: impl FnOnce() -> R) -> (R, Held) {
+    assert!(
+        !COUNTING.with(Cell::get),
+        "counted is not called inside counted"
+    );
+    let _restore = Uncounted(
+        COUNTING.with(|counting| counting.replace(true)),
+        HELD.with(|held| held.replace(0)),
+        PEAK.with(|peak| peak.replace(0)),
+    );
+    let out = body();
+    let held = Held {
+        end: HELD.with(Cell::get),
+        peak: PEAK.with(Cell::get),
+    };
+    (out, held)
 }
 
 /// The bound a fuzzer reads a mutated input of `bytes` under: sixteen times

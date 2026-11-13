@@ -133,6 +133,66 @@ pub trait Distance<T> {
     fn eval(&self, va: &[T], vb: &[T]) -> f32;
 }
 
+/// A borrowed distance evaluates as the distance it borrows.
+impl<T, D: Distance<T> + ?Sized> Distance<T> for &D {
+    #[inline(always)]
+    fn eval(&self, va: &[T], vb: &[T]) -> f32 {
+        (**self).eval(va, vb)
+    }
+}
+
+/// How a graph of distance `D` evaluates its distances for the length of one
+/// search or one build step.
+///
+/// A caller takes a path once and hands it down, and every distance the
+/// search or the step evaluates then comes from the scorer the path gives.
+/// [`Held`] gives the graph's own distance. A kernel path, which
+/// `distance::resolve` answers, gives a raw distance its kernel of that path,
+/// so the processor is checked once for the search or the step and not once
+/// for each distance.
+pub(crate) trait Path<T, D>: Copy {
+    /// What evaluates the distances.
+    type Scorer<'a>: Distance<T> + Copy
+    where
+        D: 'a;
+
+    /// The scorer for a graph whose distance is `distance`.
+    fn scorer<'a>(self, distance: &'a D) -> Self::Scorer<'a>;
+}
+
+/// The path that evaluates with the distance the graph holds.
+///
+/// What a graph over codes takes, since its distance has one kernel, and
+/// what a caller that evaluates a raw distance through [`Distance::eval`]
+/// takes, which checks the processor in each call.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Held;
+
+impl<T, D: Distance<T>> Path<T, D> for Held {
+    type Scorer<'a>
+        = &'a D
+    where
+        D: 'a;
+
+    #[inline(always)]
+    fn scorer(self, distance: &D) -> &D {
+        distance
+    }
+}
+
+/// Evaluate `$body` with `$path` bound to the kernel path of this processor,
+/// resolved once, here. A search or a build step inside `$body` therefore
+/// checks the processor once.
+macro_rules! on_kernel_path {
+    ($path:ident => $body:expr) => {
+        match crate::distance::resolve() {
+            crate::distance::Resolved::Baseline($path) => $body,
+            #[cfg(target_arch = "x86_64")]
+            crate::distance::Resolved::Avx($path) => $body,
+        }
+    };
+}
+
 /// How far `sum(x * x)` may sit from one before a vector is not unit length.
 ///
 /// The quantity is the squared norm rather than the norm, because that is what
@@ -346,15 +406,23 @@ where
     }
 
     /// Phase one at `level`. Decides the insertion, reading only and drawing
-    /// nothing.
-    fn plan_at_level(&self, data: &[T], level: usize) -> Planned {
-        self.graph.plan_insertion(&self.store, data, level)
+    /// nothing, with every distance evaluated on `path`.
+    fn plan_at_level<P: Path<T, D>>(&self, path: P, data: &[T], level: usize) -> Planned {
+        self.graph.plan_insertion_on(path, &self.store, data, level)
     }
 
-    /// Phase two. Writes what phase one decided.
-    fn install(&mut self, data: &[T], origin_id: usize, position: u32, planned: Planned) {
+    /// Phase two. Writes what phase one decided, with every distance
+    /// evaluated on `path`.
+    fn install<P: Path<T, D>>(
+        &mut self,
+        path: P,
+        data: &[T],
+        origin_id: usize,
+        position: u32,
+        planned: Planned,
+    ) {
         self.graph
-            .install_insertion(&mut self.store, data, origin_id, position, planned);
+            .install_insertion_on(path, &mut self.store, data, origin_id, position, planned);
     }
 
     /// Append one raw vector to the side store a `quantized_with_raw` graph
@@ -394,12 +462,13 @@ where
 
     /// The draw and both phases, for a caller holding the graph outright,
     /// refused with nothing installed where the drawn level leaves the graph
-    /// no room for the record.
+    /// no room for the record. Every distance is evaluated with the distance
+    /// the graph holds, which a graph over codes takes.
     fn try_insert(&mut self, data: &[T], origin_id: usize, position: u32) -> Result<(), Error> {
         let level = self.draw_level();
         self.graph.room().take(level)?;
-        let planned = self.plan_at_level(data, level);
-        self.install(data, origin_id, position, planned);
+        let planned = self.plan_at_level(Held, data, level);
+        self.install(Held, data, origin_id, position, planned);
         Ok(())
     }
 }
@@ -443,6 +512,35 @@ pub enum VectorGraph {
     /// which is what makes the memory case: the store holds a quarter of
     /// what a raw store holds and there is no second store beside it.
     Int8(Backend<i8, Int8Dist>),
+}
+
+/// One query's table over a product quantized graph, held on the calling
+/// thread for the length of an exact scan, with the score of each node the
+/// scan asks for.
+///
+/// The table is the one a traversal installs for the query and
+/// [`CodeScores::at`] is the kernel a traversal evaluates, so the scan and
+/// the traversal score a node by one arithmetic. The table leaves the thread
+/// when this value is dropped. The value stays on the thread that made it,
+/// since the table is that thread's.
+#[allow(private_interfaces)]
+pub struct CodeScores<'a> {
+    backend: &'a Backend<u8, DistPQ>,
+    /// The code slice the kernel takes in the query's place, as a traversal
+    /// hands it one.
+    dummy: Vec<u8>,
+    _table: crate::distance::QueryLut,
+    _on_this_thread: std::marker::PhantomData<*const ()>,
+}
+
+impl CodeScores<'_> {
+    /// The score a traversal gives `node` for the query, on the scale the
+    /// kernel returns, or `None` for a node the graph does not hold.
+    #[inline]
+    pub fn at(&self, node: u32) -> Option<f32> {
+        let codes = self.backend.store.try_get(node)?;
+        Some(self.backend.graph.distance().eval(&self.dummy, codes))
+    }
 }
 
 /// One record on its way into the graph, in whichever form that graph holds.
@@ -746,21 +844,25 @@ impl VectorGraph {
         F: Fn(&usize) -> bool,
     {
         match self {
-            // Raw vector search
+            // Raw vector search. Each arm resolves the kernel path once, and
+            // the traversal evaluates every distance on it.
             VectorGraph::Cosine(b) => {
                 assert_unit_for_cosine(query, "search");
-                Ok(b.graph
-                    .search_with::<F, UNTIL_FULL>(&b.store, query, k, ef, filter))
+                Ok(
+                    on_kernel_path!(path => b.graph.search_with::<_, F, UNTIL_FULL>(
+                        path, &b.store, query, k, ef, filter
+                    )),
+                )
             }
-            VectorGraph::L2(b) => Ok(b
+            VectorGraph::L2(b) => Ok(on_kernel_path!(path => b
                 .graph
-                .search_with::<F, UNTIL_FULL>(&b.store, query, k, ef, filter)),
-            VectorGraph::L1(b) => Ok(b
+                .search_with::<_, F, UNTIL_FULL>(path, &b.store, query, k, ef, filter))),
+            VectorGraph::L1(b) => Ok(on_kernel_path!(path => b
                 .graph
-                .search_with::<F, UNTIL_FULL>(&b.store, query, k, ef, filter)),
-            VectorGraph::Dot(b) => Ok(b
+                .search_with::<_, F, UNTIL_FULL>(path, &b.store, query, k, ef, filter))),
+            VectorGraph::Dot(b) => Ok(on_kernel_path!(path => b
                 .graph
-                .search_with::<F, UNTIL_FULL>(&b.store, query, k, ef, filter)),
+                .search_with::<_, F, UNTIL_FULL>(path, &b.store, query, k, ef, filter))),
 
             // PQ-based search with ADC
             VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => {
@@ -773,8 +875,14 @@ impl VectorGraph {
                 // Create dummy query vector for HNSW traversal (flat u8 codes)
                 let dummy_query = vec![0u8; b.graph.distance().subvectors()];
 
-                Ok(b.graph
-                    .search_with::<F, UNTIL_FULL>(&b.store, &dummy_query, k, ef, filter))
+                Ok(b.graph.search_with::<_, F, UNTIL_FULL>(
+                    Held,
+                    &b.store,
+                    &dummy_query,
+                    k,
+                    ef,
+                    filter,
+                ))
             }
 
             // Scalar codes. The query is installed on this thread at full
@@ -786,8 +894,14 @@ impl VectorGraph {
                 }
                 let _query = b.graph.distance().install_query(query)?;
                 let dummy_query = vec![0i8; b.graph.distance().dim()];
-                Ok(b.graph
-                    .search_with::<F, UNTIL_FULL>(&b.store, &dummy_query, k, ef, filter))
+                Ok(b.graph.search_with::<_, F, UNTIL_FULL>(
+                    Held,
+                    &b.store,
+                    &dummy_query,
+                    k,
+                    ef,
+                    filter,
+                ))
             }
         }
     }
@@ -1096,6 +1210,35 @@ impl VectorGraph {
         }
     }
 
+    /// The scores a traversal of this graph gives its nodes for `query`, for
+    /// an exact scan over a product quantized graph that keeps no raw vector.
+    ///
+    /// `None` on every other graph, which an exact scan scores from the
+    /// vectors or the scalar rows it holds. The scores come from the kernel
+    /// the traversal evaluates, over the table the traversal installs for
+    /// the same query, so a node scores the same bits on either path. See
+    /// [`CodeScores`].
+    pub fn code_scores(&self, query: &[f32]) -> Option<Result<CodeScores<'_>, String>> {
+        match self {
+            VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b)
+                if b.raw.is_none() =>
+            {
+                Some(
+                    b.graph
+                        .distance()
+                        .install_query_lut(query)
+                        .map(|table| CodeScores {
+                            backend: b,
+                            dummy: vec![0u8; b.graph.distance().subvectors()],
+                            _table: table,
+                            _on_this_thread: std::marker::PhantomData,
+                        }),
+                )
+            }
+            _ => None,
+        }
+    }
+
     /// One node's stored row, being its scalar codes and, on a cosine graph,
     /// the four bytes of its inverse norm after them. What a rebuild re-inserts
     /// without re-encoding.
@@ -1245,13 +1388,24 @@ impl VectorGraph {
             samples.sort_by(|a, b| a.total_cmp(b));
             Some(samples[samples.len() / 2])
         }
+        // A raw graph is timed on the kernel path a scan of it runs,
+        // resolved once for the run.
+        macro_rules! timed {
+            ($b:ident) => {
+                on_kernel_path!(path => time(
+                    &path.scorer($b.graph.distance()),
+                    &$b.store,
+                    evaluations,
+                    rounds,
+                    admits
+                ))
+            };
+        }
         match self {
-            VectorGraph::Cosine(b) => {
-                time(b.graph.distance(), &b.store, evaluations, rounds, admits)
-            }
-            VectorGraph::L2(b) => time(b.graph.distance(), &b.store, evaluations, rounds, admits),
-            VectorGraph::L1(b) => time(b.graph.distance(), &b.store, evaluations, rounds, admits),
-            VectorGraph::Dot(b) => time(b.graph.distance(), &b.store, evaluations, rounds, admits),
+            VectorGraph::Cosine(b) => timed!(b),
+            VectorGraph::L2(b) => timed!(b),
+            VectorGraph::L1(b) => timed!(b),
+            VectorGraph::Dot(b) => timed!(b),
             VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => {
                 let query = vec![0f32; b.graph.distance().dim()];
                 let _query_lut = b.graph.distance().install_query_lut(&query).ok()?;
@@ -1709,19 +1863,28 @@ impl VectorGraph {
     /// it planned against rather than trusting that.
     pub fn plan_at_level(&self, record: Record<'_>, level: usize) -> Option<Planned> {
         match (self, record) {
+            // A raw graph resolves the kernel path once for the plan.
             (VectorGraph::Cosine(b), Record::Raw(v)) => {
                 assert_unit_for_cosine(v, "insert");
-                Some(b.plan_at_level(v, level))
+                Some(on_kernel_path!(path => b.plan_at_level(path, v, level)))
             }
-            (VectorGraph::L2(b), Record::Raw(v)) => Some(b.plan_at_level(v, level)),
-            (VectorGraph::L1(b), Record::Raw(v)) => Some(b.plan_at_level(v, level)),
-            (VectorGraph::Dot(b), Record::Raw(v)) => Some(b.plan_at_level(v, level)),
+            (VectorGraph::L2(b), Record::Raw(v)) => {
+                Some(on_kernel_path!(path => b.plan_at_level(path, v, level)))
+            }
+            (VectorGraph::L1(b), Record::Raw(v)) => {
+                Some(on_kernel_path!(path => b.plan_at_level(path, v, level)))
+            }
+            (VectorGraph::Dot(b), Record::Raw(v)) => {
+                Some(on_kernel_path!(path => b.plan_at_level(path, v, level)))
+            }
             (VectorGraph::CosinePQ(b), Record::Codes { codes, .. })
             | (VectorGraph::L2PQ(b), Record::Codes { codes, .. })
             | (VectorGraph::L1PQ(b), Record::Codes { codes, .. }) => {
-                Some(b.plan_at_level(codes, level))
+                Some(b.plan_at_level(Held, codes, level))
             }
-            (VectorGraph::Int8(b), Record::Int8(codes)) => Some(b.plan_at_level(codes, level)),
+            (VectorGraph::Int8(b), Record::Int8(codes)) => {
+                Some(b.plan_at_level(Held, codes, level))
+            }
             // A scalar graph handed anything but scalar codes, or scalar
             // codes handed to any other graph, is the same programming error
             // the two arms below name for the other element types.
@@ -1767,17 +1930,28 @@ impl VectorGraph {
     pub fn install(&mut self, record: Record<'_>, id: usize, at: Position, planned: Planned) {
         let position = at.0;
         match (self, record) {
-            (VectorGraph::Cosine(b), Record::Raw(v)) => b.install(v, id, position, planned),
-            (VectorGraph::L2(b), Record::Raw(v)) => b.install(v, id, position, planned),
-            (VectorGraph::L1(b), Record::Raw(v)) => b.install(v, id, position, planned),
-            (VectorGraph::Dot(b), Record::Raw(v)) => b.install(v, id, position, planned),
+            // A raw graph resolves the kernel path once for the install.
+            (VectorGraph::Cosine(b), Record::Raw(v)) => {
+                on_kernel_path!(path => b.install(path, v, id, position, planned))
+            }
+            (VectorGraph::L2(b), Record::Raw(v)) => {
+                on_kernel_path!(path => b.install(path, v, id, position, planned))
+            }
+            (VectorGraph::L1(b), Record::Raw(v)) => {
+                on_kernel_path!(path => b.install(path, v, id, position, planned))
+            }
+            (VectorGraph::Dot(b), Record::Raw(v)) => {
+                on_kernel_path!(path => b.install(path, v, id, position, planned))
+            }
             (VectorGraph::CosinePQ(b), Record::Codes { codes, raw })
             | (VectorGraph::L2PQ(b), Record::Codes { codes, raw })
             | (VectorGraph::L1PQ(b), Record::Codes { codes, raw }) => {
-                b.install(codes, id, position, planned);
+                b.install(Held, codes, id, position, planned);
                 b.push_raw(raw);
             }
-            (VectorGraph::Int8(b), Record::Int8(codes)) => b.install(codes, id, position, planned),
+            (VectorGraph::Int8(b), Record::Int8(codes)) => {
+                b.install(Held, codes, id, position, planned)
+            }
             // Unreachable, because a plan the element type refused is `None`
             // and the caller then installs nothing.
             _ => error!(

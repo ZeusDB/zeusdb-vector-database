@@ -524,8 +524,35 @@ const ENV_UPGRADE: &str = "ZEUSDB_KILL_UPGRADE";
 const ENV_REPAIR: &str = "ZEUSDB_KILL_REPAIR";
 const ENV_SHAPE: &str = "ZEUSDB_KILL_SHAPE";
 
+/// Set where the parent asks the child for its error mode and nothing else.
+const ENV_ERROR_MODE: &str = "ZEUSDB_KILL_ERROR_MODE";
+
 /// The name of the child test, as `--exact` spells it.
 const CHILD_TEST: &str = "collection::crash_tests::the_kill_matrixs_child";
+
+/// The two flags of a Windows error mode under which the system hands an
+/// abort of the process to nothing: no crash dump is written, no report is
+/// filed and no event is logged, and the process ends at once.
+#[cfg(windows)]
+const QUIET_ABORT_MODE: u32 = 0x0001 | 0x0002;
+
+/// Add [`QUIET_ABORT_MODE`] to this process's error mode, and hand back the
+/// mode then in force. The child calls it before it arms a kill point, so an
+/// abort it takes leaves nothing behind whatever error mode it inherited.
+#[cfg(windows)]
+fn abort_quietly() -> u32 {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetErrorMode() -> u32;
+        fn SetErrorMode(mode: u32) -> u32;
+    }
+    // SAFETY: both calls read or set the error mode of this process, and
+    // neither takes a pointer.
+    unsafe {
+        SetErrorMode(GetErrorMode() | QUIET_ABORT_MODE);
+        GetErrorMode()
+    }
+}
 
 /// The policy each arm runs under.
 fn durability(arm: &str) -> Durability {
@@ -802,6 +829,17 @@ fn backup_holds(
 #[test]
 #[ignore = "the parent runs this in a process of its own, armed to abort"]
 fn the_kill_matrixs_child() {
+    let asked_for_its_mode = std::env::var(ENV_ERROR_MODE).is_ok();
+    #[cfg(windows)]
+    if asked_for_its_mode || std::env::var(ENV_DIR).is_ok() {
+        let mode = abort_quietly();
+        if asked_for_its_mode {
+            println!("error mode {mode:#x}");
+        }
+    }
+    if asked_for_its_mode {
+        return;
+    }
     let Ok(dir) = std::env::var(ENV_DIR) else {
         return;
     };
@@ -1356,6 +1394,45 @@ fn lock_case(work: &Path, name: &str, vectors: &[Vec<f32>]) -> Option<String> {
     holds(&recovered, &expected, vectors, None, Shape::Raw)
         .unwrap_or_else(|e| panic!("after {name}: {e}"));
     Some(format!("{name}: the lock was released with the process"))
+}
+
+/// The child sets its own error mode before it runs a case. Started with
+/// the system's default error mode, which holds neither flag, it reports a
+/// mode that holds both flags of [`QUIET_ABORT_MODE`], so the abort of an
+/// armed child leaves no crash dump, no report and no event whatever shell
+/// started the suite.
+#[cfg(windows)]
+#[test]
+fn the_kill_matrixs_child_aborts_under_a_quiet_error_mode() {
+    use std::os::windows::process::CommandExt;
+    // The child takes the system's default error mode and not this
+    // process's.
+    const CREATE_DEFAULT_ERROR_MODE: u32 = 0x0400_0000;
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", CHILD_TEST, "--ignored", "--nocapture"])
+        .env(ENV_ERROR_MODE, "1")
+        .env_remove(ENV_DIR)
+        .env_remove(ENV_MATRIX)
+        .creation_flags(CREATE_DEFAULT_ERROR_MODE)
+        .output()
+        .expect("the child runs");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "the child asked for its error mode failed:\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mode = stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("error mode 0x"))
+        .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+        .unwrap_or_else(|| panic!("the child reported no error mode:\n{stdout}"));
+    assert_eq!(
+        mode & QUIET_ABORT_MODE,
+        QUIET_ABORT_MODE,
+        "the child runs its case under the error mode {mode:#x}, which hands an abort to \
+         Windows Error Reporting"
+    );
 }
 
 /// The matrix.

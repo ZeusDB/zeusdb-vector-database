@@ -235,6 +235,27 @@ impl Kind for Dense {
     type Owned = Vec<f32>;
 }
 
+/// The largest magnitude of a sparse value that `add()` stores and `query()`
+/// scores with, and the largest term weighting `k1` a declaration takes:
+/// 2^40, exact in `f32`.
+///
+/// Within it every score a sparse space computes in `f32` stays finite. A
+/// record holds fewer than 2^32 nonzeros and a collection fewer than 2^32
+/// records, so a term's rarity is below 2^4.48. A dot term is at most 2^80
+/// and a sum of them at most 2^113, since a running sum in `f32` is at most
+/// twice the sum of its terms' magnitudes. A term weighted query value is at
+/// most 2^84.5, its product with a stored count at most 2^124.5, and a sum
+/// of the terms at most 2^117.5. A record's length is below 2^72.
+pub const SPARSE_BOUND: f32 = 1_099_511_627_776.0;
+
+/// The bits of the magnitude of `value`, being its bits with the sign
+/// cleared, which order as the magnitudes of finite values do and above
+/// every finite value's for an infinity and a NaN.
+#[inline(always)]
+pub fn magnitude_bits(value: f32) -> u32 {
+    value.to_bits() & 0x7fff_ffff
+}
+
 /// A sparse vector as parallel dimension and value slices, sorted by
 /// dimension.
 #[derive(Clone, Copy, Debug)]
@@ -249,7 +270,8 @@ impl SparseRef<'_> {
     /// The two slices are the same length, the dimensions are strictly
     /// increasing, and every value is finite. Strictly increasing rather than
     /// sorted, because a repeated dimension would put two postings for one
-    /// record on one list.
+    /// record on one list. What a load holds a record of a directory or a
+    /// journal to; see [`SparseRef::validate_bounded`] for a new one.
     pub fn validate(&self) -> Result<(), Error> {
         if self.dims.len() != self.values.len() {
             return Err(Error::SparseVectorShape {
@@ -267,6 +289,43 @@ impl SparseRef<'_> {
             .find(|(_, value)| !value.is_finite())
         {
             return Err(Error::SparseValueNotFinite { index, value });
+        }
+        Ok(())
+    }
+
+    /// The rules of [`SparseRef::validate`], and every value at most
+    /// [`SPARSE_BOUND`] in magnitude: what `add()` holds a record's sparse
+    /// vector to and `query()` a sparse arm's. A value that is not finite is
+    /// refused as [`SparseRef::validate`] refuses it, and a finite one past
+    /// the bound as [`Error::SparseValuePastBound`].
+    ///
+    /// One comparison holds a value: the bits of its magnitude against the
+    /// bits of the bound. The bits of a float at least zero order as its
+    /// values do, and every infinity's and NaN's order above every finite
+    /// value's, so the comparison refuses a NaN, an infinity and a finite
+    /// value past the bound alike, and the refusal is chosen after it.
+    pub fn validate_bounded(&self) -> Result<(), Error> {
+        if self.dims.len() != self.values.len() {
+            return Err(Error::SparseVectorShape {
+                dims: self.dims.len(),
+                values: self.values.len(),
+            });
+        }
+        if let Some(position) = (1..self.dims.len()).find(|&i| self.dims[i] <= self.dims[i - 1]) {
+            return Err(Error::SparseDimsNotIncreasing { position });
+        }
+        let within = SPARSE_BOUND.to_bits();
+        if let Some((index, &value)) = self
+            .values
+            .iter()
+            .enumerate()
+            .find(|(_, value)| magnitude_bits(**value) > within)
+        {
+            return Err(if value.is_finite() {
+                Error::SparseValuePastBound { index, value }
+            } else {
+                Error::SparseValueNotFinite { index, value }
+            });
         }
         Ok(())
     }
@@ -772,6 +831,67 @@ mod tests {
                 asked += 1 + (draw() % 3) as usize;
             }
         }
+    }
+
+    /// A new sparse vector is held to the bound on a value's magnitude as
+    /// well as to the three rules: a value at 2^40 either side of zero is
+    /// taken, the next float past it and the largest float are refused as
+    /// past the bound, naming the value and its place, and a value that is
+    /// not finite is refused as the three rules refuse it. The three rules
+    /// alone, which a load applies, take every finite value.
+    #[test]
+    fn a_new_sparse_vector_is_held_to_the_bound_on_its_magnitude() {
+        assert_eq!(f64::from(SPARSE_BOUND), 2f64.powi(40));
+        let past = f32::from_bits(SPARSE_BOUND.to_bits() + 1);
+        let at = SparseRef {
+            dims: &[1, 2, 3],
+            values: &[SPARSE_BOUND, -SPARSE_BOUND, 1.0],
+        };
+        assert!(at.validate_bounded().is_ok());
+        for (values, index, value) in [
+            ([1.0, past, 1.0], 1usize, past),
+            ([-past, 1.0, 1.0], 0, -past),
+            ([1.0, 1.0, f32::MAX], 2, f32::MAX),
+        ] {
+            let vector = SparseRef {
+                dims: &[1, 2, 3],
+                values: &values,
+            };
+            match vector.validate_bounded() {
+                Err(Error::SparseValuePastBound {
+                    index: named,
+                    value: held,
+                }) => assert_eq!((named, held.to_bits()), (index, value.to_bits())),
+                other => panic!("{values:?}: {other:?}"),
+            }
+            assert!(
+                vector.validate().is_ok(),
+                "{values:?}: the three rules take a finite value"
+            );
+        }
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let vector = SparseRef {
+                dims: &[4],
+                values: &[value],
+            };
+            assert!(matches!(
+                vector.validate_bounded(),
+                Err(Error::SparseValueNotFinite { index: 0, .. })
+            ));
+            assert!(matches!(
+                vector.validate(),
+                Err(Error::SparseValueNotFinite { index: 0, .. })
+            ));
+        }
+        assert_eq!(
+            Error::SparseValuePastBound {
+                index: 3,
+                value: 2e12
+            }
+            .to_string(),
+            "Sparse vector value at index 3 is 2e12, and a sparse space takes values of at most \
+             2^40, 1.099511627776e12, in magnitude"
+        );
     }
 
     /// The sparse rules refuse each malformed shape by name and admit a

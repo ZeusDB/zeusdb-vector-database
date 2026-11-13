@@ -620,16 +620,19 @@ pub(crate) enum ReadOnlyCause {
     /// load takes is a save.
     Generation(u64),
     /// The directory holds this finite value past what the bound on a
-    /// vector's norm allows, which this build writes nowhere.
+    /// vector's norm or the bound on a sparse value allows, which this build
+    /// writes nowhere.
     Bound(PastBound),
 }
 
 /// A finite value a directory holds past what the bound on a vector's norm,
-/// `NORM_BOUND`, allows: a stored vector of an index under l2, dot or l1
-/// whose norm passes it, a codebook value past 2^62, or a scale past the
-/// largest one vectors within the bound fit. A release before the bound took
-/// such vectors, and this build takes none, so a collection holding such a
-/// value is read only and no save writes it again.
+/// `NORM_BOUND`, or the bound on a sparse value, `SPARSE_BOUND`, allows: a
+/// stored vector of an index under l2, dot or l1 whose norm passes 2^62, a
+/// codebook value past 2^62, a scale past the largest one vectors within
+/// that bound fit, a term weighting `k1` past 2^40, or a stored sparse value
+/// whose magnitude passes 2^40. A release before the bounds took such
+/// values, and this build takes none, so a collection holding one is read
+/// only and no save writes it again.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PastBound {
     /// The file the value is in, by name.
@@ -687,7 +690,8 @@ fn quoted(names: &[String]) -> String {
 /// The sink a collection read only carries, read from a medium it cannot
 /// write, from a directory holding features this build does not know,
 /// marked `read_only`, from a directory at the largest generation, or from a
-/// directory holding a value past the bound on a vector's norm.
+/// directory holding a value past the bound on a vector's norm or on a
+/// sparse value.
 ///
 /// It takes no record, so every mutation is refused before it runs: with
 /// [`Error::CollectionReadOnly`] for a medium, naming the directory and the
@@ -859,9 +863,9 @@ pub enum Note {
     /// hold, which makes a journaled one below 5.0.0 read only, since its
     /// upgrade is a save.
     ReadOnlyGeneration(u64),
-    /// A value the directory holds past what the bound on a vector's norm
-    /// allows, which makes the collection read only and which `read_only`
-    /// names with its file and the bound.
+    /// A value the directory holds past what the bound on a vector's norm or
+    /// the bound on a sparse value allows, which makes the collection read
+    /// only and which `read_only` names with its file and the bound.
     ReadOnlyBound,
 }
 
@@ -960,7 +964,8 @@ pub struct Recovery {
     /// Why the collection is read only, where the medium refused the load's
     /// first write, the directory holds features this build does not know
     /// and its manifest marks `read_only`, the directory records the largest
-    /// generation, or it holds a value past the bound on a vector's norm.
+    /// generation, or it holds a value past the bound on a vector's norm or
+    /// on a sparse value.
     pub read_only: Option<String>,
     /// What the load records about the directory beyond these counts, in
     /// the order it met each: the values it replaced, then the features, the
@@ -1037,7 +1042,7 @@ impl Recovery {
     }
 
     /// Whether the collection is read only for a value its directory holds
-    /// past what the bound on a vector's norm allows.
+    /// past what the bound on a vector's norm or on a sparse value allows.
     pub fn read_only_bound(&self) -> bool {
         self.notes
             .iter()

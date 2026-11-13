@@ -262,8 +262,8 @@ class VectorDatabase:
                       whole numbers above zero alone, and is the default where
                       a tokenizer is declared, since a text layer stores term
                       counts; as a mapping, {"type": "bm25", "k1": 1.2,
-                      "b": 0.75} sets its two parameters, k1 finite and at least
-                      zero and b between zero and one.
+                      "b": 0.75} sets its two parameters, k1 finite, at least
+                      zero and at most 2^40, and b between zero and one.
                     - unlink: What a removal does to the record's postings,
                       "lazy" (default), "strand" or "eager".
                     - lazy_threshold_percent (int): The dead share of a
@@ -525,11 +525,12 @@ class VectorDatabase:
         hold opens read only the same way, since its upgrade is a save and
         no save can record the generation after it, and every change,
         save, checkpoint() and backup() raises RuntimeError naming that
-        generation. A directory a release before 0.14.0 wrote from vectors
-        past the bound on a vector's norm, being a stored vector of an l2,
-        dot or l1 index whose Euclidean norm passes 2^62, a codebook value
-        past 2^62 or a scale past the largest one vectors within 2^62 fit,
-        opens read only the same way, journaled or not: a RuntimeWarning
+        generation. A directory a release before 0.14.0 wrote from values
+        past a bound, being a stored vector of an l2, dot or l1 index whose
+        Euclidean norm passes 2^62, a codebook value past 2^62, a scale past
+        the largest one vectors within 2^62 fit, a sparse value whose
+        magnitude passes 2^40 or a term weighting k1 past 2^40, opens read
+        only the same way, journaled or not: a RuntimeWarning
         names the value, its file and the bound, and every change, save,
         checkpoint() and backup() raises RuntimeError in the same words.
 

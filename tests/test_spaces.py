@@ -483,6 +483,107 @@ def test_add_refuses_a_value_that_is_not_a_whole_number_under_term_frequency_wei
         VectorDatabase().load(str(path))
 
 
+# 2^40, the largest magnitude of a sparse value add() stores and query()
+# scores with, and the largest term weighting k1 create() takes.
+SPARSE_BOUND = 2.0 ** 40
+# The float32 just past it.
+PAST_SPARSE_BOUND = float(np.nextafter(np.float32(SPARSE_BOUND), np.float32(np.inf)))
+
+
+def past_sparse_bound(index, value):
+    """The words a sparse value past the bound is refused in, `value` as the
+    engine writes it."""
+    return (f"Sparse vector value at index {index} is {value}, and a sparse space takes values "
+            "of at most 2^40, 1.099511627776e12, in magnitude")
+
+
+def test_add_refuses_a_sparse_value_past_the_bound_on_its_magnitude():
+    """A record whose sparse vector holds a value past 2^40 in magnitude is
+    refused by name and leaves nothing behind: under the dot product, under
+    term frequency weighting before the rules a count keeps, and on a space
+    with a text layer before that space's own rule. A value at 2^40 is taken
+    either side of zero, and a query at the bound scores it finite."""
+    index = with_sparse()
+    for sparse, words in [
+        (sparse_vector((1, 1.0), (2, 2e12)), past_sparse_bound(1, "2e12")),
+        (sparse_vector((1, -2e12)), past_sparse_bound(0, "-2e12")),
+        (sparse_vector((1, PAST_SPARSE_BOUND)), past_sparse_bound(0, "1.0995118e12")),
+        (sparse_vector((1, 3.4028234663852886e38)), past_sparse_bound(0, "3.4028235e38")),
+    ]:
+        assert one_error(index, {"id": "big", "vector": vec(1), "sparse": sparse}) == \
+            "Vector big: ValueError: " + words
+        assert "big" not in index and len(index) == 0
+    assert sparse_keys(index)["sparse_records"] == "0"
+    assert index.add({"id": "at", "vector": vec(1),
+                      "sparse": sparse_vector((1, SPARSE_BOUND), (2, -SPARSE_BOUND))}).is_success()
+    [hit] = index.query(arms=[{"sparse": sparse_vector((1, SPARSE_BOUND))}], top_k=5)
+    assert (hit["id"], hit["score"]) == ("at", 2.0 ** 80)
+
+    counts = with_sparse(weighting="bm25")
+    assert one_error(counts, {"id": "big", "vector": vec(1),
+                              "sparse": sparse_vector((1, 2e12))}) == \
+        "Vector big: ValueError: " + past_sparse_bound(0, "2e12")
+    assert counts.add({"id": "at", "vector": vec(1),
+                       "sparse": sparse_vector((1, SPARSE_BOUND))}).is_success()
+    for text in (with_text(), with_text(weighting="dot")):
+        assert one_error(text, {"id": "big", "vector": vec(1),
+                                "sparse": sparse_vector((0, 2e12))}) == \
+            "Vector big: ValueError: " + past_sparse_bound(0, "2e12")
+        assert len(text) == 0 and sparse_keys(text)["term_count"] == "0"
+
+
+def test_query_refuses_a_sparse_arm_past_the_bound_on_its_magnitude():
+    """A sparse arm whose vector holds a value past 2^40 in magnitude is
+    refused with ValueError naming the value and its place, by query and by
+    explain, alone and beside a dense arm, on a space that takes term ids and
+    on one with a text layer before that space's own rule. An arm at the
+    bound scores finite."""
+    index = with_sparse()
+    index.add({"id": "a", "vector": vec(1), "sparse": sparse_vector((1, 1.0), (2, 1.0))})
+    arm = {"sparse": sparse_vector((1, 1.0), (2, 2e12))}
+    for method in (index.query, index.explain):
+        for arms in ([arm], [{"vector": vec(1)}, arm]):
+            with pytest.raises(ValueError) as refused:
+                method(arms=arms, top_k=5)
+            assert str(refused.value) == past_sparse_bound(1, "2e12")
+    [hit] = index.query(arms=[{"sparse": sparse_vector((1, SPARSE_BOUND), (2, SPARSE_BOUND))}],
+                        top_k=5)
+    assert (hit["id"], hit["score"]) == ("a", 2.0 ** 41)
+    text = with_text()
+    text.add({"id": "a", "vector": vec(1), "text": "alpha"})
+    for method in (text.query, text.explain):
+        with pytest.raises(ValueError) as refused:
+            method(arms=[{"sparse": sparse_vector((0, -2e12))}])
+        assert str(refused.value) == past_sparse_bound(0, "-2e12")
+
+
+def test_create_refuses_a_term_weighting_k1_past_the_bound():
+    """A term weighting k1 past 2^40 is refused through the engine's own door
+    and through create() alike, with the whole rule named. A k1 at 2^40 is
+    taken, beside a text layer as well, and its scores are finite."""
+    words = ("Term weighting parameter k1 is 2000000000000, and it must be finite, at least zero "
+             "and at most 2^40, 1.099511627776e12")
+    sparse = {"weighting": {"type": "bm25", "k1": 2e12}}
+    with pytest.raises(ValueError) as raised:
+        CREATE(dim=DIM, space="l2", m=8, ef_construction=50, expected_size=50, sparse=sparse)
+    assert str(raised.value) == words
+    with pytest.raises(ValueError) as created:
+        VectorDatabase().create("hnsw", dim=DIM, space="l2", expected_size=50, sparse=sparse)
+    assert str(created.value) == words
+    at = {"type": "bm25", "k1": SPARSE_BOUND}
+    text = with_text(weighting=at)
+    text.add([{"id": "a", "vector": vec(1), "text": "alpha alpha beta"},
+              {"id": "b", "vector": vec(2), "text": "beta"}])
+    page = text.query(arms=[{"text": "alpha beta"}], top_k=5)
+    assert ids(page) == ["a", "b"]
+    assert all(math.isfinite(hit["score"]) for hit in page), page
+    counts = with_sparse(weighting=at)
+    assert counts.add({"id": "c", "vector": vec(3),
+                       "sparse": sparse_vector((1, SPARSE_BOUND))}).is_success()
+    [hit] = counts.query(arms=[{"sparse": sparse_vector((1, SPARSE_BOUND))}], top_k=5)
+    assert hit["id"] == "c" and math.isfinite(hit["score"]), hit
+
+
 def test_add_refuses_a_sparse_half_where_there_is_no_space_or_no_layer():
     dense = dense_only()
     assert one_error(dense, {"id": "a", "vector": vec(1), "sparse": sparse_vector((1, 1.0))}) == \

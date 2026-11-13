@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
-use zeusdb_vector_core::{CosineDist, Distance, DotDist, L1Dist, L2Dist, PQ};
+use zeusdb_vector_core::PQ;
 /// The three terms of the default rerank fetch.
 ///
 /// A rerank fetch has to be deep enough to contain the true neighbours in the
@@ -897,17 +897,14 @@ pub fn prepare_reconstruction(needs_unit: bool, mut reconstructed: Vec<f32>) -> 
 /// hands to a raw graph, so a rescored score is the number a raw index would
 /// have reported for the same pair rather than a second implementation of the
 /// same formula.
+///
+/// The function is the space's distance on the kernel path of this
+/// processor, resolved once in this call, so a caller that scores many
+/// vectors through it checks the processor once. An unrecognised name is
+/// cosine. A dot index is never quantized, so nothing rescores against its
+/// function, and the filtered exact scan scores with it.
 pub fn raw_distance_fn(space: &str) -> fn(&[f32], &[f32]) -> f32 {
-    match space {
-        "l2" => |a: &[f32], b: &[f32]| L2Dist {}.eval(a, b),
-        "l1" => |a: &[f32], b: &[f32]| L1Dist {}.eval(a, b),
-        // A dot index is never quantized, so nothing rescores against this. The
-        // filtered exact scan does score with it, and scoring that page with
-        // cosine while the traversal scored with the inner product would have
-        // been two different orderings from one query.
-        "dot" => |a: &[f32], b: &[f32]| DotDist {}.eval(a, b),
-        _ => |a: &[f32], b: &[f32]| CosineDist {}.eval(a, b),
-    }
+    zeusdb_vector_core::raw_distance(space)
 }
 
 /// The fetch a sample of `records` needs at each of `pages`, measured over that
@@ -1403,7 +1400,8 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use zeusdb_vector_core::{
-        test_support::clustered, CosineDist, Position, RecordId, VectorGraph, VectorIndex, PQ,
+        test_support::clustered, CosineDist, Distance, L1Dist, L2Dist, Position, RecordId,
+        VectorGraph, VectorIndex, PQ,
     };
 
     /// `RawVectors` is passed by value down every search path into the loop

@@ -2028,6 +2028,41 @@ mod tests {
         }
     }
 
+    /// A clear lets the old columns and the old live set go before it makes
+    /// the new reservation, so it never holds both. Counted on this thread,
+    /// the bytes the store holds during the clear never pass the larger of
+    /// what it held before the clear and what it holds after, for a store of
+    /// records and for an empty one, cleared to a reservation and to none.
+    #[test]
+    fn a_clear_never_holds_the_old_store_and_the_new_reservation_at_once() {
+        let names = || vec!["cat".to_string(), "serial".to_string()];
+        for (records, reservation) in [
+            (100_000usize, 100_000usize),
+            (100_000, 0),
+            (0, 100_000),
+            (0, 0),
+        ] {
+            let mut store = ColumnStore::new(names(), 0);
+            for slot in 0..records {
+                let metadata = record(&[
+                    ("cat", json!(["a", "b", "c"][slot % 3])),
+                    ("serial", json!(format!("s{slot}"))),
+                ]);
+                store.write(slot, &metadata);
+            }
+            let ((), held) = crate::allocations::counted(|| store.clear(reservation));
+            assert_eq!(
+                held.peak,
+                held.end.max(0),
+                "a store of {records} records cleared to a reservation of {reservation} held \
+                 {} bytes above where the clear began, and ended {} bytes from it",
+                held.peak,
+                held.end
+            );
+            assert_eq!(store.record_count(), 0);
+        }
+    }
+
     /// A clear keeps the declaration and the table that finds a column, and
     /// holds a fresh store's reservation and nothing else, whatever the store
     /// grew to and whatever form its columns took.

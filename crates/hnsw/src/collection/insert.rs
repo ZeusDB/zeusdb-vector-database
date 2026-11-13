@@ -2521,10 +2521,10 @@ impl Collection {
         // mutation guard the caller holds, so the ids a record's postings
         // carry are the dictionary's at the moment the record is inserted
         // and nothing can empty the dictionary between the two. A sparse
-        // vector is then held to its rules, the weighting's included, and to
-        // the collection having a sparse space, before anything is written,
-        // so a record refused for its sparse half leaves nothing behind in
-        // the dense one.
+        // vector is then held to its rules, the bound on its values and the
+        // weighting's included, and to the collection having a sparse space,
+        // before anything is written, so a record refused for its sparse half
+        // leaves nothing behind in the dense one.
         let sparse = match sparse {
             None => None,
             Some(SparseHalf::Vector(vector)) => Some(vector),
@@ -2537,7 +2537,12 @@ impl Collection {
             let checked = self
                 .sparse()
                 .ok_or(Error::NoSparseSpace)
-                .and_then(|space| space.config().weighting.validate_record(sparse.as_ref()))
+                .and_then(|space| {
+                    space
+                        .config()
+                        .weighting
+                        .validate_bounded_record(sparse.as_ref())
+                })
                 .and_then(|()| {
                     refuse_forward(taken.forward, taken.nonzeros, sparse.dims.len())
                         .map_err(|err| self.sparse_refusal_named(err))

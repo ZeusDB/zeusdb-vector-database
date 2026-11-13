@@ -183,11 +183,12 @@ impl From<PyEngineError> for PyErr {
 /// only the same way, since its upgrade is a save and no save can record
 /// the generation after it: a `RuntimeWarning` names that generation, and
 /// every change, save, `checkpoint` and `backup` raises `RuntimeError` in
-/// the same words. A directory holding a value past the bound on a vector's
-/// norm, being a stored vector of an l2, dot or l1 index whose Euclidean
-/// norm passes 2^62, a codebook value past 2^62 or a scale past the largest
-/// one vectors within 2^62 fit, opens read only the same way, journaled or
-/// not: a `RuntimeWarning` names the value, its file and the bound, and
+/// the same words. A directory holding a value past a bound, being a stored
+/// vector of an l2, dot or l1 index whose Euclidean norm passes 2^62, a
+/// codebook value past 2^62, a scale past the largest one vectors within
+/// 2^62 fit, a sparse value whose magnitude passes 2^40 or a term weighting
+/// `k1` past 2^40, opens read only the same way, journaled or not: a
+/// `RuntimeWarning` names the value, its file and the bound, and
 /// every change, save, `checkpoint` and `backup` raises `RuntimeError` in
 /// the same words.
 ///

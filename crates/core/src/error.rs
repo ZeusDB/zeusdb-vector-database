@@ -735,6 +735,15 @@ pub enum Error {
     /// A vector in a query batch of an index under l2, dot or l1 whose
     /// Euclidean norm passes [`NORM_BOUND`](crate::NORM_BOUND)
     BatchVectorPastBound { position: usize, norm: f64 },
+
+    // ------------------------------------------------------------------
+    // A sparse value past the bound on its magnitude. Appended after every
+    // variant above, and none wider than the widest above.
+    // ------------------------------------------------------------------
+    /// A finite value of a sparse vector, offered to `add()` or to a sparse
+    /// arm of `query()`, whose magnitude passes
+    /// [`SPARSE_BOUND`](crate::SPARSE_BOUND)
+    SparseValuePastBound { index: usize, value: f32 },
 }
 
 impl Error {
@@ -808,6 +817,7 @@ impl Error {
             | SparseVectorShape { .. }
             | SparseDimsNotIncreasing { .. }
             | SparseValueNotFinite { .. }
+            | SparseValuePastBound { .. }
             | JournalRecordTooLarge { .. }
             | SparseValueNotPositive { .. }
             | SparseValueNotWhole { .. }
@@ -1405,6 +1415,14 @@ impl fmt::Display for Error {
                 f,
                 "Sparse vector contains invalid value at index {}: {} (must be finite)",
                 index, value
+            ),
+            SparseValuePastBound { index, value } => write!(
+                f,
+                "Sparse vector value at index {} is {:e}, and a sparse space takes values of \
+                 at most 2^40, {:e}, in magnitude",
+                index,
+                value,
+                f64::from(crate::SPARSE_BOUND)
             ),
             SparseValueNotPositive { index, value } => write!(
                 f,

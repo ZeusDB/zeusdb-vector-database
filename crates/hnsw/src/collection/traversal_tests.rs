@@ -98,7 +98,7 @@ fn bits(page: &QueryHits) -> Vec<(String, u32)> {
 /// Twenty live records among a thousand nodes, each search asked for ten
 /// at a live record's own vector: every path returns ten live records at
 /// every width, and at the default width and above the page is the exact
-/// scan's where the kinds score alike. The single search, the two batch
+/// scan's for every kind. The single search, the two batch
 /// paths and the dense arm return one page, and the dense arm's plan is
 /// exact at every width above the twenty records held.
 #[test]
@@ -110,10 +110,10 @@ fn a_search_through_stranded_nodes_returns_the_live_records_nearest_the_query() 
     for kind in ["raw", "int8", "pq with raw", "pq only"] {
         let collection = stranded(kind, &vectors);
         assert_eq!(collection.len(), live.len(), "{kind}");
-        // The traversal scores with the scan's kernel on a raw and a scalar
-        // graph, and a product quantized graph keeping raw vectors reranks
-        // its page against them, so those three pages are the scan's.
-        let scored_as_scanned = kind != "pq only";
+        // Every kind scores a record as the scan does: a raw and a scalar
+        // graph with the scan's kernel, a product quantized graph keeping raw
+        // vectors by reranking its page against them, and one keeping codes
+        // alone with the kernel its scan takes, so every page is the scan's.
         let queries: Vec<Vec<f32>> = live
             .iter()
             .map(|&i| collection.process_vector_for_space(vectors[i].clone()))
@@ -182,7 +182,7 @@ fn a_search_through_stranded_nodes_returns_the_live_records_nearest_the_query() 
                         page.iter().all(|(id, _)| kept(id[1..].parse().unwrap())),
                         "{label} {path}"
                     );
-                    if scored_as_scanned && ef != Some(10) {
+                    if ef != Some(10) {
                         assert_eq!(page, &exact[q], "{label} {path}");
                     }
                 }

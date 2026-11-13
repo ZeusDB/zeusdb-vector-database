@@ -26,7 +26,7 @@ use tracing::{debug, error, info, instrument};
 use zeusdb_vector_core::{
     screen, ArtefactRecord, Bounds, Dir, DumpRefusal, DumpRegion, DumpRows, Error, FsStorage,
     IdStore, Int8Codec, Inventory, KillPoint, MetadataStore, Persist, Position, PositionWalk,
-    Screen, SegmentBase, Storage, VectorGraph, DUMP_FILENAME, NORM_BOUND,
+    Screen, SegmentBase, Storage, VectorGraph, DUMP_FILENAME, NORM_BOUND, SPARSE_BOUND,
 };
 
 /// Where a load read the parts [`Collection::first_past_bound`] scans, for
@@ -123,7 +123,7 @@ fn refuse_foreign_target(storage: &dyn Storage, path: &str) -> Result<(), Error>
         None => Ok(()),
     }
 }
-use zeusdb_vector_sparse::PostingsIndex;
+use zeusdb_vector_sparse::{PostingsIndex, Weighting};
 use zeusdb_vector_text::{TermDictionary, Tokenizer};
 
 /// The target every record this file emits carries. See the parent module.
@@ -236,18 +236,23 @@ impl Collection {
     }
 
     /// The first value the collection holds past what the bound on a
-    /// vector's norm allows, named with the file `sources` says it came from:
-    /// under l2, dot or l1 a raw vector whose norm passes `NORM_BOUND`, then a
-    /// codebook value past 2^62, then a scale past the largest one vectors
-    /// within the bound fit. `None` for every collection this build writes,
-    /// since `add` refuses a vector past the bound and a fit to vectors within
-    /// it holds no such value.
+    /// vector's norm or the bound on a sparse value allows, named with the
+    /// file `sources` says it came from: under l2, dot or l1 a raw vector
+    /// whose norm passes `NORM_BOUND`, then a codebook value past 2^62, then
+    /// a scale past the largest one vectors within the bound fit, then a
+    /// term weighting `k1` past `SPARSE_BOUND`, then a sparse value whose
+    /// magnitude passes it. `None` for every collection this build writes,
+    /// since `add` refuses a vector and a sparse value past its bound,
+    /// `create` refuses such a `k1`, and a fit to vectors within the bound
+    /// holds no such value.
     ///
     /// A load asks this once the checkpoint is read and any journal replayed,
     /// before anything is written, and opens the collection read only where
     /// it answers one. Every raw vector takes the one pass of
     /// `zeusdb_vector_core::screen`, under the id store's guard and the
-    /// index's, in that order.
+    /// index's, in that order, and the sparse values take one pass of
+    /// `PostingsIndex::first_value_past_bound` under the id store's guard,
+    /// the dense index's and the sparse space's, in that order.
     pub(crate) fn first_past_bound(&self, sources: &BoundSources<'_>) -> Option<PastBound> {
         if self.dense().bounded() {
             let ids = self.ids.read().unwrap();
@@ -315,7 +320,44 @@ impl Collection {
                 ),
             });
         }
-        None
+        let (name, space) = self.sparse_named()?;
+        let bound_words = |what: &str| {
+            format!(
+                "2^40 ({:e}), the largest {} a sparse space takes",
+                f64::from(SPARSE_BOUND),
+                what
+            )
+        };
+        if let Weighting::Bm25 { k1, .. } = space.config().weighting {
+            if k1 > SPARSE_BOUND {
+                return Some(PastBound {
+                    file: "config.json".to_string(),
+                    detail: format!("a term weighting k1 of {:e}", k1),
+                    allowed: bound_words("k1"),
+                });
+            }
+        }
+        let ids = self.ids.read().unwrap();
+        let dense = self.dense_index();
+        let postings = space.index.read().unwrap();
+        let (at, index, value) = postings.first_value_past_bound()?;
+        let replayed = dense
+            .ids_by_position()
+            .get(at.slot())
+            .is_some_and(|internal_id| internal_id >= sources.counter);
+        let artefact = postings
+            .artefact_names(&Self::space_prefix(name))
+            .swap_remove(0);
+        Some(PastBound {
+            file: sources.file(replayed, &artefact),
+            detail: format!(
+                "the sparse value {:e} at index {} of '{}'",
+                value,
+                index,
+                ids.read_name(at.slot()).unwrap_or_default()
+            ),
+            allowed: bound_words("magnitude"),
+        })
     }
 
     /// Whether this index should hold a raw store beside its codes.

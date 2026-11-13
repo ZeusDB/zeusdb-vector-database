@@ -475,7 +475,7 @@ impl Declaration {
         if self.sparse.is_some() {
             return Err(Error::SpacesTooMany { max: 2 });
         }
-        config.validate()?;
+        config.validate_declared()?;
         self.sparse = Some(SparseDeclaration {
             name,
             config,

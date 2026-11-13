@@ -90,7 +90,8 @@ const SPARSE_VECTOR_KEYS: [&str; 2] = ["dims", "values"];
 /// The dims are read as integers and held to the width of a term id, the
 /// values as numbers, from a list or a one dimensional array of either. The
 /// rules the vector itself has to satisfy, being parallel slices, strictly
-/// increasing dims and finite values, are the engine's and are applied
+/// increasing dims and finite values at most 2^40 in magnitude, are the
+/// engine's and are applied
 /// where the vector is used, so a malformed vector is refused with the
 /// engine's message wherever it arrives.
 pub(super) fn extract_sparse_vector(value: &Bound<PyAny>) -> Result<SparseVector, String> {

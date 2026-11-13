@@ -583,8 +583,9 @@ impl HNSWIndex {
     /// A record fills the sparse space under the key the space takes.
     /// `sparse` is a mapping `{"dims": [...], "values": [...]}` of term ids
     /// and weights, parallel, the dims strictly increasing and the values
-    /// finite, and whole numbers above zero on a space weighted by term
-    /// frequency; a space that takes term ids alone takes it, and a space
+    /// finite and at most 2^40 in magnitude, and whole numbers above zero on
+    /// a space weighted by term frequency; a space that takes term ids alone
+    /// takes it, and a space
     /// with a text layer refuses it, since that space's term ids are its
     /// dictionary's to issue. `text` is a string the space's text layer
     /// splits with the tokenizer it was declared with and counts into term
@@ -673,7 +674,7 @@ impl HNSWIndex {
                             // applies them, so a malformed vector reads the
                             // same message on either kind of space, and then
                             // the space's.
-                            let refused = match vector.as_ref().validate() {
+                            let refused = match vector.as_ref().validate_bounded() {
                                 Err(rule) => rule,
                                 Ok(()) => Error::SparseVectorOnTextSpace,
                             };
@@ -1393,8 +1394,8 @@ impl HNSWIndex {
     ///   holds that this build does not know and its manifest marks
     ///   `read_only`, the largest generation a journaled directory below
     ///   format 5.0.0 records, or a value the directory holds past the bound
-    ///   on a vector's norm with its file and the bound, the last two in the
-    ///   words every save of it is refused in.
+    ///   on a vector's norm or on a sparse value with its file and the bound,
+    ///   the last two in the words every save of it is refused in.
     /// - `repair`: where a load with `repair=True` cut the journal or set a
     ///   stale segment aside, a dict of `kept_through`, `discarded_from`,
     ///   `records_discarded`, `bytes_discarded` and `quarantine`, being the

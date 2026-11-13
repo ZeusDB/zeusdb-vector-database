@@ -131,7 +131,7 @@ use super::dump::LoadedPoint;
 use super::dump::{EachLists, ListWalk, LoadedEdge, PointId};
 use super::store::VectorStore;
 use super::traverse::{self, Topology, LAYERS};
-use super::{Distance, GraphHit};
+use super::{Distance, GraphHit, Held, Path};
 use crate::error::Error;
 use crate::space::Position;
 
@@ -1955,8 +1955,16 @@ where
     /// order they were filed in. A NaN panics as the sort's comparator did.
     ///
     /// This runs once per reverse link per layer, which is the hottest list
-    /// operation in the insert.
-    fn place_last(&mut self, node: u32, layer: usize, store: &VectorStore<T>, dist: f32) {
+    /// operation in the insert. Every distance it evaluates comes from the
+    /// scorer of `path`.
+    fn place_last<P: Path<T, D>>(
+        &mut self,
+        path: P,
+        node: u32,
+        layer: usize,
+        store: &VectorStore<T>,
+        dist: f32,
+    ) {
         assert!(!dist.is_nan(), "got a NaN in a distance");
         let (at, len, slab) = match self.slice_of(node, layer) {
             Some(found) => found,
@@ -1966,7 +1974,7 @@ where
             return;
         }
         let owner = store.get(node);
-        let dist_f = &self.dist_f;
+        let dist_f = path.scorer(&self.dist_f);
         let ordered = &self.neighbours_at(node, layer)[..len - 1];
         let place = ordered.partition_point(|&target| {
             let d = dist_f.eval(owner, store.get(target));
@@ -2401,21 +2409,32 @@ where
         F: Fn(&usize) -> bool,
     {
         match filter {
-            None => self.search_with::<fn(&usize) -> bool, false>(store, data, knbn, ef_arg, None),
-            Some(admits) => self.search_with::<F, true>(store, data, knbn, ef_arg, Some(admits)),
+            None => self.search_with::<Held, fn(&usize) -> bool, false>(
+                Held, store, data, knbn, ef_arg, None,
+            ),
+            Some(admits) => {
+                self.search_with::<Held, F, true>(Held, store, data, knbn, ef_arg, Some(admits))
+            }
         }
     }
 
     /// Search the graph, which is [`traverse::search`] over this layout, in
-    /// the instance `UNTIL_FULL` names.
+    /// the instance `UNTIL_FULL` names, with every distance evaluated on
+    /// `path`.
     ///
     /// The empty case is answered here rather than in the traversal, which has
     /// no early return for it because neither loading constructor accepts a
     /// graph of no points. [`Self::new`] does, since a graph being built by
     /// insertion starts empty, and the vendored `search_filter` answers the same
     /// question the same way.
-    pub(super) fn search_with<F, const UNTIL_FULL: bool>(
+    ///
+    /// Never inlined, so the traversal of each distance, each path and each
+    /// predicate is compiled alone and shares no registers and no stack
+    /// frame with another.
+    #[inline(never)]
+    pub(super) fn search_with<P, F, const UNTIL_FULL: bool>(
         &self,
+        path: P,
         store: &VectorStore<T>,
         data: &[T],
         knbn: usize,
@@ -2423,18 +2442,28 @@ where
         filter: Option<&F>,
     ) -> Vec<GraphHit>
     where
+        P: Path<T, D>,
         F: Fn(&usize) -> bool,
     {
         if self.origin_ids.is_empty() {
             return Vec::new();
         }
-        traverse::search::<_, F, UNTIL_FULL>(&self.bound(store), data, knbn, ef_arg, filter)
+        traverse::search::<_, F, UNTIL_FULL>(&self.bound(path, store), data, knbn, ef_arg, filter)
     }
 
-    /// This graph with its store, which is what a traversal reads.
+    /// This graph with its store and the path its distances are evaluated
+    /// on, which is what a traversal reads.
     #[inline]
-    pub(in crate::graph) fn bound<'a>(&'a self, store: &'a VectorStore<T>) -> Bound<'a, T, D> {
-        Bound { graph: self, store }
+    pub(in crate::graph) fn bound<'a, P: Path<T, D>>(
+        &'a self,
+        path: P,
+        store: &'a VectorStore<T>,
+    ) -> Bound<'a, T, D, P> {
+        Bound {
+            graph: self,
+            store,
+            path,
+        }
     }
 
     /// One node's lists as a version 2 dump records them, being every list
@@ -2502,21 +2531,25 @@ where
 /// is the whole of what design B costs at a distance evaluation: one load of
 /// the store's base pointer, which the optimiser hoists out of the neighbour
 /// loop, and then the same multiply and slice the arena used.
-pub(in crate::graph) struct Bound<'a, T, D> {
+pub(in crate::graph) struct Bound<'a, T, D, P> {
     pub(in crate::graph) graph: &'a MutableGraph<T, D>,
     pub(in crate::graph) store: &'a VectorStore<T>,
+    /// The path the traversal's distances are evaluated on.
+    pub(in crate::graph) path: P,
 }
 
-impl<T, D> Topology for Bound<'_, T, D>
+impl<'a, T, D, P> Topology for Bound<'a, T, D, P>
 where
     T: Clone + Send + Sync,
     D: Distance<T> + Send + Sync,
+    P: Path<T, D>,
 {
     type Elem = T;
-    type Dist = D;
+    type Dist = P::Scorer<'a>;
 
-    fn distance(&self) -> &D {
-        self.graph.distance()
+    #[inline]
+    fn distance(&self) -> P::Scorer<'a> {
+        self.path.scorer(self.graph.distance())
     }
 
     fn nb_points(&self) -> usize {

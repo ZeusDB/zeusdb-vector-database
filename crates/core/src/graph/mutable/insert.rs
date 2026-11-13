@@ -65,7 +65,7 @@ use super::{by_distance, Entry, MutableGraph};
 use crate::graph::levels::LevelGenerator;
 use crate::graph::store::VectorStore;
 use crate::graph::traverse::{self, OrderedNode, Topology};
-use crate::graph::Distance;
+use crate::graph::{Distance, Held, Path};
 use std::collections::BinaryHeap;
 
 /// The filter the insertion traversal runs under, which is none of one.
@@ -137,22 +137,26 @@ impl Planned {
 /// to a traversal. No list names the new point until the reverse update, which
 /// runs after every search this insertion makes, and the point the traversal
 /// starts from is passed in rather than looked up.
-struct Pending<'a, T, D> {
+struct Pending<'a, T, D, P> {
     graph: &'a MutableGraph<T, D>,
     store: &'a VectorStore<T>,
     level: usize,
+    /// The path the insertion's distances are evaluated on.
+    path: P,
 }
 
-impl<T, D> Topology for Pending<'_, T, D>
+impl<'a, T, D, P> Topology for Pending<'a, T, D, P>
 where
     T: Clone + Send + Sync,
     D: Distance<T> + Send + Sync,
+    P: Path<T, D>,
 {
     type Elem = T;
-    type Dist = D;
+    type Dist = P::Scorer<'a>;
 
-    fn distance(&self) -> &D {
-        self.graph.distance()
+    #[inline]
+    fn distance(&self) -> P::Scorer<'a> {
+        self.path.scorer(self.graph.distance())
     }
 
     fn nb_points(&self) -> usize {
@@ -201,7 +205,8 @@ where
     /// graph outright. The cutover splits this at the two phase boundary and
     /// puts the index locks around each; until then this is what the tests
     /// build with and what the measurement times. The record's position is
-    /// the place its origin id names.
+    /// the place its origin id names. Every distance is evaluated with the
+    /// distance the graph holds.
     pub(in crate::graph) fn insert(
         &mut self,
         store: &mut VectorStore<T>,
@@ -215,13 +220,25 @@ where
         self.install_insertion(store, data, origin_id, position, planned);
     }
 
-    /// Phase one, whichever shape the insertion takes.
+    /// [`Self::plan_insertion_on`] with the distance the graph holds.
+    pub(in crate::graph) fn plan_insertion(
+        &self,
+        store: &VectorStore<T>,
+        data: &[T],
+        level: usize,
+    ) -> Planned {
+        self.plan_insertion_on(Held, store, data, level)
+    }
+
+    /// Phase one, whichever shape the insertion takes, with every distance
+    /// evaluated on `path`.
     ///
     /// The empty case is settled here rather than by the caller, because
     /// whether the graph holds a point is itself something read under the read
     /// guard, and the answer cannot change before phase two runs.
-    pub(in crate::graph) fn plan_insertion(
+    pub(in crate::graph) fn plan_insertion_on<P: Path<T, D>>(
         &self,
+        path: P,
         store: &VectorStore<T>,
         data: &[T],
         level: usize,
@@ -229,13 +246,11 @@ where
         if self.nb_points() == 0 {
             Planned::First { level }
         } else {
-            Planned::Descended(self.plan(store, data, level))
+            Planned::Descended(self.plan(path, store, data, level))
         }
     }
 
-    /// Phase two, whichever shape the insertion takes. The node takes
-    /// `origin_id` as the id the dump records and `position` as the place of
-    /// the record it holds.
+    /// [`Self::install_insertion_on`] with the distance the graph holds.
     pub(in crate::graph) fn install_insertion(
         &mut self,
         store: &mut VectorStore<T>,
@@ -244,9 +259,24 @@ where
         position: u32,
         planned: Planned,
     ) {
+        self.install_insertion_on(Held, store, data, origin_id, position, planned);
+    }
+
+    /// Phase two, whichever shape the insertion takes, with every distance
+    /// evaluated on `path`. The node takes `origin_id` as the id the dump
+    /// records and `position` as the place of the record it holds.
+    pub(in crate::graph) fn install_insertion_on<P: Path<T, D>>(
+        &mut self,
+        path: P,
+        store: &mut VectorStore<T>,
+        data: &[T],
+        origin_id: usize,
+        position: u32,
+        planned: Planned,
+    ) {
         match planned {
             Planned::First { level } => self.insert_first(store, data, origin_id, position, level),
-            Planned::Descended(plan) => self.install(store, data, origin_id, position, plan),
+            Planned::Descended(plan) => self.install(path, store, data, origin_id, position, plan),
         }
     }
 
@@ -277,13 +307,15 @@ where
         self.set_entry(node, level);
     }
 
-    /// Phase one. Everything the insertion decides, under nothing but a read.
+    /// Phase one. Everything the insertion decides, under nothing but a read,
+    /// with every distance evaluated on `path`.
     ///
     /// The graph must hold at least one point, which [`Self::insert`] settles
     /// before it gets here. The vendored equivalent settles it by reading
     /// `entry_point` and taking the `None` arm.
-    pub(in crate::graph) fn plan(
+    pub(in crate::graph) fn plan<P: Path<T, D>>(
         &self,
+        path: P,
         store: &VectorStore<T>,
         data: &[T],
         level: usize,
@@ -296,8 +328,9 @@ where
             graph: self,
             store,
             level,
+            path,
         };
-        let dist_f = self.distance();
+        let dist_f = path.scorer(self.distance());
         let mut pivot = self.entry();
         let mut dist_to_entry = dist_f.eval(data, store.get(pivot));
         let max_level_observed = self.entry_level() as usize;
@@ -358,7 +391,7 @@ where
             let mut candidates = negated(&sorted_points);
             let nb_conn = if l == 0 { 2 * self.m() } else { self.m() };
             neighbours.reserve(nb_conn);
-            self.select_neighbours(store, data, &mut candidates, nb_conn, &mut neighbours);
+            self.select_neighbours(path, store, data, &mut candidates, nb_conn, &mut neighbours);
             neighbours.sort_by(by_distance);
             // The nearest chosen neighbour carries the descent into the next
             // layer down. The vendored insert reads it after installing the
@@ -416,15 +449,16 @@ where
     /// takes one place of the budget and joins the list at the end, every
     /// further twin at the head is pruned, and the rule runs over the
     /// candidates after them.
-    fn select_neighbours(
+    fn select_neighbours<P: Path<T, D>>(
         &self,
+        path: P,
         store: &VectorStore<T>,
         data: &[T],
         candidates: &mut BinaryHeap<OrderedNode>,
         nb_neighbours_asked: usize,
         neighbours_vec: &mut Vec<Entry>,
     ) {
-        let dist_f = self.distance();
+        let dist_f = path.scorer(self.distance());
         neighbours_vec.clear();
 
         if candidates.len() <= nb_neighbours_asked {
@@ -486,9 +520,11 @@ where
         }
     }
 
-    /// Phase two. Everything the insertion writes, under the write guard.
-    pub(in crate::graph) fn install(
+    /// Phase two. Everything the insertion writes, under the write guard,
+    /// with every distance evaluated on `path`.
+    pub(in crate::graph) fn install<P: Path<T, D>>(
         &mut self,
+        path: P,
         store: &mut VectorStore<T>,
         data: &[T],
         origin_id: usize,
@@ -585,7 +621,7 @@ where
                 let threshold_shrinking = if layer > 0 { self.m() } else { 2 * self.m() };
                 let shrink = nbn_at_l > threshold_shrinking;
 
-                self.place_last(target, layer, store, dist);
+                self.place_last(path, target, layer, store, dist);
                 if shrink {
                     self.guarded_pop(target, layer);
                 }

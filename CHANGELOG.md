@@ -121,6 +121,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **The docstrings of `load()`, `add()`, `search()` and `recovery`** describe the bound on a vector's norm, the read-only load of a directory past it and of a journaled directory at the largest generation, and the replaced `created_at`.
 
+- **`add()` refuses a record whose sparse vector holds a value with a magnitude past 2^40**, and `query()` raises `ValueError` for a sparse arm whose vector holds one. `errors` names the record, and both name the value's index, the value and the bound. A value that is not finite is refused as before. A vector supplied to a space with a text layer is held to the bound before that space's own rule.
+
+- **`create()` refuses a term weighting `k1` past 2^40** with `ValueError`, naming the parameter, its value and the rule. A `k1` that is not finite or is below zero is refused in the words it was.
+
+- **A directory that holds a sparse value with a magnitude past 2^40, or a term weighting `k1` past 2^40, opens read only**, as a directory past the bound on a vector's norm does. `load()` reads every record, writes nothing, issues a `RuntimeWarning` naming the value, its file and the bound, and sets `recovery["read_only"]`, with a `read_only_reason` in the same words. `add()` reports each record as an error in those words, and every other mutation, `save()` into any directory, `checkpoint()`, `journal_to()` and `backup()` raise `RuntimeError` in them. Searches run.
+
+- **The docstrings of `create()`, `load()`, `add()` and `recovery`** describe the bound on a sparse value and the read-only load of a directory past it.
+
 ### Fixed
 
 - **`load()` refuses a journal whose segments follow another checkpoint of the same index**, with a `RuntimeError` naming both checkpoints, and replays none of it. A segment from another checkpoint that holds nothing past the directory's sequence is passed over, and deleted by a load that can write.
@@ -197,6 +205,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Product quantizer training seeds all centroids also when the sum of the squared seeding distances is not finite.**
 
+- **On an index that keeps codes alone, the exact scan scores each record with the traversal's own kernel and query table.** A filtered search that takes the scan and an unfiltered search give a record the same score, bit for bit, and two records the same order.
+
 ### Internal
 
 - Every workflow job names its runner image. The jobs that ran on `ubuntu-latest` run on `ubuntu-24.04`, and the Windows wheel is built on `windows-2025-vs2026` in place of `windows-latest`. These are the images each job ran on for 0.13.0. A change of runner image is a change to a workflow file.
@@ -246,6 +256,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Each crate turns on `clippy::cast_possible_truncation` for its library code, and each narrowing cast carries an `#[expect]` that states its bound.
 
 - The frame mutator and the graph dump mutator compile under the core crate's `test-support` feature and in its tests alone. The text crate's tests take the feature through a dev-dependency.
+
+- **A search, each phase of an insertion, the exact scan, the rerank, the rerank's calibration and the timing of a graph check the processor for AVX once**, and every distance each of them evaluates runs on the kernel that check chose. Every distance returns the bits it returned.
 
 ### Format
 

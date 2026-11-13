@@ -430,7 +430,7 @@ impl Collection {
                     Settled::Dense { vector, params }
                 }
                 Arm::Sparse { vector, idf } => {
-                    vector.validate()?;
+                    vector.validate_bounded()?;
                     self.sparse().ok_or(Error::NoSparseSpace)?;
                     Settled::Sparse {
                         vector: SparseVector {

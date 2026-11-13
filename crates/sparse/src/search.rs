@@ -959,6 +959,52 @@ mod tests {
         }
     }
 
+    /// Every score is finite where every stored value, every query value
+    /// and `k1` stand at the bound on a sparse value, under the dot product
+    /// and under term frequency weighting at either end of `b`, in every
+    /// mode of the scan, over the corpus the admit set gives and over every
+    /// live record.
+    #[test]
+    fn every_score_within_the_sparse_bound_is_finite() {
+        let bound = zeusdb_vector_core::SPARSE_BOUND;
+        for weighting in [
+            Weighting::Dot,
+            Weighting::Bm25 { k1: bound, b: 0.0 },
+            Weighting::Bm25 { k1: bound, b: 0.75 },
+            Weighting::Bm25 { k1: bound, b: 1.0 },
+        ] {
+            let index = index_with(
+                &[
+                    (1, &[1, 2, 3], &[bound, bound, bound]),
+                    (2, &[1], &[bound]),
+                    (3, &[2, 3], &[1.0, bound]),
+                ],
+                Unlink::Lazy,
+                weighting,
+            );
+            let q = SparseVector {
+                dims: vec![1, 2, 3],
+                values: vec![bound, bound, bound],
+            };
+            for mode in MODES {
+                for scope in [IdfScope::Corpus, IdfScope::Global] {
+                    let page = index
+                        .search_scoped(mode, q.as_ref(), 10, &Candidates::All, false, scope)
+                        .unwrap();
+                    assert_eq!(page.items.len(), 3, "{weighting:?} {mode:?} {scope:?}");
+                    for hit in &page.items {
+                        assert!(
+                            hit.score.is_finite(),
+                            "{weighting:?} {mode:?} {scope:?}: record {} scored {}",
+                            hit.position.0,
+                            hit.score
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// The term frequency weighting reproduces the formula by hand on a
     /// corpus of three, every loop agreeing, and a value at or below zero
     /// is refused at insert.

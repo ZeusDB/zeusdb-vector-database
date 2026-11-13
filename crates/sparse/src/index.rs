@@ -5,9 +5,9 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, trace};
 use zeusdb_vector_core::{
-    Admit, Bitmap, Budget, CorpusStats, Cost, Dir, Error, Hits, Inventory, Ledger, Persist,
-    Position, Prepared, RecordId, Restore, Selectivity, Sparse, SparseRef, SparseVector,
-    VectorIndex,
+    magnitude_bits, Admit, Bitmap, Budget, CorpusStats, Cost, Dir, Error, Hits, Inventory, Ledger,
+    Persist, Position, Prepared, RecordId, Restore, Selectivity, Sparse, SparseRef, SparseVector,
+    VectorIndex, SPARSE_BOUND,
 };
 
 use crate::calibrate::UnitCosts;
@@ -76,6 +76,8 @@ impl Weighting {
     };
 
     /// `k1` is finite and at least zero, and `b` is between zero and one.
+    /// What a load holds the weighting `config.json` names to; see
+    /// [`Weighting::validate_declared`] for a declaration.
     pub fn validate(&self) -> Result<(), Error> {
         if let Weighting::Bm25 { k1, b } = *self {
             if !(k1.is_finite() && k1 >= 0.0) {
@@ -96,6 +98,25 @@ impl Weighting {
         Ok(())
     }
 
+    /// The rules of [`Weighting::validate`], and `k1` at most
+    /// [`SPARSE_BOUND`]: what a declaration is held to before a space is
+    /// built on it. A `k1` past the bound is refused with the whole rule
+    /// named, and every other refusal is the one [`Weighting::validate`]
+    /// gives.
+    pub fn validate_declared(&self) -> Result<(), Error> {
+        self.validate()?;
+        if let Weighting::Bm25 { k1, .. } = *self {
+            if k1 > SPARSE_BOUND {
+                return Err(Error::SparseWeightingInvalid {
+                    parameter: "k1",
+                    value: k1,
+                    rule: "finite, at least zero and at most 2^40, 1.099511627776e12",
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Whether every stored value is read as a term frequency, which is
     /// what makes a value at or below zero, or one that is not a whole
     /// number, a refusal at insert.
@@ -108,11 +129,26 @@ impl Weighting {
     /// a term frequency, above zero and a whole number, since a term
     /// frequency is a count and the rule's saturation and length read it
     /// as one. The first value breaking a rule is named, the positivity
-    /// rule first. What `insert` applies, and what a collection applies
-    /// before it writes any other space for the record, so a record
-    /// refused here leaves nothing behind.
+    /// rule first. What `insert` applies, and what a load applies to a
+    /// record of a directory or a journal.
     pub fn validate_record(&self, vector: SparseRef<'_>) -> Result<(), Error> {
         vector.validate()?;
+        self.validate_counts(vector)
+    }
+
+    /// The rules of [`Weighting::validate_record`], with every value at
+    /// most [`SPARSE_BOUND`] in magnitude, as [`SparseRef::validate_bounded`]
+    /// holds it. What a collection applies where it admits a new record,
+    /// before it writes any other space for the record, so a record refused
+    /// here leaves nothing behind.
+    pub fn validate_bounded_record(&self, vector: SparseRef<'_>) -> Result<(), Error> {
+        vector.validate_bounded()?;
+        self.validate_counts(vector)
+    }
+
+    /// Every value above zero and a whole number, where the rule reads a
+    /// term frequency, the positivity rule first.
+    fn validate_counts(&self, vector: SparseRef<'_>) -> Result<(), Error> {
         if self.reads_term_frequency() {
             for (index, &value) in vector.values.iter().enumerate() {
                 if value <= 0.0 {
@@ -194,9 +230,17 @@ impl Default for SparseConfig {
 }
 
 impl SparseConfig {
-    /// The rules a declaration has to satisfy before a space is built on it.
+    /// The rules a declaration `config.json` holds has to satisfy before a
+    /// load builds a space on it.
     pub fn validate(&self) -> Result<(), Error> {
         self.weighting.validate()
+    }
+
+    /// The rules a caller's declaration has to satisfy before a space is
+    /// built on it, being those of [`SparseConfig::validate`] and `k1` at
+    /// most [`SPARSE_BOUND`]. See [`Weighting::validate_declared`].
+    pub fn validate_declared(&self) -> Result<(), Error> {
+        self.weighting.validate_declared()
     }
 }
 
@@ -606,6 +650,36 @@ impl PostingsIndex {
     /// until a compaction, which is what [`MAX_FORWARD`] bounds.
     pub fn forward_len(&self) -> usize {
         self.fwd_dims.len()
+    }
+
+    /// The first value a live record holds whose magnitude passes
+    /// [`SPARSE_BOUND`], with the record's position and the value's index
+    /// in the record's vector, the records taken in position order. `None`
+    /// for every index this build writes, since a collection admits no such
+    /// value.
+    ///
+    /// One pass over the forward arena with no early exit settles an index
+    /// that holds no such value, removed records' spans included, and only
+    /// an arena that holds one is walked record by record. A load asks this
+    /// once the space is read and any journal replayed.
+    pub fn first_value_past_bound(&self) -> Option<(Position, usize, f32)> {
+        let within = SPARSE_BOUND.to_bits();
+        let past = self.fwd_values.iter().fold(false, |past, &value| {
+            past | (magnitude_bits(value) > within)
+        });
+        if !past {
+            return None;
+        }
+        (0..self.records.len()).find_map(|slot| {
+            let at = Position::from_slot(slot);
+            let vector = self.forward(self.slot_of(at)?);
+            let (index, &value) = vector
+                .values
+                .iter()
+                .enumerate()
+                .find(|(_, value)| magnitude_bits(**value) > within)?;
+            Some((at, index, value))
+        })
     }
 
     /// Rewrite one list without its dead postings.
@@ -1281,6 +1355,121 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert_eq!(dot.len(), 1);
+    }
+
+    /// A declaration's `k1` past the bound on a sparse value is refused with
+    /// the whole rule named, one at the bound is taken, and a load, which
+    /// holds `config.json` to the rules without the bound, reads both. Every
+    /// other refusal of a declaration keeps its words.
+    #[test]
+    fn a_k1_past_the_bound_is_refused_where_declared_and_read_where_loaded() {
+        let at = Weighting::Bm25 {
+            k1: SPARSE_BOUND,
+            b: 0.75,
+        };
+        assert!(at.validate_declared().is_ok());
+        for k1 in [f32::from_bits(SPARSE_BOUND.to_bits() + 1), 2e12, f32::MAX] {
+            let past = Weighting::Bm25 { k1, b: 0.75 };
+            assert!(past.validate().is_ok(), "{k1:e}: a load reads it");
+            let declared = SparseConfig {
+                weighting: past,
+                ..SparseConfig::default()
+            };
+            assert!(declared.validate().is_ok(), "{k1:e}: a load reads it");
+            assert_eq!(
+                declared.validate_declared().unwrap_err().to_string(),
+                format!(
+                    "Term weighting parameter k1 is {k1}, and it must be finite, at least zero \
+                     and at most 2^40, 1.099511627776e12"
+                )
+            );
+        }
+        assert_eq!(
+            Weighting::Bm25 { k1: 2e12, b: 0.75 }
+                .validate_declared()
+                .unwrap_err()
+                .to_string(),
+            "Term weighting parameter k1 is 2000000000000, and it must be finite, at least zero \
+             and at most 2^40, 1.099511627776e12"
+        );
+        for broken in [
+            Weighting::Bm25 { k1: -1.0, b: 0.75 },
+            Weighting::Bm25 {
+                k1: f32::NAN,
+                b: 0.75,
+            },
+            Weighting::Bm25 { k1: 1.2, b: 1.5 },
+        ] {
+            assert_eq!(
+                broken.validate_declared().unwrap_err().to_string(),
+                broken.validate().unwrap_err().to_string()
+            );
+        }
+        assert!(Weighting::Dot.validate_declared().is_ok());
+    }
+
+    /// A new record's value past the bound on a sparse value is refused as
+    /// past the bound before the rules a term frequency keeps, under either
+    /// weighting, and the rules a load applies take the same record.
+    #[test]
+    fn a_new_records_value_past_the_bound_is_refused_before_the_count_rules() {
+        let whole_past = 2f32.powi(41);
+        for (weighting, value) in [(Weighting::BM25, whole_past), (Weighting::Dot, -whole_past)] {
+            let vector = sparse(&[1, 2], &[1.0, value]);
+            assert!(
+                matches!(
+                    weighting.validate_bounded_record(vector.as_ref()),
+                    Err(Error::SparseValuePastBound { index: 1, value: held }) if held == value
+                ),
+                "{weighting:?}"
+            );
+            assert!(
+                weighting.validate_record(vector.as_ref()).is_ok(),
+                "{weighting:?}: a load reads it"
+            );
+        }
+        assert!(matches!(
+            Weighting::BM25.validate_bounded_record(sparse(&[1], &[0.5]).as_ref()),
+            Err(Error::SparseValueNotWhole { index: 0, .. })
+        ));
+    }
+
+    /// The first stored value past the bound on a sparse value is a live
+    /// record's, found in position order with its place in the record's
+    /// vector. A removed record's value is passed over, and an index that
+    /// holds none answers none.
+    #[test]
+    fn the_first_value_past_the_bound_is_a_live_records() {
+        let none = zeusdb_vector_core::Prepared::none;
+        let mut index = PostingsIndex::new(SparseConfig {
+            unlink: Unlink::Strand,
+            ..SparseConfig::default()
+        });
+        assert_eq!(index.first_value_past_bound(), None);
+        for (at, values) in [
+            (1u32, [1.0f32, 2.0]),
+            (2, [1.0, 3e12]),
+            (3, [-5e12, SPARSE_BOUND]),
+        ] {
+            index
+                .insert(
+                    Position(at),
+                    RecordId(at),
+                    sparse(&[4, 9], &values).as_ref(),
+                    none(),
+                )
+                .unwrap();
+        }
+        assert_eq!(index.first_value_past_bound(), Some((Position(2), 1, 3e12)));
+        index.remove(Position(2)).unwrap();
+        assert_eq!(
+            index.first_value_past_bound(),
+            Some((Position(3), 0, -5e12))
+        );
+        index.remove(Position(3)).unwrap();
+        assert_eq!(index.first_value_past_bound(), None);
+        index.compact();
+        assert_eq!(index.first_value_past_bound(), None);
     }
 
     /// An id already held is refused, an id never held cannot be removed,

@@ -78,8 +78,8 @@ pub use bitmap::Bitmap;
 pub use checksum::checksum_of;
 pub use columns::{validate_indexed_fields, ColumnParts, ColumnStore, Selection};
 pub use distance::{
-    norm_f64, past_bound_words, screen, CosineDist, DistPQ, DotDist, Int8Dist, Int8Metric, L1Dist,
-    L2Dist, PqMetric, Screen, NORM_BOUND,
+    norm_f64, past_bound_words, raw_distance, screen, CosineDist, DistPQ, DotDist, Int8Dist,
+    Int8Metric, L1Dist, L2Dist, PqMetric, Screen, NORM_BOUND,
 };
 pub use error::{Error, Exception};
 pub use filter::{compile_filter, matches_filter, FieldLookup, Filter};
@@ -102,8 +102,9 @@ pub use graph::dump_fuzz;
 #[cfg(any(test, feature = "test-support"))]
 pub use graph::GRAPH_CEILINGS;
 pub use graph::{
-    restore_graph, restore_int8_graph, Distance, DumpBounds, DumpRefusal, DumpRegion, DumpRows,
-    GraphCeilings, GraphHit, GraphRoom, Planned, Record, Restored, RowValues, VectorGraph,
+    restore_graph, restore_int8_graph, CodeScores, Distance, DumpBounds, DumpRefusal, DumpRegion,
+    DumpRows, GraphCeilings, GraphHit, GraphRoom, Planned, Record, Restored, RowValues,
+    VectorGraph,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use ids::ID_CEILINGS;
@@ -149,10 +150,10 @@ pub use panic_point::{at as panic_at, PanicPoint};
 pub use pq::PQ;
 pub use rng::SeededRng;
 pub use space::{
-    read_artefact, write_artefact, ArtefactRecord, Bounds, Budget, CorpusStats, Cost, Dense, Hit,
-    Hits, IdfScope, Inventory, Kind, Ledger, Persist, Position, PositionWalk, Prepared, RecordId,
-    Restore, ScoreKind, Selectivity, SpaceKind, SpaceName, Sparse, SparseRef, SparseVector,
-    VectorIndex,
+    magnitude_bits, read_artefact, write_artefact, ArtefactRecord, Bounds, Budget, CorpusStats,
+    Cost, Dense, Hit, Hits, IdfScope, Inventory, Kind, Ledger, Persist, Position, PositionWalk,
+    Prepared, RecordId, Restore, ScoreKind, Selectivity, SpaceKind, SpaceName, Sparse, SparseRef,
+    SparseVector, VectorIndex, SPARSE_BOUND,
 };
 // The directory syncs a test makes fail. Present under the `test-support`
 // feature and in this crate's own tests; see `storage`.

@@ -85,10 +85,10 @@ use std::sync::Arc;
 
 use tracing::error;
 use zeusdb_vector_core::{
-    restore_graph, restore_int8_graph, Admit, ArtefactRecord, Bitmap, Bounds, Budget, Cost, Dense,
-    Dir, DumpBounds, DumpRefusal, DumpRegion, DumpRows, Error, Hit, Hits, Int8Codec, Inventory,
-    Ledger, Persist, Planned, Position, Prepared, Record, RecordId, Restore, Restored, ScoreKind,
-    Selectivity, VectorGraph, VectorIndex, DUMP_FILENAME, PQ,
+    restore_graph, restore_int8_graph, Admit, ArtefactRecord, Bitmap, Bounds, Budget, CodeScores,
+    Cost, Dense, Dir, DumpBounds, DumpRefusal, DumpRegion, DumpRows, Error, Hit, Hits, Int8Codec,
+    Inventory, Ledger, Persist, Planned, Position, Prepared, Record, RecordId, Restore, Restored,
+    ScoreKind, Selectivity, VectorGraph, VectorIndex, DUMP_FILENAME, PQ,
 };
 
 /// The empty marker, being a position that holds no record or a node that
@@ -124,7 +124,7 @@ impl<'a> IdsByPosition<'a> {
 
 use super::query::AdmitShape;
 use super::search::FULL_SCAN_THRESHOLD;
-use crate::{prepare_reconstruction, raw_distance_fn, reconstruction_needs_unit, RawVectors};
+use crate::{raw_distance_fn, RawVectors};
 
 /// The target every record this file emits carries, being the search
 /// module's, since the records here are the ones the traversal emitted from
@@ -839,38 +839,56 @@ impl DenseIndex {
         self.cost(query, k, shape.selectivity().as_ref())
     }
 
-    /// The distance from `query` to the record one node holds, on the raw
-    /// scale.
+    /// The distance from `query` to the record one node holds, as the exact
+    /// scan scores it.
     ///
-    /// The stored raw vector where the graph holds one and the reconstruction
-    /// from the record's codes where it does not, normalised first where the
-    /// space requires it. A record holding neither cannot exist, since every
-    /// insertion writes one or the other, and is sorted last.
+    /// The stored raw vector where the graph holds one, on the raw scale.
+    /// Otherwise the graph's own kernel over the record's scalar row or its
+    /// product quantized codes, which is what a traversal scores the node
+    /// with, so the scan and the traversal give a record the same bits.
+    /// `code_scores` holds the query's table over a product quantized graph
+    /// that keeps no raw vector. A record holding none of the three cannot
+    /// exist, since every insertion writes one, and is sorted last.
     fn exact_distance_at(
         &self,
         query: &[f32],
         node: u32,
         distance: fn(&[f32], &[f32]) -> f32,
-        needs_unit: bool,
+        code_scores: Option<&CodeScores<'_>>,
     ) -> f32 {
         if let Some(stored) = self.graph.raw_vector_at(node) {
             return distance(query, stored);
         }
-        // A scalar row is scored through the graph's own kernel, so the exact
-        // scan and the traversal agree bit for bit and the page is on the
-        // scale the kernel already puts it on.
         if let Some(scored) = self.graph.int8_distance_at(query, node) {
             return scored;
         }
-        let reconstructed = self
-            .graph
-            .codes_at(node)
-            .and_then(|codes| self.pq.as_ref()?.reconstruct(codes).ok());
-        match reconstructed {
-            Some(reconstructed) => {
-                distance(query, &prepare_reconstruction(needs_unit, reconstructed))
-            }
+        match code_scores.and_then(|scores| scores.at(node)) {
+            Some(score) => self.reported(score),
             None => f32::INFINITY,
+        }
+    }
+
+    /// Whether a score of the graph's kernel takes a root on its way to a
+    /// page, which a product quantized l2 graph's does.
+    ///
+    /// That kernel sums a table of squared distances and takes no root,
+    /// since the root is monotone. Every other kernel returns its score on
+    /// the scale the index reports: the product quantized cosine kernel
+    /// makes its own conversion, and a scalar l2 kernel takes the root
+    /// itself.
+    #[inline]
+    fn roots_scores(&self) -> bool {
+        self.graph.is_pq() && self.metric == "l2"
+    }
+
+    /// A score of the graph's kernel on the scale the index reports, for the
+    /// exact scan. See [`DenseIndex::roots_scores`] and [`rooted`].
+    #[inline]
+    fn reported(&self, score: f32) -> f32 {
+        if self.roots_scores() {
+            rooted(score)
+        } else {
+            score
         }
     }
 
@@ -887,13 +905,27 @@ impl DenseIndex {
         boundary_ties: bool,
     ) -> Hits {
         let distance = raw_distance_fn(&self.metric);
-        let needs_unit = reconstruction_needs_unit(&self.metric);
+        // The query's table, where the graph holds codes and no raw vector.
+        // A query the table cannot be made for is answered as the traversal
+        // answers it, with the refusal logged and no record.
+        let code_scores = match self.graph.code_scores(query) {
+            None => None,
+            Some(Ok(scores)) => Some(scores),
+            Some(Err(e)) => {
+                error!(target: LOG_TARGET, operation = "adc_scan", error = %e, "Graph scan failed");
+                return Hits {
+                    items: Vec::new(),
+                    kind: ScoreKind::Distance,
+                    exact: true,
+                };
+            }
+        };
         let node_at = &self.node_at;
         let mut scored: Vec<(f32, u32)> = positions
             .iter()
             .filter_map(|at| match node_at.get(at.slot()) {
                 Some(&node) if node != NONE => Some((
-                    self.exact_distance_at(query, node, distance, needs_unit),
+                    self.exact_distance_at(query, node, distance, code_scores.as_ref()),
                     at.0,
                 )),
                 _ => None,
@@ -980,19 +1012,11 @@ impl DenseIndex {
                 score: hit.distance,
             })
             .collect();
-        // Put a product quantized l2 index's approximate scores back on the
-        // scale it reports. That scorer sums a table of squared distances and
-        // takes no root, because the root is monotone and would cost one per
-        // evaluation to change nothing, so the root is taken once per
-        // returned candidate here. Cosine arrives already on its own scale,
-        // since its conversion is not monotone in the sum and the scorer has
-        // to make it. A scalar l2 scorer takes the root inside the kernel,
-        // reproducing the raw kernel over the decoded values, so its page is
-        // already on that scale and a second root here would move every
-        // score off it; the condition is the product quantized graph alone.
-        if self.graph.is_pq() && self.metric == "l2" {
+        // Put a product quantized l2 index's scores on the scale it reports,
+        // one root for each returned candidate. See `roots_scores`.
+        if self.roots_scores() {
             for item in &mut items {
-                item.score = item.score.max(0.0).sqrt();
+                item.score = rooted(item.score);
             }
         }
         Hits {
@@ -1057,11 +1081,12 @@ impl DenseIndex {
     /// The score the exact scan gives the record one node holds.
     #[cfg(test)]
     pub(crate) fn exact_distance_of_node(&self, query: &[f32], node: u32) -> f32 {
+        let code_scores = self.graph.code_scores(query).map(Result::unwrap);
         self.exact_distance_at(
             query,
             node,
             raw_distance_fn(&self.metric),
-            reconstruction_needs_unit(&self.metric),
+            code_scores.as_ref(),
         )
     }
 
@@ -1315,6 +1340,15 @@ impl VectorIndex<Dense> for DenseIndex {
             },
         }
     }
+}
+
+/// The root that puts a product quantized l2 kernel's score, a sum of squared
+/// distances, on the scale the index reports. The traversal's page and the
+/// exact scan both take it here, so a record's score is the same bits on
+/// either path.
+#[inline(always)]
+fn rooted(score: f32) -> f32 {
+    score.max(0.0).sqrt()
 }
 
 /// The positions an index over `graph` reserves, being the nodes the graph
@@ -2364,8 +2398,6 @@ mod tests {
             .chain([Position(1 + count as u32 * gap + 7), Position(NONE)])
             .collect();
         positions.sort_unstable();
-        let distance = raw_distance_fn("l2");
-        let needs_unit = reconstruction_needs_unit("l2");
         for (kind, index) in &indexes {
             for q in [3usize, 77, 150] {
                 let query = &vectors[q];
@@ -2376,10 +2408,7 @@ mod tests {
                     })
                     .map(|at| {
                         let node = node_with_origin(index.graph(), at.slot()).unwrap();
-                        (
-                            index.exact_distance_at(query, node, distance, needs_unit),
-                            at.0,
-                        )
+                        (index.exact_distance_of_node(query, node), at.0)
                     })
                     .collect();
                 assert_eq!(looked_up.len(), count - count.div_ceil(7), "{kind}");
@@ -2402,6 +2431,88 @@ mod tests {
                     assert_eq!(page, bits(&cut), "{kind} query {q} k {k}");
                 }
             }
+        }
+    }
+
+    /// The exact scan scores a product quantized record that keeps no raw
+    /// vector as the traversal scores it, bit for bit, under cosine and under
+    /// l2. Every record a traversal returns scores the same bits by the
+    /// scan, and a traversal wide enough to reach every record answers the
+    /// page the scan answers over the same records, score for score, and
+    /// record for record wherever two neighbours' scores differ.
+    #[test]
+    fn the_exact_scan_scores_a_coded_record_as_the_traversal_scores_it() {
+        let (count, dim) = (600usize, 16usize);
+        let layers = NB_LAYER_MAX as usize;
+        let unit = |v: &[f32]| -> Vec<f32> {
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            v.iter().map(|x| x / norm).collect()
+        };
+        for metric in ["cosine", "l2"] {
+            let raw = zeusdb_vector_core::test_support::clustered(count + 40, dim, 0x0225);
+            let vectors: Vec<Vec<f32>> = if metric == "cosine" {
+                raw.iter().map(|v| unit(v)).collect()
+            } else {
+                raw
+            };
+            let (records, queries) = vectors.split_at(count);
+            let pq = Arc::new(PQ::new(dim, 8, 4, 256, None));
+            pq.train(records).unwrap();
+            let graph = VectorGraph::new_pq(metric, 16, count, layers, 200, pq.clone());
+            let mut index = DenseIndex::new(graph, metric, dim, Some(pq), false);
+            for (k, v) in records.iter().enumerate() {
+                put(&mut index, k as u32, v);
+            }
+            assert!(index.graph().is_pq() && !index.graph().holds_raw());
+            let every: Vec<Position> = (0..count as u32).map(Position).collect();
+
+            let (mut compared, mut pages) = (0usize, 0usize);
+            for (q, query) in queries.iter().enumerate() {
+                // What the traversal returns, each record scored again by
+                // the scan.
+                let traversed = index.traverse_under(query, 50, 200, &Candidates::All);
+                assert_eq!(traversed.items.len(), 50, "{metric} query {q}");
+                for hit in &traversed.items {
+                    let node = index.node_of(hit.position).unwrap();
+                    let scanned = index.exact_distance_of_node(query, node);
+                    compared += 1;
+                    assert_eq!(
+                        scanned.to_bits(),
+                        hit.score.to_bits(),
+                        "{metric} query {q}: the scan scores the record at {} as {scanned:e} and \
+                         the traversal as {:e}",
+                        hit.position.0,
+                        hit.score
+                    );
+                }
+
+                // A traversal that reaches every record against the scan of
+                // every record.
+                let wide = index.traverse_under(query, count, 4 * count, &Candidates::All);
+                let scan = index.score_exact(query, &every, count, false);
+                assert_eq!(wide.items.len(), count, "{metric} query {q}");
+                assert_eq!(scan.items.len(), count, "{metric} query {q}");
+                for (rank, (a, b)) in wide.items.iter().zip(&scan.items).enumerate() {
+                    assert_eq!(
+                        a.score.to_bits(),
+                        b.score.to_bits(),
+                        "{metric} query {q} rank {rank}: the traversal holds {:e} and the scan \
+                         {:e}",
+                        a.score,
+                        b.score
+                    );
+                    let tied = (rank > 0 && scan.items[rank - 1].score == b.score)
+                        || scan
+                            .items
+                            .get(rank + 1)
+                            .is_some_and(|next| next.score == b.score);
+                    if !tied {
+                        assert_eq!(a.position, b.position, "{metric} query {q} rank {rank}");
+                    }
+                }
+                pages += 1;
+            }
+            assert_eq!((compared, pages), (40 * 50, 40), "{metric}");
         }
     }
 

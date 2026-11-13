@@ -382,7 +382,8 @@ pub trait OperationSink: Send + std::fmt::Debug {
     }
 
     /// Whether this sink's collection is read only for a value its
-    /// directory holds past the bound on a vector's norm. The collection then
+    /// directory holds past the bound on a vector's norm or on a sparse
+    /// value. The collection then
     /// refuses every mutation, a checkpoint, a save into any directory and a
     /// backup in the words of the sink's reason, since each would write that
     /// value again.
@@ -1947,7 +1948,8 @@ impl Collection {
     }
 
     /// The refusal of a collection read only for a value its directory
-    /// holds past the bound on a vector's norm, which refuses a save into any
+    /// holds past the bound on a vector's norm or on a sparse value, which
+    /// refuses a save into any
     /// directory and a backup as well as every mutation and checkpoint, in
     /// the words of the sink's reason. `None` for every other collection.
     pub(crate) fn sink_bound_refusal(&self) -> Option<Error> {

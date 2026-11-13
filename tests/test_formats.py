@@ -587,3 +587,85 @@ def test_a_directory_holding_a_value_past_the_bound_opens_read_only(tmp_path, na
     gc.collect()
     assert not copy.exists()
     assert files_of(path.parent) == before
+
+
+# ============================================================================
+# A SPARSE VALUE PAST THE BOUND ON ITS MAGNITUDE
+# ============================================================================
+
+# The bound on a sparse value and on a term weighting k1, 2^40, in the words
+# of a load's reason.
+SPARSE_BOUND_WORDS = "2^40 (1.099511627776e12)"
+
+
+def a_sparse_value_of_the_largest_float(path):
+    """The first value of the first record the text space's postings hold
+    set to the largest float32. The payload holds the slot count and the
+    live count, then each record's id, its count, its dims and its values."""
+    name = "spaces/text/postings.zdbsparse"
+    _, _, payload = unframe((path / name).read_bytes())
+    count = int.from_bytes(payload[12:16], "little")
+    largest = float(np.finfo(np.float32).max)
+    set_float(path, name, 16 + 4 * count, largest)
+    return (r"spaces/text/postings\.zdbsparse holds the sparse value (\S+) at index 0 of "
+            r"'([^']+)', past " + re.escape(SPARSE_BOUND_WORDS)
+            + r", the largest magnitude a sparse space takes\.", largest)
+
+
+def a_term_weighting_k1_of_2e12(path):
+    config = json.loads((path / "config.json").read_text(encoding="utf-8"))
+    config["spaces"][0]["index"]["weighting"]["k1"] = 2e12
+    (path / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8",
+                                      newline="\n")
+    repair_manifest(path, "config.json")
+    return (r"config\.json holds a term weighting k1 of (\S+), past "
+            + re.escape(SPARSE_BOUND_WORDS) + r", the largest k1 a sparse space takes\.", 2e12)
+
+
+@pytest.mark.parametrize("name,edit", [
+    ("v2.0.0-text", a_sparse_value_of_the_largest_float),
+    ("v4.0.0-journaled-text", a_sparse_value_of_the_largest_float),
+    ("v2.0.0-text", a_term_weighting_k1_of_2e12),
+    ("v4.0.0-journaled-text", a_term_weighting_k1_of_2e12),
+])
+def test_a_directory_holding_a_sparse_value_past_the_bound_opens_read_only(tmp_path, name, edit):
+    """A directory 0.13.0 writes holding a sparse value whose magnitude
+    passes 2^40, or a term weighting k1 past 2^40, every value finite, opens
+    read only, whether or not it is journaled: nothing on disk changes, a
+    RuntimeWarning names the value, the file and the bound, and every change,
+    checkpoint() and save is refused in the same words. Its searches run, a
+    text arm among them."""
+    path = opened_copy(name, tmp_path)
+    pattern, value = edit(path)
+    before = files_of(path.parent)
+
+    index, messages = loaded_with_warnings(path)
+    assert index.recovery["read_only"] is True
+    reason = index.recovery["read_only_reason"]
+    found = re.fullmatch(pattern + re.escape(PAST_THE_BOUND), reason)
+    assert found, reason
+    assert np.float32(float(found.group(1))) == np.float32(value), reason
+    if found.re.groups == 2:
+        assert found.group(2) in index, reason
+    [message] = messages
+    assert reason in message and "opened read only" in message, message
+
+    assert len(index.search([0.25] * index.dim, top_k=5)) == 5
+    assert len(index.query(arms=[{"vector": [0.25] * index.dim}, {"text": "absent"}],
+                           top_k=5)) == 5
+    copy = tmp_path / "copy.zdb"
+    first = index.list(number=1)[0][0]
+    refused = index.add({"ids": ["new"], "embeddings": np.zeros((1, index.dim), dtype=np.float32)})
+    assert refused.total_errors == 1 and reason in refused.errors[0], refused.errors
+    for change in (lambda: index.remove_point(first),
+                   lambda: index.checkpoint(),
+                   lambda: index.save(str(path)),
+                   lambda: index.save(str(copy)),
+                   lambda: index.backup(str(copy))):
+        with pytest.raises(RuntimeError) as refusal:
+            change()
+        assert reason in str(refusal.value)
+    del index
+    gc.collect()
+    assert not copy.exists()
+    assert files_of(path.parent) == before

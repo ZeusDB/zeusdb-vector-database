@@ -554,8 +554,8 @@ enum Outcome {
 /// A collection that cannot record the generation after its directory's
 /// refuses every save in the words of `generation_exhausted`, and one read
 /// only for that reason gives those words as its reason. One read only for
-/// a value past the bound on a vector's norm gives that value's words as
-/// its reason and refuses every save in them. Those are the refusals a case
+/// a value past the bound on a vector's norm or on a sparse value gives that
+/// value's words as its reason and refuses every save in them. Those are the refusals a case
 /// may meet past the reads, each by its exact words.
 fn hold_together(collection: &Collection, recovery: &Recovery, policy: JournalPolicy, label: &str) {
     assert!(
