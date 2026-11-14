@@ -52,6 +52,7 @@
 use crate::bitmap::Bitmap;
 use crate::error::Error;
 use crate::filter::{field_test_matches, FieldLookup, FieldTest, Filter, Presence};
+use crate::table::SizedMap;
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -116,7 +117,9 @@ enum Column {
         /// every `update_metadata` would grow its dictionary without bound.
         refs: Vec<u32>,
         free: Vec<u32>,
-        lookup: HashMap<Value, u32>,
+        /// Each held value's code, with the buckets of its table kept beside
+        /// it, which a release leaves.
+        lookup: SizedMap<Value, u32>,
     },
     /// High cardinality. One value a record, which is a second copy of that
     /// value, the first being the one `vector_metadata` holds.
@@ -136,7 +139,7 @@ impl Column {
             dict: Vec::new(),
             refs: Vec::new(),
             free: Vec::new(),
-            lookup: HashMap::new(),
+            lookup: SizedMap::new(),
         }
     }
 
@@ -298,8 +301,10 @@ impl Column {
         }
     }
 
-    /// Every part of the column, each with its capacity, for
-    /// [`ColumnStore::layout`].
+    /// Every part of the column for [`ColumnStore::layout`], each vector with
+    /// its capacity, and the lookup with the bytes its table is priced at,
+    /// its length and its entries in the order of their codes. The lookup's
+    /// own capacity and order follow the map's seed, so neither is shown.
     #[cfg(any(test, feature = "test-support"))]
     fn layout(&self) -> Vec<(&'static str, usize, String)> {
         match self {
@@ -318,12 +323,21 @@ impl Column {
                 lookup,
             } => {
                 let shown: Vec<String> = dict.iter().map(Value::to_string).collect();
+                let mut entries: Vec<(u32, String)> = lookup
+                    .iter()
+                    .map(|(value, &code)| (code, value.to_string()))
+                    .collect();
+                entries.sort_unstable();
                 vec![
                     ("codes", codes.capacity(), format!("{codes:?}")),
                     ("dict", dict.capacity(), format!("{shown:?}")),
                     ("refs", refs.capacity(), format!("{refs:?}")),
                     ("free", free.capacity(), format!("{free:?}")),
-                    ("lookup", lookup.capacity(), lookup.len().to_string()),
+                    (
+                        "lookup",
+                        lookup_bytes(lookup),
+                        format!("{} {entries:?}", entries.len()),
+                    ),
                 ]
             }
         }
@@ -425,9 +439,9 @@ impl Column {
                     + dict.capacity() * std::mem::size_of::<Value>()
                     + refs.capacity() * 4
                     + free.capacity() * 4
-                    // A bucket holds the key, the code and a control byte, and
-                    // the key owns the same payload the dictionary entry does.
-                    + lookup.capacity() * (std::mem::size_of::<Value>() + 4 + 8)
+                    + lookup_bytes(lookup)
+                    // Each of the lookup's keys owns the same payload as the
+                    // dictionary entry.
                     + dict.iter().map(value_payload).sum::<usize>() * 2
             }
         }
@@ -505,6 +519,13 @@ fn put_by_slots(codes: &[u32], words: &mut [u64], takes: impl Fn(u32) -> bool) {
             words[slot >> 6] |= 1 << (slot & 63);
         }
     }
+}
+
+/// Bytes a dictionary column's lookup is priced at, being its table at the
+/// buckets it holds with the slots its releases left among them. What its
+/// keys own on the heap is priced with the dictionary's entries.
+fn lookup_bytes(lookup: &SizedMap<Value, u32>) -> usize {
+    lookup.table_bytes()
 }
 
 /// What a value owns on the heap beyond the 32 bytes of the `Value` itself.
@@ -854,9 +875,10 @@ impl ColumnStore {
         std::mem::swap(&mut self.slots, &mut parts.slots);
     }
 
-    /// Every part of the store, each with its capacity, for a test that
-    /// holds two stores to be the same codes and values. Absent from every
-    /// build that is not a test.
+    /// Every part of the store, each vector with its capacity and each
+    /// lookup with the bytes its table is priced at, for a test that holds
+    /// two stores to be the same codes and values. See `Column::layout`.
+    /// Absent from every build that is not a test.
     #[cfg(any(test, feature = "test-support"))]
     pub fn layout(&self) -> Vec<(&'static str, usize, String)> {
         let mut out = vec![
@@ -2089,6 +2111,42 @@ mod tests {
             selected(&store, &field("cat", FieldTest::Equals(json!("b")))),
             vec![0]
         );
+    }
+
+    /// A dictionary column prices its lookup at the buckets its table holds,
+    /// which a release never gives back. A store that took 1,792 distinct
+    /// values, two records each, and then lost every record of 1,780 of them
+    /// prices its column at what it priced before and the codes the releases
+    /// put on the free list, whatever its lookup's seed, in each of eight
+    /// stores.
+    #[test]
+    fn a_release_leaves_the_lookup_priced_at_the_buckets_its_table_holds() {
+        for round in 0..8 {
+            let mut store = ColumnStore::new(vec!["serial".to_string()], 4_096);
+            for slot in 0..3_584usize {
+                store.write(slot, &record(&[("serial", json!(slot / 2))]));
+            }
+            assert!(
+                matches!(store.columns[0], Column::Dictionary { .. }),
+                "round {round}"
+            );
+            let before = store.heap_bytes();
+            for slot in 0..3_560usize {
+                store.erase(slot);
+            }
+            let Column::Dictionary { free, .. } = &store.columns[0] else {
+                panic!("round {round}: the column is a dictionary after the releases");
+            };
+            assert_eq!(free.len(), 1_780, "round {round}");
+            let freed = free.capacity() * std::mem::size_of::<u32>();
+            let after = store.heap_bytes();
+            assert_eq!(
+                after,
+                before + freed,
+                "round {round}: the store priced {before} bytes before the releases and {after} \
+                 after, where the free list adds {freed}"
+            );
+        }
     }
 
     // ========================================================================

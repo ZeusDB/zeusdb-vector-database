@@ -32,12 +32,17 @@
 //!
 //! An admit set the index can enumerate whose count is at or under
 //! [`FULL_SCAN_THRESHOLD`] is scored exactly, record by record, from the
-//! graph's own store or from the reconstruction of the record's codes where
-//! the store holds none. So is a set admitting every record where a node is
+//! graph's own store. So is a set admitting every record where a node is
 //! stranded and the index holds fewer records than the search's width, which
 //! a traversal could never fill its heap from; see
-//! [`DenseIndex::scans_every_record`]. Everything else traverses the graph
-//! under the admit set as a predicate. The collection decides what the admit set is, being a
+//! [`DenseIndex::scans_every_record`]. The scan scores the raw vector, the
+//! scalar row, or the product quantized codes through the kernel and the
+//! query table a traversal uses. A graph that keeps raw vectors beside its
+//! codes is scored by its codes unless the caller rescores the page against
+//! the raw vectors, so a record takes the score a traversal's page or a
+//! rescored page gives it; see `DenseIndex::score_exact`. Everything else
+//! traverses the graph under the admit set as a predicate. The collection
+//! decides what the admit set is, being a
 //! filter's bitmap, the matches of a metadata walk, or a conjunction of a
 //! bound and a predicate, and the threshold is applied here, so the rule is
 //! stated once whatever built the set.
@@ -839,30 +844,38 @@ impl DenseIndex {
         self.cost(query, k, shape.selectivity().as_ref())
     }
 
-    /// The distance from `query` to the record one node holds, as the exact
-    /// scan scores it.
+    /// The distance from `query` to the record one node holds, scored from
+    /// the vector or the row the node stores.
     ///
     /// The stored raw vector where the graph holds one, on the raw scale.
-    /// Otherwise the graph's own kernel over the record's scalar row or its
-    /// product quantized codes, which is what a traversal scores the node
-    /// with, so the scan and the traversal give a record the same bits.
-    /// `code_scores` holds the query's table over a product quantized graph
-    /// that keeps no raw vector. A record holding none of the three cannot
-    /// exist, since every insertion writes one, and is sorted last.
+    /// Otherwise the graph's own kernel over the record's scalar row, which
+    /// is what a traversal scores the node with, so the scan and the
+    /// traversal give a record the same bits. A record the scan scores by
+    /// its product quantized codes is [`DenseIndex::coded_distance_at`]'s. A
+    /// record holding neither cannot reach here, since every insertion
+    /// writes one, and is sorted last.
     fn exact_distance_at(
         &self,
         query: &[f32],
         node: u32,
         distance: fn(&[f32], &[f32]) -> f32,
-        code_scores: Option<&CodeScores<'_>>,
     ) -> f32 {
         if let Some(stored) = self.graph.raw_vector_at(node) {
             return distance(query, stored);
         }
-        if let Some(scored) = self.graph.int8_distance_at(query, node) {
-            return scored;
-        }
-        match code_scores.and_then(|scores| scores.at(node)) {
+        self.graph
+            .int8_distance_at(query, node)
+            .unwrap_or(f32::INFINITY)
+    }
+
+    /// The distance from the query `code_scores` holds the table of to the
+    /// record one node holds, by the product quantized kernel a traversal
+    /// evaluates and on the scale the index reports, so the scan and the
+    /// traversal give a record the same bits. A node the graph does not hold
+    /// is sorted last.
+    #[inline]
+    fn coded_distance_at(&self, code_scores: &CodeScores<'_>, node: u32) -> f32 {
+        match code_scores.at(node) {
             Some(score) => self.reported(score),
             None => f32::INFINITY,
         }
@@ -897,18 +910,30 @@ impl DenseIndex {
     /// The positions arrive in increasing order. Each reads its node from
     /// `node_at`, skips a position that holds no record, and is scored from
     /// the node's vector, scalar row or codes.
+    ///
+    /// A product quantized record is scored by its codes through the
+    /// graph's own kernel, as a traversal scores it, except on a graph that
+    /// keeps raw vectors where `rescored` says the caller rescores the page
+    /// against them, which scores the raw vector, as the rescore does. So a
+    /// record and a query take one score whichever path answers: the raw
+    /// vector's on a rescored page and the codes' on any other.
     fn score_exact(
         &self,
         query: &[f32],
         positions: &[Position],
         k: usize,
         boundary_ties: bool,
+        rescored: bool,
     ) -> Hits {
-        let distance = raw_distance_fn(&self.metric);
-        // The query's table, where the graph holds codes and no raw vector.
-        // A query the table cannot be made for is answered as the traversal
-        // answers it, with the refusal logged and no record.
-        let code_scores = match self.graph.code_scores(query) {
+        // The query's table, where the scan scores codes. A query the table
+        // cannot be made for is answered as the traversal answers it, with
+        // the refusal logged and no record.
+        let codes = if rescored && self.graph.holds_raw() {
+            None
+        } else {
+            self.graph.code_scores(query)
+        };
+        let code_scores = match codes {
             None => None,
             Some(Ok(scores)) => Some(scores),
             Some(Err(e)) => {
@@ -920,17 +945,17 @@ impl DenseIndex {
                 };
             }
         };
-        let node_at = &self.node_at;
-        let mut scored: Vec<(f32, u32)> = positions
-            .iter()
-            .filter_map(|at| match node_at.get(at.slot()) {
-                Some(&node) if node != NONE => Some((
-                    self.exact_distance_at(query, node, distance, code_scores.as_ref()),
-                    at.0,
-                )),
-                _ => None,
-            })
-            .collect();
+        let mut scored = match code_scores.as_ref() {
+            Some(scores) => {
+                self.scored_positions(positions, |node| self.coded_distance_at(scores, node))
+            }
+            None => {
+                let distance = raw_distance_fn(&self.metric);
+                self.scored_positions(positions, |node| {
+                    self.exact_distance_at(query, node, distance)
+                })
+            }
+        };
         scored.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
         let mut end = k.min(scored.len());
         if boundary_ties && end > 0 && end < scored.len() {
@@ -951,6 +976,24 @@ impl DenseIndex {
             kind: ScoreKind::Distance,
             exact: true,
         }
+    }
+
+    /// Each of `positions` that holds a record, as its node's score by
+    /// `score` and the position, in the order the positions arrive.
+    #[inline]
+    fn scored_positions(
+        &self,
+        positions: &[Position],
+        score: impl Fn(u32) -> f32,
+    ) -> Vec<(f32, u32)> {
+        let node_at = &self.node_at;
+        positions
+            .iter()
+            .filter_map(|at| match node_at.get(at.slot()) {
+                Some(&node) if node != NONE => Some((score(node), at.0)),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Run the traversal under one predicate.
@@ -1078,16 +1121,16 @@ impl DenseIndex {
             .collect()
     }
 
-    /// The score the exact scan gives the record one node holds.
+    /// The score the exact scan gives the record one node holds, on a page
+    /// the caller rescores against the raw vectors where `rescored` is set.
     #[cfg(test)]
-    pub(crate) fn exact_distance_of_node(&self, query: &[f32], node: u32) -> f32 {
-        let code_scores = self.graph.code_scores(query).map(Result::unwrap);
-        self.exact_distance_at(
-            query,
-            node,
-            raw_distance_fn(&self.metric),
-            code_scores.as_ref(),
-        )
+    pub(crate) fn exact_distance_of_node(&self, query: &[f32], node: u32, rescored: bool) -> f32 {
+        if !(rescored && self.graph.holds_raw()) {
+            if let Some(scores) = self.graph.code_scores(query).map(Result::unwrap) {
+                return self.coded_distance_at(&scores, node);
+            }
+        }
+        self.exact_distance_at(query, node, raw_distance_fn(&self.metric))
     }
 
     /// Draw the level the next record's node takes, advancing the graph's
@@ -1307,12 +1350,24 @@ impl VectorIndex<Dense> for DenseIndex {
                     positions.push(at);
                     true
                 }) {
-                    return Ok(self.score_exact(query, &positions, k, budget.boundary_ties));
+                    return Ok(self.score_exact(
+                        query,
+                        &positions,
+                        k,
+                        budget.boundary_ties,
+                        budget.rescored,
+                    ));
                 }
             }
         }
         if admit.admits_all() && self.scans_every_record(ef) {
-            return Ok(self.score_exact(query, &self.held_positions(), k, budget.boundary_ties));
+            return Ok(self.score_exact(
+                query,
+                &self.held_positions(),
+                k,
+                budget.boundary_ties,
+                budget.rescored,
+            ));
         }
         Ok(self.traverse(query, k, ef, admit))
     }
@@ -2408,7 +2463,7 @@ mod tests {
                     })
                     .map(|at| {
                         let node = node_with_origin(index.graph(), at.slot()).unwrap();
-                        (index.exact_distance_of_node(query, node), at.0)
+                        (index.exact_distance_of_node(query, node, true), at.0)
                     })
                     .collect();
                 assert_eq!(looked_up.len(), count - count.div_ceil(7), "{kind}");
@@ -2420,7 +2475,7 @@ mod tests {
                         .collect()
                 };
                 for k in [10usize, count] {
-                    let page = index.score_exact(query, &positions, k, false);
+                    let page = index.score_exact(query, &positions, k, false, true);
                     let page: Vec<(u32, u32)> = page
                         .items
                         .iter()
@@ -2474,7 +2529,7 @@ mod tests {
                 assert_eq!(traversed.items.len(), 50, "{metric} query {q}");
                 for hit in &traversed.items {
                     let node = index.node_of(hit.position).unwrap();
-                    let scanned = index.exact_distance_of_node(query, node);
+                    let scanned = index.exact_distance_of_node(query, node, false);
                     compared += 1;
                     assert_eq!(
                         scanned.to_bits(),
@@ -2489,7 +2544,7 @@ mod tests {
                 // A traversal that reaches every record against the scan of
                 // every record.
                 let wide = index.traverse_under(query, count, 4 * count, &Candidates::All);
-                let scan = index.score_exact(query, &every, count, false);
+                let scan = index.score_exact(query, &every, count, false, false);
                 assert_eq!(wide.items.len(), count, "{metric} query {q}");
                 assert_eq!(scan.items.len(), count, "{metric} query {q}");
                 for (rank, (a, b)) in wide.items.iter().zip(&scan.items).enumerate() {
@@ -2894,8 +2949,8 @@ mod tests {
             for (case, index, admit) in cases {
                 for at in &admitted {
                     let query = &vectors[at.slot() - 1];
-                    let exact = bits_of(&index.score_exact(query, &admitted, 10, false));
-                    let every = bits_of(&index.score_exact(query, &admitted, 20, false));
+                    let exact = bits_of(&index.score_exact(query, &admitted, 10, false, true));
+                    let every = bits_of(&index.score_exact(query, &admitted, 20, false, true));
                     for ef in [10, 20, 40, 400] {
                         let page = index.traverse_under(query, 10, ef, admit);
                         let label = format!("{kind} {case} query {} width {ef}", at.0);
@@ -2957,7 +3012,7 @@ mod tests {
         for (case, index, admit) in cases {
             for at in (1..=400u32).filter(|at| at % 20 != 4) {
                 let query = &sparse[at as usize - 1];
-                let exact = bits_of(&index.score_exact(query, &admitted, 10, false));
+                let exact = bits_of(&index.score_exact(query, &admitted, 10, false, true));
                 for ef in [40, 400] {
                     let page = index.traverse_under(query, 10, ef, admit);
                     assert_eq!(

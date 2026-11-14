@@ -173,8 +173,8 @@ use std::sync::{Arc, OnceLock};
 use tracing::{trace, warn};
 use zeusdb_vector_core::{
     matches_filter, ColumnStore, Error, Filter, IdStore, Int8Codec, MetadataStore, Operation,
-    OperationKind, Persist, Position, SegmentBase, Selection, SpaceName, SparseVector, VectorGraph,
-    VectorIndex, Withdrawal, PQ,
+    OperationKind, Persist, Position, SegmentBase, Selection, SizedMap, SpaceName, SparseVector,
+    VectorGraph, VectorIndex, Withdrawal, PQ,
 };
 use zeusdb_vector_sparse::{PostingsIndex, SparseConfig};
 use zeusdb_vector_text::{count_record_with, TermDictionary, Tokenizer, TokenizerConfig};
@@ -887,7 +887,9 @@ pub(crate) struct DenseSpace {
     // Quantization configuration and PQ instance
     quantization_config: Option<QuantizationConfig>,
     pq: Option<Arc<PQ>>,
-    pq_codes: RwLockAt<HashMap<String, Vec<u8>>>, // PQ codes storage
+    /// Each quantized record's codes by its id, with the buckets of the
+    /// map's table kept beside it, which a removal leaves.
+    pq_codes: RwLockAt<SizedMap<String, Vec<u8>>>,
 
     /// The scalar codec, once a scalar quantized space has fitted it, and
     /// its trained flag is this slot being filled.

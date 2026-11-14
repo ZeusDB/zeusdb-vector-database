@@ -26,7 +26,7 @@ use tracing::{debug, error, info, instrument};
 use zeusdb_vector_core::{
     screen, ArtefactRecord, Bounds, Dir, DumpRefusal, DumpRegion, DumpRows, Error, FsStorage,
     IdStore, Int8Codec, Inventory, KillPoint, MetadataStore, Persist, Position, PositionWalk,
-    Screen, SegmentBase, Storage, VectorGraph, DUMP_FILENAME, NORM_BOUND, SPARSE_BOUND,
+    Screen, SegmentBase, SizedMap, Storage, VectorGraph, DUMP_FILENAME, NORM_BOUND, SPARSE_BOUND,
 };
 
 /// Where a load read the parts [`Collection::first_past_bound`] scans, for
@@ -1467,13 +1467,14 @@ impl Collection {
     /// naming an id the mappings do not hold had no position to go in and
     /// was dropped by the read. Writing the codes back, taking the store and
     /// building the columns from it leaves the loaded index holding exactly
-    /// what was saved.
+    /// what was saved. Every read that builds the codes inserts and never
+    /// removes, so the buckets their table holds are taken from its capacity.
     pub(crate) fn restore_storage_maps(
         &mut self,
         pq_codes: HashMap<String, Vec<u8>>,
         vector_metadata: MetadataStore,
     ) {
-        *self.dense().pq_codes.write().unwrap() = pq_codes;
+        *self.dense().pq_codes.write().unwrap() = SizedMap::from_unremoved(pq_codes);
         *self.vector_metadata.write().unwrap() = vector_metadata;
         self.rebuild_columns();
     }
@@ -1742,7 +1743,7 @@ impl Collection {
     /// through a guard: it takes owned values from the operations and
     /// nothing else.
     #[cfg(test)]
-    pub(crate) fn pq_codes(&self) -> ReadGuard<'_, HashMap<String, Vec<u8>>> {
+    pub(crate) fn pq_codes(&self) -> ReadGuard<'_, SizedMap<String, Vec<u8>>> {
         self.dense().pq_codes.read().unwrap()
     }
 

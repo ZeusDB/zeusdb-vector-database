@@ -4,8 +4,8 @@
 //! A close-up builds new copies of every per-record structure under read
 //! guards and swaps them in under every write guard. The first test holds the
 //! structures it leaves to the ones the close-up made in place leaves, part
-//! for part and capacity for capacity, from the same states under every
-//! declaration. The rest run beside a close-up on other threads: searches and
+//! for part, with each vector's capacity and each lookup's priced bytes, from
+//! the same states under every declaration. The rest run beside a close-up on other threads: searches and
 //! counts answer for the state before the change they overlap or the state
 //! after it and for nothing else, a search runs while the build is held open
 //! and waits while the swap is, the metadata's move of its blocks included,
@@ -31,8 +31,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use zeusdb_vector_core::{
-    compile_filter, matches_filter, pause_arm, pause_disarm, Filter, IdfScope, PanicPoint, Pause,
-    PauseAt, Selection, SparseVector, METADATA_MOVE_HOOK,
+    compile_filter, matches_filter, pause_arm, pause_disarm, table_buckets, table_bytes_of, Filter,
+    IdfScope, PanicPoint, Pause, PauseAt, Selection, SparseVector, METADATA_MOVE_HOOK,
 };
 use zeusdb_vector_sparse::{SparseConfig, Unlink, Weighting};
 
@@ -214,8 +214,8 @@ fn holes(collection: &Collection) -> usize {
 
 /// Run both close-ups from the collection's state, the one built off to the
 /// side and the one made in place, and hold every structure each leaves to
-/// the other, part for part, value for value and capacity for capacity. The
-/// collection is left closed up.
+/// the other, part for part and value for value, with each vector's capacity
+/// and each lookup's priced bytes. The collection is left closed up.
 ///
 /// One part differs by design. Where the graph keeps its nodes, `node_at`
 /// keeps what it holds, or the records or the reservation the declared size
@@ -366,8 +366,9 @@ fn the_close_up_built_aside_leaves_what_the_close_up_in_place_leaves() {
 
 /// Run the close-up and the routine that copied every part from the
 /// collection's state, and hold every structure each leaves to the other,
-/// part for part, value for value and capacity for capacity, with no part
-/// excepted. The collection is left closed up.
+/// part for part and value for value, with each vector's capacity and each
+/// lookup's priced bytes, and no part excepted. The collection is left
+/// closed up.
 fn both_copies(collection: &Collection, replace: bool, label: &str) {
     let graph = replace.then(|| {
         collection
@@ -1686,9 +1687,13 @@ fn unseeded(collection: &Collection) -> Layouts {
 /// runs on the thread that made the first call, which waits in the drop's
 /// hook. The second close-up's build is held open until a search has
 /// answered inside it, so a search runs while the first drop is held and
-/// over the second close-up. Once both are done,
-/// every structure equals a twin's that ran the same two batches one after
-/// the other with nothing held, part for part and capacity for capacity.
+/// over the second close-up. Once both are done, every structure is priced
+/// at what a twin's is, the twin having run the same two batches one after
+/// the other with nothing held, and holds what the twin's holds, part for
+/// part. A vector is held to the twin's capacity as well, and the column
+/// store's lookup to the bytes its table is priced at, since the capacity a
+/// map reports after a removal follows its seed. The lookup took its ten
+/// values before any release, so it is priced at the table ten values take.
 #[test]
 fn a_second_close_up_runs_while_the_first_ones_drop_is_held() {
     let make = || {
@@ -1873,13 +1878,35 @@ fn a_second_close_up_runs_while_the_first_ones_drop_is_held() {
         for (part, other) in parts.iter().zip(other_parts) {
             assert!(
                 part == other,
-                "{name}'s {} differs from the twin's: capacity {} against {}",
+                "{name}'s {} differs from the twin's: {} against {}, being a vector's \
+                 capacity or a lookup's priced bytes, or the entries differ",
                 part.0,
                 part.1,
                 other.1
             );
         }
     }
+    assert_eq!(
+        collection.structure_prices(),
+        twin.structure_prices(),
+        "each structure is priced at the twin's figure"
+    );
+    let mut ten: HashMap<Value, u32> = HashMap::new();
+    for (code, value) in (0u32..).zip(["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]) {
+        ten.insert(json!(value), code);
+    }
+    let lookup = ours
+        .iter()
+        .filter(|(name, _)| *name == "columns")
+        .flat_map(|(_, parts)| parts)
+        .find(|part| part.0 == "lookup")
+        .expect("the column store holds the lookup of cat");
+    assert_eq!(
+        lookup.1,
+        table_bytes_of::<Value, u32>(table_buckets(ten.capacity())),
+        "the lookup of cat is priced at the table its ten values took, holding {}",
+        lookup.2
+    );
     eprintln!(
         "{} answers beside the two close-ups, {during} while the first drop was held, \
          {over_second} over the second close-up's build or swap",

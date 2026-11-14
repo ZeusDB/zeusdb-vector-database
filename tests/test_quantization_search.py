@@ -1413,6 +1413,48 @@ def test_the_exact_scan_scores_a_coded_record_as_the_traversal_scores_it(space):
     assert compared == 20 * 50
 
 
+@pytest.mark.parametrize("space", ["cosine", "l2"])
+def test_a_record_that_keeps_its_raw_vector_takes_one_score_on_every_path(space):
+    """On an index that keeps raw vectors, a record takes one score for a
+    query whichever path answers, under cosine and under l2. With `rerank=0`
+    a filter that admits every record of an index within the scan threshold
+    takes the exact scan, and the scan scores each record a traversal returns
+    with the bits the traversal gives it. With `rerank=1` the page that filter
+    answers is the page an unquantized index over the same records answers,
+    ids and scores, being the records nearest the query by their raw vectors
+    at their raw distances."""
+    corpus = _pq_corpus(n=3000, dim=32)
+    metadatas = [{"tag": "every"} for _ in range(len(corpus))]
+    index = _pq_index(space, "quantized_with_raw", corpus, metadatas=metadatas)
+    raw = VectorDatabase().create("hnsw", dim=corpus.shape[1], space=space, m=16,
+                                  ef_construction=200, expected_size=len(corpus))
+    raw.add({"ids": [f"r{i}" for i in range(len(corpus))], "vectors": corpus.tolist(),
+             "metadatas": metadatas})
+    queries = np.random.default_rng(226).normal(size=(20, corpus.shape[1])).astype(np.float32) * 3.0
+    compared = 0
+    for q, query in enumerate(queries.tolist()):
+        traversed = index.search(query, top_k=50, ef_search=400, rerank=0)
+        assert len(traversed) == 50, (space, q)
+        scanned = {h["id"]: h["score"] for h in
+                   index.search(query, filter={"tag": "every"}, top_k=len(corpus), rerank=0)}
+        assert len(scanned) == len(corpus), (space, q)
+        for hit in traversed:
+            compared += 1
+            assert scanned[hit["id"]] == hit["score"], (
+                f"{space} query {q}: with rerank=0 the scan scores {hit['id']} as "
+                f"{scanned[hit['id']]!r} and the traversal as {hit['score']!r}"
+            )
+        reranked = [(h["id"], h["score"]) for h in
+                    index.search(query, filter={"tag": "every"}, top_k=10, rerank=1)]
+        exact = [(h["id"], h["score"]) for h in
+                 raw.search(query, filter={"tag": "every"}, top_k=10)]
+        assert reranked == exact, (
+            f"{space} query {q}: with rerank=1 the filtered page is {reranked}, and the "
+            f"unquantized index's is {exact}"
+        )
+    assert compared == 20 * 50
+
+
 def test_a_quantized_cosine_score_is_comparable_with_a_raw_cosine_score():
     """Two indexes over one corpus, one raw and one quantized, one scale.
 

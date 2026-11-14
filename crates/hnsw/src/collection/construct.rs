@@ -18,7 +18,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tracing::{debug, error, info, trace};
-use zeusdb_vector_core::{validate_indexed_fields, ColumnStore, Error, SpaceName, VectorGraph, PQ};
+use zeusdb_vector_core::{
+    validate_indexed_fields, ColumnStore, Error, SizedMap, SpaceName, VectorGraph, PQ,
+};
 use zeusdb_vector_sparse::{PostingsIndex, SparseConfig};
 use zeusdb_vector_text::{TermDictionary, Tokenizer};
 
@@ -884,7 +886,7 @@ impl Collection {
                 ef_construction: AtomicUsize::new(ef_construction),
                 quantization_config,
                 pq,
-                pq_codes: RwLockAt::new(order::space_codes(0), HashMap::new()),
+                pq_codes: RwLockAt::new(order::space_codes(0), SizedMap::new()),
                 int8: OnceLock::new(),
                 rerank_calibration: RwLockAt::new(order::space_calibration(0), None),
                 index: RwLockAt::new(order::space_index(0), index),

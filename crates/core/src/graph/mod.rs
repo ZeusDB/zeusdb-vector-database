@@ -1211,7 +1211,8 @@ impl VectorGraph {
     }
 
     /// The scores a traversal of this graph gives its nodes for `query`, for
-    /// an exact scan over a product quantized graph that keeps no raw vector.
+    /// an exact scan over a product quantized graph, whether or not it keeps
+    /// raw vectors beside its codes.
     ///
     /// `None` on every other graph, which an exact scan scores from the
     /// vectors or the scalar rows it holds. The scores come from the kernel
@@ -1220,21 +1221,17 @@ impl VectorGraph {
     /// [`CodeScores`].
     pub fn code_scores(&self, query: &[f32]) -> Option<Result<CodeScores<'_>, String>> {
         match self {
-            VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b)
-                if b.raw.is_none() =>
-            {
-                Some(
-                    b.graph
-                        .distance()
-                        .install_query_lut(query)
-                        .map(|table| CodeScores {
-                            backend: b,
-                            dummy: vec![0u8; b.graph.distance().subvectors()],
-                            _table: table,
-                            _on_this_thread: std::marker::PhantomData,
-                        }),
-                )
-            }
+            VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => Some(
+                b.graph
+                    .distance()
+                    .install_query_lut(query)
+                    .map(|table| CodeScores {
+                        backend: b,
+                        dummy: vec![0u8; b.graph.distance().subvectors()],
+                        _table: table,
+                        _on_this_thread: std::marker::PhantomData,
+                    }),
+            ),
             _ => None,
         }
     }

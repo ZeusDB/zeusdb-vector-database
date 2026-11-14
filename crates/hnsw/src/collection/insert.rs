@@ -54,7 +54,7 @@ use tracing::{debug, error, info, instrument, trace, warn};
 use zeusdb_vector_core::{
     matches_filter, refuse_unnamable, Bitmap, ColumnParts, ColumnStore, Error, Filter, GraphRoom,
     IdParts, IdStore, InsertParts, MetadataParts, MetadataStore, Operation, OperationKind,
-    Position, Prepared, RecordId, Selection, SparseVector, VectorGraph, VectorIndex,
+    Position, Prepared, RecordId, Selection, SizedMap, SparseVector, VectorGraph, VectorIndex,
     JOURNAL_MAX_PAYLOAD, MAX_INTERNAL_ID,
 };
 use zeusdb_vector_sparse::{refuse_forward, PostingsIndex, PostingsParts};
@@ -104,7 +104,7 @@ struct RemovalGuards<'a> {
     /// Taken as a write guard between the reverse map and the codes, which
     /// is its place in the order, and held for the removal alone.
     index: WriteGuard<'a, DenseIndex>,
-    pq_codes: WriteGuard<'a, HashMap<String, Vec<u8>>>,
+    pq_codes: WriteGuard<'a, SizedMap<String, Vec<u8>>>,
     /// The sparse index, where the collection declares a sparse space.
     sparse: Option<WriteGuard<'a, PostingsIndex>>,
     vector_metadata: WriteGuard<'a, MetadataStore>,
@@ -1085,6 +1085,26 @@ impl Collection {
     #[cfg(test)]
     pub(super) fn structure_layouts(&self) -> Layouts {
         layouts(&self.removal_guards())
+    }
+
+    /// Every structure a close-up moves, each with the bytes `stats` prices
+    /// it at, read under every write guard a removal takes.
+    #[cfg(test)]
+    pub(super) fn structure_prices(&self) -> Vec<(&'static str, usize)> {
+        let guards = self.removal_guards();
+        let mut out = vec![
+            ("ids", guards.ids.heap_bytes()),
+            ("index", guards.index.node_at_heap_bytes()),
+            (
+                "metadata",
+                super::stats::metadata_bytes(&guards.vector_metadata),
+            ),
+            ("columns", guards.columns.heap_bytes()),
+        ];
+        if let Some(sparse) = guards.sparse.as_ref() {
+            out.push(("sparse", sparse.heap_bytes().total()));
+        }
+        out
     }
 
     /// Close the positions up, so the records held sit at the positions below
@@ -3177,12 +3197,13 @@ impl Collection {
     /// replaces scores against codes. Built before any guard is taken, so
     /// every allocation happens outside the write guards, as `compact`
     /// arranges it for its graph. The stores reserve for the declared size,
-    /// under their caps, and the code map and the training list hold the
-    /// capacity the old ones hold, which is what emptying them in place kept.
+    /// under their caps. The code map holds the buckets the old one's table
+    /// holds, and the training list the capacity the old one holds, which is
+    /// what emptying them in place kept.
     fn replacement_for_clear(&self) -> Result<ClearReplacement, Error> {
         let (quantized, index) = self.fresh_index_for_clear()?;
         let names = self.columns.read().unwrap().declared().to_vec();
-        let codes = self.dense().pq_codes.read().unwrap().capacity();
+        let codes = self.dense().pq_codes.read().unwrap().table_capacity();
         let training = self.training_ids.read().unwrap().capacity();
         let sparse = self.sparse().map(|space| {
             (
@@ -3197,7 +3218,7 @@ impl Collection {
             quantized,
             ids: IdStore::new(self.expected_size()),
             index,
-            pq_codes: HashMap::with_capacity(codes),
+            pq_codes: SizedMap::with_capacity(codes),
             sparse,
             vector_metadata: MetadataStore::new(self.expected_size()),
             columns: ColumnStore::new(names, self.expected_size()),
@@ -3382,7 +3403,7 @@ struct ClearReplacement {
     quantized: bool,
     ids: IdStore,
     index: DenseIndex,
-    pq_codes: HashMap<String, Vec<u8>>,
+    pq_codes: SizedMap<String, Vec<u8>>,
     /// The sparse space's postings and, where it has a text layer, its
     /// dictionary.
     sparse: Option<(PostingsIndex, Option<zeusdb_vector_text::TermDictionary>)>,
@@ -3403,7 +3424,7 @@ pub(super) struct Cleared {
 struct ClearedParts {
     _ids: IdStore,
     _index: DenseIndex,
-    _pq_codes: HashMap<String, Vec<u8>>,
+    _pq_codes: SizedMap<String, Vec<u8>>,
     _sparse: Option<(PostingsIndex, Option<zeusdb_vector_text::TermDictionary>)>,
     _vector_metadata: MetadataStore,
     _columns: ColumnStore,

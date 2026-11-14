@@ -205,7 +205,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Product quantizer training seeds all centroids also when the sum of the squared seeding distances is not finite.**
 
-- **On an index that keeps codes alone, the exact scan scores each record with the traversal's own kernel and query table.** A filtered search that takes the scan and an unfiltered search give a record the same score, bit for bit, and two records the same order.
+- **On a product quantized index, the exact scan scores a record as the traversal scores it.** On an index that keeps codes alone, and on one that keeps raw vectors beside them under `rerank=0`, the scan scores each record with the traversal's own kernel and query table. A filtered search that takes the scan and an unfiltered search give a record the same score, bit for bit, and two records the same order. A search that reranks scores each record from its raw vector on every path.
+
+- **On a `cosine` index that keeps raw vectors, the rerank calibration ranks the codes of its sample with the traversal's own kernel and query table**, so it measures the depth at which the search reaches the true neighbours. The calibration of an `l2` index does not change. A loaded index keeps the calibration it saved.
+
+- **`get_stats()` prices the value lookup of each dictionary column and the product quantized codes at the hash table each one holds, with the slots that removals leave in it.** `index_bookkeeping_memory_mb` and `total_memory_mb` now follow the tables the index holds. A lookup is priced at its table's buckets, as every other table is, and `clear()` gives the new table of codes the size the old table held.
 
 ### Internal
 
@@ -226,6 +230,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CI runs the Python suite on CPython 3.15.1 in `test-python` and on CPython 3.10.22 in `test-python-floor`. The release workflow installs and imports each wheel on CPython 3.10 and 3.15.
 
 - `test-rust` links the Rust tests against the libpython of CPython 3.15.1, which uv installs.
+
+- CI runs the Rust tests and the Python suite on arm64, in `test-rust-arm64` and `test-python-arm64` on `ubuntu-24.04-arm` and in `test-rust-macos` and `test-python-macos` on `macos-15`. Each job runs the steps of `test-rust` or `test-python` with the uv archive and the CPython 3.15.1 build of its runner.
 
 - A change to the documentation files that `.github/scripts/documentation_only.py` lists passes every CI job and skips the build and test steps. The Rust build cache is keyed by the runner image as well.
 

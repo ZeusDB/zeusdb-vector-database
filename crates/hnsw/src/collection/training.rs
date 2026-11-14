@@ -13,7 +13,7 @@
 
 use super::insert::MutationGuard;
 use super::{Collection, QuantizationConfig, StorageMode, MAX_LAYER};
-use crate::{calibrate_rerank_from_sample, raw_distance_fn, RerankCalibration};
+use crate::{calibrate_rerank_from_sample, RerankCalibration};
 use chrono::Utc;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
@@ -577,18 +577,18 @@ impl Collection {
             return Ok(None);
         }
 
-        let fitted = PQ::new(
+        let fitted = Arc::new(PQ::new(
             pq.dim(),
             pq.subvectors(),
             pq.bits(),
             pq.training_size,
             pq.max_training_vectors,
-        );
+        ));
         fitted.install(centroids.to_vec())?;
         Ok(calibrate_rerank_from_sample(
             &fitted,
+            &self.dense().metric,
             sample,
-            raw_distance_fn(&self.dense().metric),
         ))
     }
 
@@ -943,9 +943,10 @@ impl Collection {
 #[cfg(test)]
 mod tests {
     use super::TRAINING_SAMPLE_SEED;
-    use crate::{calibrate_rerank_from_sample, raw_distance_fn};
+    use crate::calibrate_rerank_from_sample;
     use rand::seq::SliceRandom;
     use rand::SeedableRng;
+    use std::sync::Arc;
     use zeusdb_vector_core::{test_support::clustered, SeededRng, PQ};
 
     /// The shuffle the training sample is drawn in is fixed by its seed, so two
@@ -988,12 +989,141 @@ mod tests {
         // And the calibration over the shuffled sample is reproducible, given
         // the codebook. One codebook is fitted here and both calibrations read
         // it, so what this holds is the calibration alone.
-        let pq = PQ::new(32, 8, 6, 500, None);
+        let pq = Arc::new(PQ::new(32, 8, 6, 500, None));
         pq.train(&after).unwrap();
-        let first = calibrate_rerank_from_sample(&pq, &after, raw_distance_fn("cosine")).unwrap();
-        let second = calibrate_rerank_from_sample(&pq, &after, raw_distance_fn("cosine")).unwrap();
+        let first = calibrate_rerank_from_sample(&pq, "cosine", &after).unwrap();
+        let second = calibrate_rerank_from_sample(&pq, "cosine", &after).unwrap();
         assert_eq!(first.fetch, second.fetch);
         assert_eq!(first.fit_fetches, second.fit_fetches);
         assert_eq!(first.exponent, second.exponent);
+    }
+
+    /// The rerank calibration measures each true neighbour's depth in the
+    /// order a search of its index reads the candidates in. On a trained
+    /// `quantized_with_raw` collection, under cosine and under l2, the fetch
+    /// it measured at each page over the whole training sample is the fetch
+    /// the pooled ranks give where every record of the sample is ranked by
+    /// the score a traversal gives it, on a graph made for the collection's
+    /// space over the codes of the collection's codebook.
+    #[test]
+    fn the_calibration_measures_depth_in_the_order_its_index_traverses() {
+        use crate::collection::{Collection, Declaration, ParsedRecord, StorageMode};
+        use crate::raw_distance_fn;
+        use crate::rerank::{
+            RERANK_CALIBRATION_PAGES, RERANK_CALIBRATION_QUERIES, RERANK_CALIBRATION_TARGET,
+        };
+        use std::collections::HashMap;
+        use zeusdb_vector_core::{Position, VectorGraph, NB_LAYER_MAX};
+
+        const RECORDS: usize = 1_000;
+        const DIM: usize = 32;
+        for metric in ["cosine", "l2"] {
+            let declared = Declaration::validate(DIM, metric, 16, 200, RECORDS, vec![]).unwrap();
+            let quantization = declared
+                .quantization(8, 6, RECORDS, None, StorageMode::QuantizedWithRaw)
+                .unwrap();
+            let collection = Collection::build(declared, Some(quantization));
+            // Each vector as the binding hands it over, processed for the
+            // space, which is what the index stores and trains on.
+            let stored: Vec<Vec<f32>> = clustered(RECORDS, DIM, 0x0226)
+                .into_iter()
+                .map(|vector| collection.process_vector_for_space(vector))
+                .collect();
+            let records: Vec<ParsedRecord> = stored
+                .iter()
+                .enumerate()
+                .map(|(i, vector)| ParsedRecord {
+                    id: format!("r{i:04}"),
+                    vector: vector.clone(),
+                    sparse: None,
+                    metadata: HashMap::new(),
+                })
+                .collect();
+            let added = collection.add_records(records, vec![], false);
+            assert_eq!(added.total_errors, 0, "{metric}: {:?}", added.errors);
+            assert!(collection.is_quantized(), "{metric}");
+            let calibration = collection.rerank_calibration().expect("calibrated");
+
+            // The training sample, being every record's stored vector in the
+            // order the records arrived, shuffled under the training's seed,
+            // and a graph over its codes in that order, so node `k` holds
+            // the sample's record `k`.
+            let mut order: Vec<usize> = (0..RECORDS).collect();
+            order.shuffle(&mut SeededRng::seed_from_u64(TRAINING_SAMPLE_SEED));
+            let sample: Vec<&[f32]> = order.iter().map(|&i| stored[i].as_slice()).collect();
+            let pq = collection
+                .pq()
+                .expect("a product quantized collection")
+                .clone();
+            let codes = pq.quantize_batch(&sample).unwrap();
+            let batch: Vec<(&Vec<u8>, usize, Position)> = codes
+                .iter()
+                .enumerate()
+                .map(|(k, code)| (code, k + 1, Position::from_slot(k)))
+                .collect();
+            let mut graph =
+                VectorGraph::new_pq(metric, 16, RECORDS, NB_LAYER_MAX as usize, 200, pq);
+            graph.insert_batch_pq(&batch).unwrap();
+            assert!((0..RECORDS).all(|k| graph.codes_at(k as u32) == Some(codes[k].as_slice())));
+
+            // Each query's exact neighbours by the space's raw distance,
+            // ordered by distance and then by their place in the sample, and
+            // each one's rank among the other records of the sample by the
+            // traversal's score.
+            let distance = raw_distance_fn(metric);
+            let deepest = *RERANK_CALIBRATION_PAGES.last().unwrap();
+            let stride = (RECORDS / RERANK_CALIBRATION_QUERIES).max(1);
+            let per_query: Vec<Vec<usize>> = (0..RECORDS)
+                .step_by(stride)
+                .take(RERANK_CALIBRATION_QUERIES)
+                .map(|q| {
+                    let mut exact: Vec<(f32, usize)> = (0..RECORDS)
+                        .filter(|&i| i != q)
+                        .map(|i| (distance(sample[q], sample[i]), i))
+                        .collect();
+                    exact.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+                    exact.truncate(deepest);
+                    let traversed: Vec<f32> = {
+                        let scores = graph.code_scores(sample[q]).unwrap().unwrap();
+                        (0..RECORDS)
+                            .map(|i| {
+                                if i == q {
+                                    f32::INFINITY
+                                } else {
+                                    scores.at(i as u32).unwrap()
+                                }
+                            })
+                            .collect()
+                    };
+                    let mut ordered = traversed.clone();
+                    ordered.sort_by(|a, b| a.total_cmp(b));
+                    exact
+                        .iter()
+                        .map(|&(_, i)| 1 + ordered.partition_point(|&d| d < traversed[i]))
+                        .collect()
+                })
+                .collect();
+            let expected: Vec<usize> = RERANK_CALIBRATION_PAGES
+                .iter()
+                .map(|&page| {
+                    let mut pool: Vec<usize> = per_query
+                        .iter()
+                        .flat_map(|ranks| ranks.iter().take(page).copied())
+                        .collect();
+                    pool.sort_unstable();
+                    let at = ((RERANK_CALIBRATION_TARGET * pool.len() as f64).ceil() as usize)
+                        .clamp(1, pool.len());
+                    pool[at - 1]
+                })
+                .collect();
+            assert_eq!(
+                calibration.page_fetches.to_vec(),
+                expected,
+                "{metric}: the calibration measured the fetches at pages \
+                 {RERANK_CALIBRATION_PAGES:?} as {:?}, and the ranks in the order the index \
+                 traverses give {expected:?}",
+                calibration.page_fetches
+            );
+        }
     }
 }

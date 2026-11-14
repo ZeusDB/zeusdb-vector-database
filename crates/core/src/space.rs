@@ -445,6 +445,13 @@ pub struct Budget {
     /// rerank against and ignored otherwise.
     pub rerank: Option<usize>,
     pub boundary_ties: bool,
+    /// Whether the caller rescores every record of the page against its raw
+    /// vector. An exact scan over a graph that holds codes and keeps a raw
+    /// vector beside each scores the raw vector where this is set, which is
+    /// the score the rescore gives, and the codes through the graph's own
+    /// kernel where it is not, which is the score a traversal gives. Read by
+    /// a dense index and ignored by every other.
+    pub rescored: bool,
     /// Which corpus a term-weighted search takes its document frequencies
     /// from. Read by an index whose scoring rule weights terms by their
     /// rarity and ignored by every other.

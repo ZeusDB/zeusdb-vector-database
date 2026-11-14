@@ -555,7 +555,10 @@ fn brute_dense(collection: &Collection, model: &Model, query: &[f32], filter: &F
         .filter(|(_, held)| admits(held, Some(filter)))
         .map(|(name, held)| {
             let node = nodes[&held.internal];
-            (name.clone(), index.exact_distance_of_node(query, node))
+            (
+                name.clone(),
+                index.exact_distance_of_node(query, node, true),
+            )
         })
         .collect();
     scored.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));

@@ -69,6 +69,7 @@ mod pq;
 mod rng;
 mod space;
 mod storage;
+mod table;
 // Test data two test modules measure against, so it is defined once.
 #[cfg(any(test, feature = "test-support"))]
 mod test_vectors;
@@ -78,8 +79,8 @@ pub use bitmap::Bitmap;
 pub use checksum::checksum_of;
 pub use columns::{validate_indexed_fields, ColumnParts, ColumnStore, Selection};
 pub use distance::{
-    norm_f64, past_bound_words, raw_distance, screen, CosineDist, DistPQ, DotDist, Int8Dist,
-    Int8Metric, L1Dist, L2Dist, PqMetric, Screen, NORM_BOUND,
+    norm_f64, past_bound_words, raw_distance, screen, CodeKernel, CosineDist, DistPQ, DotDist,
+    Int8Dist, Int8Metric, L1Dist, L2Dist, PqMetric, Screen, NORM_BOUND,
 };
 pub use error::{Error, Exception};
 pub use filter::{compile_filter, matches_filter, FieldLookup, Filter};
@@ -165,6 +166,7 @@ pub use storage::{
     LockFailure, LockGuard, LockMode, Locked, Staged, Storage, JOURNAL_SUFFIX,
     LEGACY_JOURNAL_SUFFIX, LOCK_SUFFIX, SEGMENT_SUFFIX,
 };
+pub use table::{bucket_capacity, table_buckets, table_bytes_of, SizedMap, HASH_CONTROL_TAIL};
 
 /// What a test in another crate measures against.
 ///

@@ -17,44 +17,44 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tracing::{debug, info};
-use zeusdb_vector_core::{Error, VectorIndex};
+use zeusdb_vector_core::{
+    table_buckets, table_bytes_of, Error, MetadataStore, SizedMap, VectorIndex,
+};
 
 /// The target every record this file emits carries. See the parent module.
 const LOG_TARGET: &str = "zeusdb_vector_database::hnsw_index::stats";
 
-/// Control bytes a hashbrown table allocates past its last bucket.
-///
-/// The table is `buckets` entries followed by `buckets + Group::WIDTH` control
-/// bytes, and the group is sixteen on every x86 target and on aarch64.
-const HASH_CONTROL_TAIL: usize = 16;
-
-/// Buckets a `HashMap` holds, from the capacity it reports.
-///
-/// hashbrown sizes a table as the smallest power of two at or above `cap * 8 / 7`
-/// and then reports seven eighths of that back as the capacity, so undoing the
-/// division and rounding up to the power of two recovers the count. Below eight
-/// buckets it reports one less than the count instead, which is what the floor
-/// covers: an allocated table never holds fewer than four buckets.
-fn table_buckets(capacity: usize) -> usize {
-    if capacity == 0 {
-        return 0;
-    }
-    (capacity.saturating_mul(8) / 7).next_power_of_two().max(4)
+/// A table this file prices at the buckets it holds. See
+/// `zeusdb_vector_core::table`.
+trait PricedTable {
+    fn priced_bytes(&self) -> usize;
 }
 
-/// Bytes a `HashMap`'s own table asks the allocator for.
+/// A map no removal reaches, so its capacity counts every slot of its table
+/// and the buckets derived from it are the table's own.
+impl<K, V, S> PricedTable for HashMap<K, V, S> {
+    fn priced_bytes(&self) -> usize {
+        table_bytes_of::<K, V>(table_buckets(self.capacity()))
+    }
+}
+
+/// A map that sees removals, priced at the buckets kept beside it, which
+/// count the slots its removals leave.
+impl<K, V> PricedTable for SizedMap<K, V> {
+    fn priced_bytes(&self) -> usize {
+        self.table_bytes()
+    }
+}
+
+/// Bytes a table asks the allocator for.
 ///
 /// The bucket array and the control bytes. What a key or a value owns on the
 /// heap is not counted here, because only the caller knows what that is: the
 /// `Vec` in `vectors` is a 24 byte header inside the bucket and 6,144 bytes
 /// outside it at dimension 1,536, and that outside part is already reported as
 /// `raw_vectors_memory_mb`.
-fn table_bytes<K, V, S>(map: &HashMap<K, V, S>) -> usize {
-    let buckets = table_buckets(map.capacity());
-    if buckets == 0 {
-        return 0;
-    }
-    buckets * std::mem::size_of::<(K, V)>() + buckets + HASH_CONTROL_TAIL
+fn table_bytes<T: PricedTable + ?Sized>(table: &T) -> usize {
+    table.priced_bytes()
 }
 
 /// Bytes the record ids in a map's keys hold on the heap.
@@ -65,6 +65,13 @@ fn table_bytes<K, V, S>(map: &HashMap<K, V, S>) -> usize {
 /// megabytes and not one pointer chase per record.
 fn key_text_bytes<V, S>(map: &HashMap<String, V, S>) -> usize {
     map.keys().map(|id| id.len()).sum()
+}
+
+/// Bytes the metadata store is priced at: its own storage, and its field
+/// names in the table that finds a name's symbol, with their text.
+pub(super) fn metadata_bytes(store: &MetadataStore) -> usize {
+    let names = store.key_table();
+    store.heap_bytes() + table_bytes(names) + key_text_bytes(names)
 }
 
 impl Collection {
@@ -186,7 +193,7 @@ impl Collection {
         // this key prices its structure the way every other memory key does.
         let (pq_code_count, pq_code_bytes) = {
             let pq_codes = self.dense().pq_codes.read().unwrap();
-            bookkeeping += table_bytes(&pq_codes) + key_text_bytes(&pq_codes);
+            bookkeeping += table_bytes(&*pq_codes) + key_text_bytes(&pq_codes);
             (
                 pq_codes.len(),
                 pq_codes.values().map(|code| code.capacity()).sum::<usize>(),
@@ -202,9 +209,7 @@ impl Collection {
         // read with it.
         let metadata_reserved = {
             let vector_metadata = self.vector_metadata.read().unwrap();
-            let names = vector_metadata.key_table();
-            bookkeeping +=
-                vector_metadata.heap_bytes() + table_bytes(names) + key_text_bytes(names);
+            bookkeeping += metadata_bytes(&vector_metadata);
             vector_metadata.reserved_bytes()
         };
 
@@ -232,7 +237,7 @@ impl Collection {
 
         bookkeeping += {
             let metadata = self.metadata.lock().unwrap();
-            table_bytes(&metadata)
+            table_bytes(&*metadata)
                 + key_text_bytes(&metadata)
                 + metadata.values().map(|value| value.len()).sum::<usize>()
         };
@@ -1315,4 +1320,62 @@ pub struct QuantizerReport {
     pub sdc_memory_mb: Option<f64>,
     pub centroid_norm_memory_mb: Option<f64>,
     pub compression_ratio: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::collection::{Declaration, ParsedRecord};
+
+    /// The code map is priced at the table it holds after removals as before
+    /// them, whatever its seed. 1,792 codes fill a table of 2,048 buckets,
+    /// and removing all but twelve leaves that table. A price taken from the
+    /// capacity the map reports after the removals counts only the slots they
+    /// freed for reuse, and is a smaller table.
+    #[test]
+    fn a_removal_leaves_the_codes_table_priced_at_the_buckets_it_holds() {
+        let vectors = zeusdb_vector_core::test_support::clustered(1_792, 16, 0x0022_6d01);
+        // 2,048 buckets of an id and its code, a control byte a bucket, and
+        // the sixteen control bytes past the last bucket.
+        let table = 2_048 * (std::mem::size_of::<(String, Vec<u8>)>() + 1) + 16;
+        let removed: Vec<String> = (0..1_780).map(|i| format!("r{i}")).collect();
+        for round in 0..2 {
+            let declaration = Declaration::validate(16, "l2", 8, 40, 1_792, vec![]).unwrap();
+            let quantization = declaration
+                .quantization(4, 4, 1_000, None, StorageMode::QuantizedOnly)
+                .unwrap();
+            let collection = Collection::build(declaration, Some(quantization));
+            let records: Vec<ParsedRecord> = vectors
+                .iter()
+                .enumerate()
+                .map(|(i, vector)| ParsedRecord {
+                    id: format!("r{i}"),
+                    vector: vector.clone(),
+                    sparse: None,
+                    metadata: HashMap::new(),
+                })
+                .collect();
+            let added = collection.add_records(records, vec![], false);
+            assert_eq!(added.total_errors, 0, "round {round}: {:?}", added.errors);
+            assert!(collection.is_quantized(), "round {round}");
+            let before = {
+                let codes = collection.dense().pq_codes.read().unwrap();
+                assert_eq!(codes.len(), 1_792, "round {round}");
+                table_bytes(&*codes)
+            };
+            assert_eq!(before, table, "round {round}");
+            assert!(
+                collection.remove_points(&removed).unwrap().is_empty(),
+                "round {round}"
+            );
+            let codes = collection.dense().pq_codes.read().unwrap();
+            assert_eq!(codes.len(), 12, "round {round}");
+            let after = table_bytes(&*codes);
+            assert_eq!(
+                after, table,
+                "round {round}: the code map was priced at {before} bytes before the removals \
+                 and {after} after"
+            );
+        }
+    }
 }

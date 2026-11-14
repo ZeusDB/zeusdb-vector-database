@@ -172,6 +172,19 @@ pub enum PqMetric {
     Cosine,
 }
 
+impl PqMetric {
+    /// The metric a product quantized graph over `space` orders and scores
+    /// by, which is the choice `VectorGraph::new_pq` makes with the variant:
+    /// squared L2 for `l2` and `l1`, and cosine for `cosine` and for a name
+    /// it does not recognise.
+    pub fn of_space(space: &str) -> PqMetric {
+        match space {
+            "l2" | "l1" => PqMetric::SquaredL2,
+            _ => PqMetric::Cosine,
+        }
+    }
+}
+
 /// A query's tables, in the shape the metric being served needs
 ///
 /// The variant is chosen by `DistPQ::install_query_lut` from the `DistPQ` doing
@@ -396,6 +409,48 @@ impl Distance<u8> for DistPQ {
                 }
             }
         })
+    }
+}
+
+/// One query's table over a codebook, held on the calling thread, with the
+/// score a product quantized graph over that codebook gives a code for the
+/// query.
+///
+/// The table is the one [`DistPQ::install_query_lut`] installs for a
+/// traversal and [`CodeKernel::score`] is [`DistPQ::eval`] over it, so a
+/// code scores the bits a traversal gives the node that holds it. The table
+/// leaves the thread when this value is dropped, and the value stays on the
+/// thread that made it, since the table is that thread's.
+pub struct CodeKernel {
+    distance: DistPQ,
+    /// The code slice the kernel takes in the query's place, as a traversal
+    /// hands it one.
+    dummy: Vec<u8>,
+    _table: QueryLut,
+    _on_this_thread: std::marker::PhantomData<*const ()>,
+}
+
+impl CodeKernel {
+    /// The kernel of a graph over `pq` under `metric`, with the table for
+    /// `query` installed on the calling thread. Refused where the codebook
+    /// is not trained or the query is not its width.
+    pub fn new(pq: Arc<PQ>, metric: PqMetric, query: &[f32]) -> Result<Self, String> {
+        let distance = DistPQ::new(pq, metric);
+        let table = distance.install_query_lut(query)?;
+        let dummy = vec![0u8; distance.subvectors()];
+        Ok(CodeKernel {
+            distance,
+            dummy,
+            _table: table,
+            _on_this_thread: std::marker::PhantomData,
+        })
+    }
+
+    /// The score a traversal gives a node holding `codes`, on the scale the
+    /// kernel returns.
+    #[inline]
+    pub fn score(&self, codes: &[u8]) -> f32 {
+        self.distance.eval(&self.dummy, codes)
     }
 }
 
@@ -3213,6 +3268,61 @@ mod tests {
         // And a code is at distance zero from itself, which the strict upper
         // triangle answers without reading anything.
         assert_eq!(dist.eval(&[1, 1], &[1, 1]), 0.0);
+    }
+
+    /// A code scores, through [`CodeKernel`] under [`PqMetric::of_space`], the
+    /// bits a traversal of a graph over the same codebook gives the node that
+    /// holds it, on a graph made by `VectorGraph::new_pq` for each space it
+    /// takes and for a name it does not recognise, so the kernel's metric is
+    /// the one each such graph scores by.
+    #[test]
+    fn a_code_kernel_scores_a_code_as_a_traversal_scores_the_node_holding_it() {
+        let (count, dim) = (300usize, 16usize);
+        let unit = |v: &[f32]| -> Vec<f32> {
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            v.iter().map(|x| x / norm).collect()
+        };
+        let vectors: Vec<Vec<f32>> = crate::test_support::clustered(count + 8, dim, 0x0226)
+            .iter()
+            .map(|v| unit(v))
+            .collect();
+        let (records, queries) = vectors.split_at(count);
+        let pq = Arc::new(PQ::new(dim, 4, 4, 128, None));
+        pq.train(records).unwrap();
+        let refs: Vec<&[f32]> = records.iter().map(Vec::as_slice).collect();
+        let codes = pq.quantize_batch(&refs).unwrap();
+        let batch: Vec<(&Vec<u8>, usize, crate::Position)> = codes
+            .iter()
+            .enumerate()
+            .map(|(k, code)| (code, k + 1, crate::Position::from_slot(k)))
+            .collect();
+        let layers = crate::NB_LAYER_MAX as usize;
+        for space in ["cosine", "l2", "l1", "angular"] {
+            let mut graph = crate::VectorGraph::new_pq(space, 8, count, layers, 50, pq.clone());
+            graph.insert_batch_pq(&batch).unwrap();
+            for (q, query) in queries.iter().enumerate() {
+                // Each code through the kernel, with its table dropped before
+                // the graph installs its own on this thread.
+                let kernel: Vec<u32> = {
+                    let kernel =
+                        CodeKernel::new(pq.clone(), PqMetric::of_space(space), query).unwrap();
+                    (0..count as u32)
+                        .map(|node| kernel.score(graph.codes_at(node).unwrap()).to_bits())
+                        .collect()
+                };
+                let scores = graph.code_scores(query).unwrap().unwrap();
+                for (node, &bits) in kernel.iter().enumerate() {
+                    let traversed = scores.at(node as u32).unwrap();
+                    assert_eq!(
+                        bits,
+                        traversed.to_bits(),
+                        "{space} query {q} node {node}: the kernel scores {:e} and the \
+                         traversal {traversed:e}",
+                        f32::from_bits(bits)
+                    );
+                }
+            }
+        }
     }
 
     /// A reconstruction of no length is at distance one from everything

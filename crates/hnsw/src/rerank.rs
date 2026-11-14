@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
-use zeusdb_vector_core::PQ;
+use zeusdb_vector_core::{CodeKernel, PqMetric, PQ};
 /// The three terms of the default rerank fetch.
 ///
 /// A rerank fetch has to be deep enough to contain the true neighbours in the
@@ -916,6 +916,12 @@ pub fn raw_distance_fn(space: &str) -> fn(&[f32], &[f32]) -> f32 {
 /// scored, so the measurements `calibrate_rerank_from_sample` takes share one
 /// quantization pass.
 ///
+/// The ADC ordering is the order a graph over these codes under `metric`
+/// traverses: each code is scored by [`CodeKernel`], which is the kernel the
+/// traversal evaluates over the table it installs for the query. So the depth
+/// a true neighbour is measured at is its depth in the order the search reads
+/// the candidates in, under cosine as under l2.
+///
 /// Every page is answered from one pass. The exact neighbours are found once to
 /// the deepest page asked for and their ranks are kept in true neighbour order,
 /// so the pool for a shallower page is a prefix of the pool for a deeper one.
@@ -928,7 +934,8 @@ pub fn raw_distance_fn(space: &str) -> fn(&[f32], &[f32]) -> f32 {
 /// page, being fewer records than twice that page. A page the sample is too
 /// small for returns zero in its slot.
 pub(crate) fn measure_rerank_fetches(
-    pq: &PQ,
+    pq: &Arc<PQ>,
+    metric: PqMetric,
     sample: &[Vec<f32>],
     codes: &[Vec<u8>],
     distance: fn(&[f32], &[f32]) -> f32,
@@ -954,8 +961,6 @@ pub(crate) fn measure_rerank_fetches(
     if query_ids.is_empty() {
         return None;
     }
-
-    let subvectors = pq.subvectors();
 
     // One rank list per query, in true neighbour order, so that the pool for a
     // page is a prefix of each of them.
@@ -989,9 +994,10 @@ pub(crate) fn measure_rerank_fetches(
             }
 
             // The ADC ordering the search would traverse, over the same records
-            // and with the query excluded from it as well.
-            let lut = match pq.compute_adc_lut(query) {
-                Ok(lut) => lut,
+            // and with the query excluded from it as well. The kernel holds the
+            // query's table on this worker's thread until the scores are taken.
+            let kernel = match CodeKernel::new(pq.clone(), metric, query) {
+                Ok(kernel) => kernel,
                 Err(_) => return Vec::new(),
             };
             let adc: Vec<f32> = codes
@@ -1002,13 +1008,10 @@ pub(crate) fn measure_rerank_fetches(
                     if i == qi {
                         return f32::INFINITY;
                     }
-                    let mut sum = 0.0f32;
-                    for s in 0..subvectors {
-                        sum += lut[s][code[s] as usize];
-                    }
-                    sum
+                    kernel.score(code)
                 })
                 .collect();
+            drop(kernel);
 
             // Ranks come off a sorted copy rather than a scan per neighbour.
             // The scan is one pass over the sample for every true neighbour,
@@ -1070,10 +1073,15 @@ pub(crate) fn measure_rerank_fetches(
 /// them is what fixes the record exponent. That last measurement also answers
 /// every page in `RERANK_CALIBRATION_PAGES` from the same pass, which is what
 /// fixes the page exponent; see `RerankCalibration`.
+///
+/// `space` decides both orders the measurement compares: its raw distance,
+/// [`raw_distance_fn`], finds the true neighbours, and the kernel a graph over
+/// `pq`'s codes for that space evaluates, [`PqMetric::of_space`], orders the
+/// candidates, as the search over that graph orders them.
 pub fn calibrate_rerank_from_sample(
-    pq: &PQ,
+    pq: &Arc<PQ>,
+    space: &str,
     sample: &[Vec<f32>],
-    distance: fn(&[f32], &[f32]) -> f32,
 ) -> Option<RerankCalibration> {
     let total = sample.len();
     if total < RERANK_CALIBRATION_TOP_K * 4 + 2 {
@@ -1081,6 +1089,8 @@ pub fn calibrate_rerank_from_sample(
     }
 
     let started = Instant::now();
+    let distance = raw_distance_fn(space);
+    let metric = PqMetric::of_space(space);
 
     let refs: Vec<&[f32]> = sample.iter().map(|v| v.as_slice()).collect();
     let codes = pq.quantize_batch(&refs).ok()?;
@@ -1111,7 +1121,8 @@ pub fn calibrate_rerank_from_sample(
         } else {
             &reference
         };
-        let Some(measured) = measure_rerank_fetches(pq, sample, &codes, distance, records, pages)
+        let Some(measured) =
+            measure_rerank_fetches(pq, metric, sample, &codes, distance, records, pages)
         else {
             continue;
         };
@@ -1818,11 +1829,11 @@ mod tests {
     #[test]
     fn a_sample_whose_depth_does_not_grow_takes_the_maximum_exponent() {
         let sample = clustered(1_000, 32, 31337);
-        let pq = PQ::new(32, 8, 6, 1_000, None);
+        let pq = Arc::new(PQ::new(32, 8, 6, 1_000, None));
         pq.train(&sample).unwrap();
 
-        let calibration = calibrate_rerank_from_sample(&pq, &sample, raw_distance_fn("cosine"))
-            .expect("1,000 records calibrate");
+        let calibration =
+            calibrate_rerank_from_sample(&pq, "cosine", &sample).expect("1,000 records calibrate");
 
         // Fifty clusters of twenty records, and the true ten of a query are its
         // own cluster whatever fraction of the sample is present, so the depth
@@ -1924,10 +1935,10 @@ mod tests {
     #[test]
     fn the_calibration_measures_a_fetch_and_an_exponent() {
         let sample = clustered(400, 64, 4242);
-        let pq = PQ::new(64, 8, 6, 400, None);
+        let pq = Arc::new(PQ::new(64, 8, 6, 400, None));
         pq.train(&sample).unwrap();
 
-        let calibration = calibrate_rerank_from_sample(&pq, &sample, raw_distance_fn("cosine"))
+        let calibration = calibrate_rerank_from_sample(&pq, "cosine", &sample)
             .expect("a sample of 400 records calibrates");
 
         assert_eq!(calibration.sample_records, 400);
@@ -1972,9 +1983,7 @@ mod tests {
         );
 
         // A sample with no room for two measurements is not calibrated.
-        assert!(
-            calibrate_rerank_from_sample(&pq, &sample[..8], raw_distance_fn("cosine")).is_none()
-        );
+        assert!(calibrate_rerank_from_sample(&pq, "cosine", &sample[..8]).is_none());
     }
 
     /// The page comes back ascending and cut to size, and a non-finite score

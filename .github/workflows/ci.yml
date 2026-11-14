@@ -1,7 +1,10 @@
 # Lints and tests every push and pull request on main and development.
 #
-# Linux only and cached, so the gate stays fast. The cross-platform build is
-# covered by the wheel matrix in publish-pypi.yml.
+# Cached, so the gate stays fast. The lint and the floor interpreter run on
+# x86-64 Linux, and the Rust suite and the Python suite run on x86-64 Linux,
+# on arm64 Linux and on arm64 macOS, so the engine's tests run on each
+# processor a wheel ships for. The cross-platform build is covered by the
+# wheel matrix in publish-pypi.yml.
 #
 # NEITHER TRIGGER HAS A PATH FILTER, AND ONE MUST NOT BE ADDED.
 #
@@ -35,18 +38,20 @@
 # date instead of silently updating it. Keep the flag on every cargo step
 # that accepts it.
 #
-# The Python suite runs twice, on the newest CPython release in test-python and
-# on the oldest version the package supports in test-python-floor, each an
-# exact build that uv installs and checks against the SHA-256 in its own list.
-# uv itself is pinned by version and by the SHA-256 of its archive. Both jobs
-# build the extension with the maturin uv.lock names, and lint checks that
+# The Python suite runs on the newest CPython release in test-python, and in
+# test-python-arm64 and test-python-macos on arm64, and on the oldest version
+# the package supports in test-python-floor, each an exact build that uv
+# installs and checks against the SHA-256 in its own list. uv itself is pinned
+# by version and by the SHA-256 of its archive for each runner. Every Python
+# job builds the extension with the maturin uv.lock names, and lint checks that
 # .github/requirements/maturin.txt names the same one for the release. Each
 # job runs the suite on the release build without tests/test_interpreter.py
 # and tests/test_overlap.py, then builds again with the binding's
 # test-support feature and runs those two modules alone, since their checks
 # arm pauses the wheel does not carry.
-# test-rust links its test executables against the libpython of the newest
-# build, which uv installs the same way.
+# test-rust, test-rust-arm64 and test-rust-macos link their test executables
+# against the libpython of the newest build for their runner, which uv
+# installs the same way.
 #
 # The jobs declare no needs, so they start together. Nothing one of them
 # produces is read by another. Each Python suite runs on the extension its job
@@ -54,10 +59,11 @@
 # `extension-module` off, which is a different feature set from the one the
 # other jobs build.
 #
-# Every job names its runner image, ubuntu-24.04, rather than a label such as
-# ubuntu-latest that GitHub moves to a newer image on its own schedule. A
-# change of image is a change to this file. lint uses the image's own python3
-# for two checks, so the label fixes that version too.
+# Every job names its runner image, ubuntu-24.04, ubuntu-24.04-arm or
+# macos-15, rather than a label such as ubuntu-latest that GitHub moves to a
+# newer image on its own schedule. A change of image is a change to this file.
+# lint uses the image's own python3 for two checks, so the label fixes that
+# version too.
 name: CI
 
 on:
@@ -74,15 +80,20 @@ permissions:
   contents: read
 
 env:
-  # uv for both Python jobs, and the SHA-256 GitHub publishes for
-  # uv-x86_64-unknown-linux-gnu.tar.gz at that version.
+  # uv for every job that installs it, and the SHA-256 GitHub publishes at
+  # that version for uv-x86_64-unknown-linux-gnu.tar.gz,
+  # uv-aarch64-unknown-linux-gnu.tar.gz and uv-aarch64-apple-darwin.tar.gz.
   PINNED_UV_VERSION: "0.13.5"
   PINNED_UV_SHA256_LINUX: f68d291c75783122dad58ab77def0e13f3233f358731db5d6d7e8715603b928f
+  PINNED_UV_SHA256_LINUX_ARM64: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403
+  PINNED_UV_SHA256_MACOS: 743f85035a1996ecb350659e01cd9faea9709829be09b1b4b03c73eaf3c9cd73
   # The CPython builds uv installs, as uv names them. The floor is the oldest
   # version the package supports, which is the floor requires-python declares
   # and the abi3 target, and the newest is the newest CPython release.
   FLOOR_CPYTHON_LINUX: cpython-3.10.22-linux-x86_64-gnu
   NEWEST_CPYTHON_LINUX: cpython-3.15.1-linux-x86_64-gnu
+  NEWEST_CPYTHON_LINUX_ARM64: cpython-3.15.1-linux-aarch64-gnu
+  NEWEST_CPYTHON_MACOS: cpython-3.15.1-macos-aarch64-none
   # uv takes no interpreter from the runner image.
   UV_PYTHON_PREFERENCE: only-managed
 
@@ -430,3 +441,259 @@ jobs:
         # feature, which is on for every other cargo command and for the wheel.
         # See the comment on it in bindings/python/Cargo.toml.
         run: cargo test --workspace --locked --no-default-features --no-fail-fast
+
+  # test-rust on arm64 Linux, so every engine test, the bit test of the
+  # distance kernels among them, runs on the kernel path an arm64 wheel takes.
+  # Each step is test-rust's with this runner's uv and CPython.
+  test-rust-arm64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # See the lint job.
+          fetch-depth: 0
+      - name: Decide whether the change is documentation alone
+        id: scope
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 .github/scripts/documentation_only.py
+      # From rust-toolchain.toml, as in the lint job. See the note there.
+      - name: Install the pinned toolchain
+        if: steps.scope.outputs.documentation-only != 'true'
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: steps.scope.outputs.documentation-only != 'true'
+        with:
+          workspaces: ". -> target"
+          # Its own key, since nothing an x86-64 job compiles runs here.
+          shared-key: workspace-arm64
+          # See the lint job.
+          env-vars: ImageOS ImageVersion
+          cache-on-failure: true
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        if: steps.scope.outputs.documentation-only != 'true'
+        with:
+          version: ${{ env.PINNED_UV_VERSION }}
+          checksum: ${{ env.PINNED_UV_SHA256_LINUX_ARM64 }}
+          # See test-rust.
+          enable-cache: false
+      # See test-rust.
+      - name: Install the CPython whose libpython the Rust tests link
+        id: libpython
+        if: steps.scope.outputs.documentation-only != 'true'
+        run: |
+          set -euo pipefail
+          uv python install "$NEWEST_CPYTHON_LINUX_ARM64"
+          python=$(uv python find "$NEWEST_CPYTHON_LINUX_ARM64")
+          libdir=$("$python" -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')
+          library="libpython$("$python" -c 'import sysconfig; print(sysconfig.get_config_var("LDVERSION"))').so"
+          if [ ! -e "$libdir/$library" ]; then
+            echo "::error::$library, the library PyO3 links, is not in $libdir"
+            exit 1
+          fi
+          ls -l "$libdir"/libpython3*
+          echo "python=$python" >> "$GITHUB_OUTPUT"
+          echo "libdir=$libdir" >> "$GITHUB_OUTPUT"
+      - name: Run the Rust test suite
+        if: steps.scope.outputs.documentation-only != 'true'
+        env:
+          PYO3_PYTHON: ${{ steps.libpython.outputs.python }}
+          LD_LIBRARY_PATH: ${{ steps.libpython.outputs.libdir }}
+        # See test-rust.
+        run: cargo test --workspace --locked --no-default-features --no-fail-fast
+
+  # test-python on arm64 Linux. Each step is test-python's with this runner's
+  # uv and CPython.
+  test-python-arm64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # See the lint job.
+          fetch-depth: 0
+      - name: Decide whether the change is documentation alone
+        id: scope
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 .github/scripts/documentation_only.py
+      # From rust-toolchain.toml, as in the lint job. See test-python.
+      - name: Install the pinned toolchain
+        if: steps.scope.outputs.documentation-only != 'true'
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: steps.scope.outputs.documentation-only != 'true'
+        with:
+          workspaces: ". -> target"
+          # Its own key, the release profile on this runner. See test-python.
+          shared-key: workspace-release-arm64
+          # See the lint job.
+          env-vars: ImageOS ImageVersion
+          cache-on-failure: true
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        if: steps.scope.outputs.documentation-only != 'true'
+        with:
+          version: ${{ env.PINNED_UV_VERSION }}
+          checksum: ${{ env.PINNED_UV_SHA256_LINUX_ARM64 }}
+          # The newest build. The action sets UV_PYTHON to it for every later
+          # step.
+          python-version: ${{ env.NEWEST_CPYTHON_LINUX_ARM64 }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Install the locked environment without the project
+        if: steps.scope.outputs.documentation-only != 'true'
+        # See test-python.
+        run: uv sync --locked --extra dev --no-install-project
+      - name: Build the extension and install the project
+        if: steps.scope.outputs.documentation-only != 'true'
+        # See test-python.
+        run: uv run --no-sync maturin develop --release --locked
+      - name: Run the Python test suite
+        if: steps.scope.outputs.documentation-only != 'true'
+        # See test-python.
+        run: uv run --no-sync pytest tests --ignore=tests/test_interpreter.py --ignore=tests/test_overlap.py
+      - name: Build the extension with the test-support feature
+        if: steps.scope.outputs.documentation-only != 'true'
+        # See test-python.
+        run: uv run --no-sync maturin develop --release --locked --features test-support
+      - name: Run the checks that need the test-support feature
+        if: steps.scope.outputs.documentation-only != 'true'
+        run: uv run --no-sync pytest tests/test_interpreter.py tests/test_overlap.py
+
+  # test-rust on arm64 macOS. Each step is test-rust's with this runner's uv,
+  # CPython and library name, and the test executables find libpython through
+  # DYLD_LIBRARY_PATH where Linux uses LD_LIBRARY_PATH.
+  test-rust-macos:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # See the lint job.
+          fetch-depth: 0
+      - name: Decide whether the change is documentation alone
+        id: scope
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 .github/scripts/documentation_only.py
+      # From rust-toolchain.toml, as in the lint job. See the note there.
+      - name: Install the pinned toolchain
+        if: steps.scope.outputs.documentation-only != 'true'
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: steps.scope.outputs.documentation-only != 'true'
+        with:
+          workspaces: ". -> target"
+          # Its own key, since nothing a Linux job compiles runs here.
+          shared-key: workspace-macos
+          # See the lint job.
+          env-vars: ImageOS ImageVersion
+          cache-on-failure: true
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        if: steps.scope.outputs.documentation-only != 'true'
+        with:
+          version: ${{ env.PINNED_UV_VERSION }}
+          checksum: ${{ env.PINNED_UV_SHA256_MACOS }}
+          # See test-rust.
+          enable-cache: false
+      # See test-rust. The library PyO3 links is a .dylib here.
+      - name: Install the CPython whose libpython the Rust tests link
+        id: libpython
+        if: steps.scope.outputs.documentation-only != 'true'
+        run: |
+          set -euo pipefail
+          uv python install "$NEWEST_CPYTHON_MACOS"
+          python=$(uv python find "$NEWEST_CPYTHON_MACOS")
+          libdir=$("$python" -c 'import sysconfig; print(sysconfig.get_config_var("LIBDIR"))')
+          library="libpython$("$python" -c 'import sysconfig; print(sysconfig.get_config_var("LDVERSION"))').dylib"
+          if [ ! -e "$libdir/$library" ]; then
+            echo "::error::$library, the library PyO3 links, is not in $libdir"
+            exit 1
+          fi
+          ls -l "$libdir"/libpython3*
+          echo "python=$python" >> "$GITHUB_OUTPUT"
+          echo "libdir=$libdir" >> "$GITHUB_OUTPUT"
+      - name: Run the Rust test suite
+        if: steps.scope.outputs.documentation-only != 'true'
+        env:
+          PYO3_PYTHON: ${{ steps.libpython.outputs.python }}
+          LIBPYTHON_DIR: ${{ steps.libpython.outputs.libdir }}
+        # The script exports DYLD_LIBRARY_PATH itself. macOS removes every
+        # DYLD_ variable from the environment of a protected program it
+        # starts, the shell this step runs in among them, so a value set under
+        # env would not reach cargo or the test executables. See test-rust.
+        run: |
+          set -euo pipefail
+          export DYLD_LIBRARY_PATH="$LIBPYTHON_DIR"
+          cargo test --workspace --locked --no-default-features --no-fail-fast
+
+  # test-python on arm64 macOS. Each step is test-python's with this runner's
+  # uv and CPython.
+  test-python-macos:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # See the lint job.
+          fetch-depth: 0
+      - name: Decide whether the change is documentation alone
+        id: scope
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 .github/scripts/documentation_only.py
+      # From rust-toolchain.toml, as in the lint job. See test-python.
+      - name: Install the pinned toolchain
+        if: steps.scope.outputs.documentation-only != 'true'
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: steps.scope.outputs.documentation-only != 'true'
+        with:
+          workspaces: ". -> target"
+          # Its own key, the release profile on this runner. See test-python.
+          shared-key: workspace-release-macos
+          # See the lint job.
+          env-vars: ImageOS ImageVersion
+          cache-on-failure: true
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        if: steps.scope.outputs.documentation-only != 'true'
+        with:
+          version: ${{ env.PINNED_UV_VERSION }}
+          checksum: ${{ env.PINNED_UV_SHA256_MACOS }}
+          # The newest build. The action sets UV_PYTHON to it for every later
+          # step.
+          python-version: ${{ env.NEWEST_CPYTHON_MACOS }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Install the locked environment without the project
+        if: steps.scope.outputs.documentation-only != 'true'
+        # See test-python.
+        run: uv sync --locked --extra dev --no-install-project
+      - name: Build the extension and install the project
+        if: steps.scope.outputs.documentation-only != 'true'
+        # See test-python.
+        run: uv run --no-sync maturin develop --release --locked
+      - name: Run the Python test suite
+        if: steps.scope.outputs.documentation-only != 'true'
+        # See test-python.
+        run: uv run --no-sync pytest tests --ignore=tests/test_interpreter.py --ignore=tests/test_overlap.py
+      - name: Build the extension with the test-support feature
+        if: steps.scope.outputs.documentation-only != 'true'
+        # See test-python.
+        run: uv run --no-sync maturin develop --release --locked --features test-support
+      - name: Run the checks that need the test-support feature
+        if: steps.scope.outputs.documentation-only != 'true'
+        run: uv run --no-sync pytest tests/test_interpreter.py tests/test_overlap.py
