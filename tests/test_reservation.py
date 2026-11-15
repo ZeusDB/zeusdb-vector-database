@@ -7,9 +7,9 @@ times the memory an index needed.
 
 Memory is read as psutil memory_info().vms rather than rss. The reservation is
 committed but never written, so on Windows rss reports almost nothing and on
-Linux the untouched pages never enter the resident set. vms is private commit on
-Windows and virtual size on Linux, and both track a reservation the moment it is
-made.
+Linux and macOS the untouched pages never enter the resident set. vms is private
+commit on Windows and virtual size on Linux and macOS, and each tracks a
+reservation the moment it is made.
 """
 
 import gc

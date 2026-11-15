@@ -23,10 +23,15 @@ it reports is held, and an id it does not report that was not held before the
 call is not held after it. Every kind of call returns at least once, and at
 least one is refused.
 
-Each kind's sequence runs in a process of its own, whose committed memory the
-system holds to 1 GiB beyond what it held when the sequence began, so a call
-that asks for more is refused before anything is reserved and ends that
-process, which fails the test with its words.
+Each kind's sequence runs in a process of its own, which the system holds to
+1 GiB beyond what it held when the sequence began, in the quantity that
+system's limit counts: private commit on Windows, the private writable
+mappings that are not the stack on Linux, and the size of the task's whole
+map on macOS. Before the sequence the process proves that the limit refuses a
+request just past the cap and grants one just inside it. A call that asks for
+more than the cap is refused, keeps nothing, and ends that process, which
+fails the test with its words. The parent asks on every system that its
+process ran held to the cap.
 
 `ZEUSDB_SURFACE_CALLS` sets the calls a run makes over every kind together,
 for a deep run.
@@ -420,19 +425,28 @@ def a_trained_index(kind):
     return index
 
 
-#: The memory a sequence's process may commit beyond what it held when the
-#: sequence began, 1 GiB, held by the system's own limit on the process.
+#: The memory a sequence's process may hold beyond what it held when the
+#: sequence began, 1 GiB, in the quantity the system's own limit on the
+#: process counts.
 CAP = 1 << 30
+
+#: How far each request of the cap's probe lies from the cap, 64 MiB: room
+#: for the allocator's rounding and for what the process allocates between
+#: its reading and the probe, and small beside the cap.
+MARGIN = 64 << 20
 
 #: The seconds a sequence's process may take, after which the test fails.
 TIMEOUT = 120 + CALLS // 50
 
 
 def hold_to_cap():
-    """Hold this process's committed memory to CAP beyond what it holds now,
-    by a job object on Windows and by RLIMIT_DATA elsewhere. A request past
-    it is refused by the system before anything is reserved. Returns whether
-    the limit is in force, which it is not on a system honouring neither."""
+    """Hold this process to CAP beyond what it holds now, through the limit
+    each system enforces on the quantity it counts. On Windows a job object
+    holds the private commit, which `PrivateUsage` reads. On Linux
+    RLIMIT_DATA holds the private writable mappings that are not the stack,
+    which `VmData` reads. On macOS RLIMIT_DATA holds the size of the task's
+    whole map, which psutil's `vms` reads. A request past the limit is
+    refused and keeps nothing. Raises on any other system."""
     if sys.platform == "win32":
         import ctypes
         from ctypes import wintypes
@@ -483,17 +497,50 @@ def hold_to_cap():
         assert kernel32.SetInformationJobObject(job, 9, ctypes.byref(limits),
                                                 ctypes.sizeof(limits)), ctypes.get_last_error()
         assert kernel32.AssignProcessToJobObject(job, process), ctypes.get_last_error()
-        return True
-    try:
-        import resource
-    except ImportError:
-        return False
-    with open("/proc/self/status", encoding="ascii") as status:
-        data = next(int(line.split()[1]) * 1024 for line in status if line.startswith("VmData:"))
+        return
+    if sys.platform == "linux":
+        with open("/proc/self/status", encoding="ascii") as status:
+            held = next(int(line.split()[1]) * 1024
+                        for line in status if line.startswith("VmData:"))
+    elif sys.platform == "darwin":
+        import psutil
+
+        held = psutil.Process().memory_info().vms
+    else:
+        raise AssertionError(f"{sys.platform}: no limit is known that holds this process to CAP")
+    import resource
+
     _, hard = resource.getrlimit(resource.RLIMIT_DATA)
-    soft = data + CAP if hard == resource.RLIM_INFINITY else min(data + CAP, hard)
+    soft = held + CAP if hard == resource.RLIM_INFINITY else min(held + CAP, hard)
     resource.setrlimit(resource.RLIMIT_DATA, (soft, hard))
+
+
+def granted(size):
+    """Whether the system grants one request for `size` bytes, which numpy
+    makes without touching a page and releases at once."""
+    try:
+        np.empty(size, dtype=np.uint8)
+    except MemoryError:
+        return False
     return True
+
+
+def hold_and_prove_the_cap():
+    """Hold this process to CAP and prove that the limit lies within MARGIN
+    of what the process held and CAP. A request for CAP and MARGIN more is
+    granted before the limit, so the system grants it, and refused after,
+    so the limit refuses it. A request for CAP less MARGIN is then granted.
+    The refusal comes first, so no granted request is held when it is
+    asked for."""
+    past, inside = CAP + MARGIN, CAP - MARGIN
+    assert granted(past), f"the system refused a request for {past} bytes before any limit"
+    hold_to_cap()
+    assert not granted(past), (
+        f"a request for {past} bytes past the cap was granted, so no limit holds this process "
+        "to the cap")
+    assert granted(inside), (
+        f"a request for {inside} bytes inside the cap was refused, so the limit lies below what "
+        "this process held and the cap")
 
 
 def run_sequence(kind):
@@ -537,11 +584,10 @@ def test_no_call_on_the_surface_panics_or_stops_the_index(kind):
     assert child.returncode == 0, (
         f"{kind}: the sequence's process ended with {child.returncode}\n"
         f"{child.stdout[-4000:]}\n{child.stderr[-4000:]}")
-    assert "held to the cap" in child.stdout or sys.platform not in ("win32", "linux"), (
-        child.stdout[-4000:])
+    assert "held to the cap" in child.stdout, child.stdout[-4000:]
 
 
 if __name__ == "__main__":
-    held = hold_to_cap()
+    hold_and_prove_the_cap()
     run_sequence(sys.argv[1])
-    print("the sequence ran held to the cap" if held else "the sequence ran with no cap")
+    print("the sequence ran held to the cap")

@@ -507,9 +507,9 @@ fn a_held_directory_refuses_a_read_only_load() {
     assert_eq!(opened.len(), 0);
 }
 
-/// R6. On Linux, the real permissions: the folder holding a fixture at mode
-/// 0555 and every file at 0444. Skipped where the process can write there
-/// regardless, which is a process running as root.
+/// R6. On Linux and macOS, the real permissions: the folder holding a
+/// fixture at mode 0555 and every file at 0444. Skipped where the process
+/// can write there regardless, which is a process running as root.
 #[cfg(unix)]
 #[test]
 fn a_fixture_under_real_read_only_permissions_opens_read_only() {
