@@ -126,6 +126,11 @@ env:
   NEWEST_CPYTHON_MACOS: cpython-3.15.1-macos-aarch64-none
   # uv takes no interpreter from the runner image.
   UV_PYTHON_PREFERENCE: only-managed
+  # Every wheel build and the sdist check's build fail where a crate of the
+  # workspace prints a warning, as in ci.yml. The Linux builds run in a
+  # container, which takes the variable through `--env`. It changes no
+  # compiler argument, so the wheels are what a build without it makes.
+  CARGO_BUILD_WARNINGS: deny
 
 jobs:
   check-version:
@@ -287,6 +292,12 @@ jobs:
             docker-platform: linux/arm64
             # ghcr.io/rust-cross/manylinux2014-cross, tag aarch64
             image: ghcr.io/rust-cross/manylinux2014-cross@sha256:32c92568ebee8db53e0598c21bcd06a6dd1649d45d507646a8a49313c50325f8
+            # The image links with GNU ld 2.29.1, which does not read the
+            # AArch64 feature property that the standard library's metadata
+            # objects carry and reports it on standard error. rustc gives that
+            # report as the lint linker_messages, which CARGO_BUILD_WARNINGS
+            # denies, so this build allows that lint for this target alone.
+            target-rustflags: -A linker_messages
     env:
       # The install check's two images. Each digest names a multi-platform
       # index, so the aarch64 leg runs the same images under QEMU.
@@ -318,7 +329,17 @@ jobs:
         env:
           IMAGE: ${{ matrix.platform.image }}
           RUST_TARGET: ${{ matrix.platform.rust-target }}
+          TARGET_RUSTFLAGS: ${{ matrix.platform.target-rustflags }}
         run: |
+          # A matrix entry's rustflags reach the container as the variable
+          # cargo reads for that entry's target alone. cargo joins it with
+          # any rustflags a configuration file gives the target and ignores
+          # it where RUSTFLAGS is set. The job and the image set neither, so
+          # it adds to the build's flags and replaces none.
+          target_rustflags=()
+          if [ -n "$TARGET_RUSTFLAGS" ]; then
+            target_rustflags=(--env "CARGO_TARGET_$(echo "$RUST_TARGET" | tr 'a-z-' 'A-Z_')_RUSTFLAGS=$TARGET_RUSTFLAGS")
+          fi
           docker run --rm \
             --volume "$GITHUB_WORKSPACE:/io" \
             --volume "$RUNNER_TEMP/maturin/bin/maturin:/usr/local/bin/maturin:ro" \
@@ -326,6 +347,8 @@ jobs:
             --workdir /io \
             --env CARGO_INCREMENTAL=0 \
             --env CARGO_TERM_COLOR=always \
+            --env CARGO_BUILD_WARNINGS \
+            "${target_rustflags[@]}" \
             "$IMAGE" \
             bash .github/scripts/build-linux-wheel.sh "$RUST_TARGET" auto
           sudo chown -R "$(id -u):$(id -g)" dist
@@ -442,6 +465,7 @@ jobs:
             --workdir /io \
             --env CARGO_INCREMENTAL=0 \
             --env CARGO_TERM_COLOR=always \
+            --env CARGO_BUILD_WARNINGS \
             "$IMAGE" \
             bash .github/scripts/build-linux-wheel.sh "$RUST_TARGET" musllinux_1_2
           sudo chown -R "$(id -u):$(id -g)" dist

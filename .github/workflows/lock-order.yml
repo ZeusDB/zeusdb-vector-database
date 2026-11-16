@@ -73,6 +73,9 @@ env:
   PINNED_UV_SHA256_LINUX: f68d291c75783122dad58ab77def0e13f3233f358731db5d6d7e8715603b928f
   # uv takes no interpreter from the runner image.
   UV_PYTHON_PREFERENCE: only-managed
+  # Every cargo command here, the ones maturin runs among them, fails where a
+  # crate of the workspace prints a warning, as in ci.yml.
+  CARGO_BUILD_WARNINGS: deny
 
 jobs:
   lock-order:

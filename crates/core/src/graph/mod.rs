@@ -2425,6 +2425,9 @@ pub fn restore_int8_graph(
 }
 
 // The graph's creation budget, for a fuzzer in another crate that bounds a
-// load by what it may reserve.
+// load by what it may reserve. An item of its own, since the budget is
+// visible to `graph` alone and a re-export cannot widen it, and present only
+// in the builds that export it, so no other build holds a public item it
+// cannot reach.
 #[cfg(any(test, feature = "test-support"))]
-pub use mutable::RESERVE_BYTES;
+pub const RESERVE_BYTES: usize = mutable::RESERVE_BYTES;

@@ -571,26 +571,54 @@ impl FsStorage {
         }
     }
 
-    /// What a lock that was not taken means. A holder that excludes this one
-    /// is named by what its lock file records, its lines joined, where the
-    /// system lets another handle read it, which Windows does not while the
-    /// lock is held exclusive. The record is the last exclusive holder's,
-    /// since a shared holder writes none.
+    /// What a lock that was not taken means. The holder that excludes this
+    /// one is named only as another holder, since a refused lock call gives
+    /// nothing of the holder. The lock file holds the last record an
+    /// exclusive holder wrote, which a shared holder never replaces and a
+    /// release never clears, so its lines are quoted, joined, as that record
+    /// and never as the holder's. An empty lock file is named as recording no
+    /// holder, and one whose bytes are not UTF-8, which the read gives as
+    /// `InvalidData`, as holding no readable record. The words that the
+    /// system does not let a second handle read the file are for the read
+    /// that Windows refuses with `ERROR_LOCK_VIOLATION`, as it does while
+    /// another handle holds the lock exclusive. The lock stops no read on
+    /// Linux or macOS, so a read that fails for any other reason, on any
+    /// system, says that the lock file cannot be read and gives the system's
+    /// error.
     fn lock_failure(&self, error: std::fs::TryLockError) -> LockFailure {
         match error {
             std::fs::TryLockError::WouldBlock => {
-                let recorded = fs::read_to_string(&self.lock).ok().map(|text| {
-                    text.lines()
-                        .map(str::trim)
-                        .filter(|line| !line.is_empty())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                });
-                let holder = match recorded.filter(|text| !text.is_empty()) {
-                    Some(text) => format!("another holder, its lock file recording {text}"),
-                    None => "another holder, whose record this system does not let a second \
-                             handle read while the lock is held"
-                        .to_string(),
+                let holder = match fs::read_to_string(&self.lock) {
+                    Ok(text) => {
+                        let record = text
+                            .lines()
+                            .map(str::trim)
+                            .filter(|line| !line.is_empty())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        if record.is_empty() {
+                            "another holder, and its lock file records no holder".to_string()
+                        } else {
+                            format!(
+                                "another holder, and its lock file holds the last record an \
+                                 exclusive holder wrote, {record}"
+                            )
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                        "another holder, and its lock file holds no readable record".to_string()
+                    }
+                    Err(error)
+                        if cfg!(windows) && error.raw_os_error() == Some(ERROR_LOCK_VIOLATION) =>
+                    {
+                        "another holder, whose record this system does not let a second handle \
+                         read while the lock is held"
+                            .to_string()
+                    }
+                    Err(error) => format!(
+                        "another holder, and its lock file cannot be read, with the system's \
+                         error {error}"
+                    ),
                 };
                 LockFailure::Held { holder }
             }
@@ -598,6 +626,10 @@ impl FsStorage {
         }
     }
 }
+
+/// The error Windows gives a read of a range that another handle holds
+/// locked, `ERROR_LOCK_VIOLATION`.
+const ERROR_LOCK_VIOLATION: i32 = 33;
 
 /// Take `file`'s lock in `mode` without waiting.
 fn acquire(file: &File, mode: LockMode) -> Result<(), std::fs::TryLockError> {
@@ -1841,17 +1873,18 @@ mod tests {
         }
     }
 
-    /// What a refusal names where the system lets a second handle read the
-    /// lock file, being the record [`holder`] writes.
-    const RECORDED: &str =
-        "another holder, its lock file recording pid 1, host test, exclusive, since now";
+    /// What a refusal says where the system lets a second handle read the
+    /// lock file, being the record [`holder`] writes, quoted as the last
+    /// record an exclusive holder wrote.
+    const RECORDED: &str = "another holder, and its lock file holds the last record an exclusive \
+                            holder wrote, pid 1, host test, exclusive, since now";
 
     /// The lock in one process, as the standard library gives it on this
     /// system. An exclusive holder refuses a second handle in either mode,
     /// shared holders sit together and refuse an exclusive one, a dropped
-    /// guard releases, and the lock file is kept. A refusal names the record
-    /// wherever the system lets the second handle read the lock file, which
-    /// Windows does beside shared holders alone and Linux and macOS do
+    /// guard releases, and the lock file is kept. A refusal quotes the
+    /// record wherever the system lets the second handle read the lock file,
+    /// which Windows does beside shared holders alone and Linux and macOS do
     /// beside any holder.
     #[test]
     fn the_lock_refuses_a_second_handle_and_releases_on_drop() {
@@ -1887,6 +1920,46 @@ mod tests {
         let again = holder(&storage, LockMode::Exclusive).unwrap();
         drop(again);
         assert!(storage.lock_path().is_file(), "the lock file is kept");
+    }
+
+    /// A read of the lock file that fails for a reason other than the
+    /// Windows lock gives a refusal that says the lock file cannot be read
+    /// and gives the system's error, and never that the system does not let
+    /// a second handle read it. Here the lock file's mode refuses this
+    /// process every read. A lock call opens the lock file to read before
+    /// any refusal, so such a file stops the lock call at its open, and the
+    /// test makes the refusal's own read directly. Root reads every file, so
+    /// the test runs as any other user.
+    #[cfg(unix)]
+    #[test]
+    fn a_refusal_beside_a_lock_file_this_process_cannot_read_gives_the_systems_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = FsStorage::at(&tmp.path().join("index.zdb")).unwrap();
+        fs::write(
+            storage.lock_path(),
+            "pid 1, host test, exclusive, since now\n",
+        )
+        .unwrap();
+        fs::set_permissions(storage.lock_path(), fs::Permissions::from_mode(0o000)).unwrap();
+        let read = fs::read_to_string(storage.lock_path());
+        let refusal = storage.lock_failure(std::fs::TryLockError::WouldBlock);
+        fs::set_permissions(storage.lock_path(), fs::Permissions::from_mode(0o600)).unwrap();
+        let Err(error) = read else {
+            eprintln!("skipped: this user reads a lock file whose mode refuses reads");
+            return;
+        };
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        match refusal {
+            LockFailure::Held { holder } => assert_eq!(
+                holder,
+                format!(
+                    "another holder, and its lock file cannot be read, with the system's error \
+                     {error}"
+                )
+            ),
+            other => panic!("expected the refusal of a held lock, got {other:?}"),
+        }
     }
 
     /// A child forked from a holder closes its copy of every lock file, and a

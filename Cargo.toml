@@ -4,10 +4,11 @@
 #
 # Three things live here and nowhere else.
 #
-# [workspace.package] holds the version, the edition and the licence, and a
-# member takes each one with `<key>.workspace = true`. The version is the one
-# pyproject.toml and src/zeusdb_vector_database/__init__.py declare, and the
-# release gate in .github/workflows/publish-pypi.yml reads it from this table.
+# [workspace.package] holds the version, the edition, the licence and the
+# documentation address, and a member takes each one with
+# `<key>.workspace = true`. The version is the one pyproject.toml and
+# src/zeusdb_vector_database/__init__.py declare, and the release gate in
+# .github/workflows/publish-pypi.yml reads it from this table.
 #
 # [workspace.dependencies] holds every dependency once, the external crates at
 # one version and the workspace's own crates by path. A member names a
@@ -33,6 +34,11 @@ edition = "2021"
 # cargo-deny reads this field. The wheel's metadata is unaffected, because
 # maturin takes it from pyproject.toml.
 license = "Apache-2.0"
+# The same documentation address pyproject.toml declares under [project.urls].
+# cargo package, which maturin sdist runs on each crate the wheel builds from,
+# reads this field. The wheel's metadata is unaffected, because maturin takes
+# its addresses from pyproject.toml.
+documentation = "https://docs.zeusdb.com/en/latest/vector_database/"
 
 [workspace.dependencies]
 # The workspace's own crates, by path. Each takes the workspace's version, so

@@ -2,6 +2,12 @@
 # reaches it through manifest-path in pyproject.toml.
 [package]
 name = "zeusdb-vector-python"
+# What the crate is, and where the wheel's documentation is, an address the
+# root Cargo.toml declares once. cargo package, which maturin sdist runs on
+# each crate the wheel builds from, warns where a manifest has no
+# description, or has none of documentation, homepage and repository.
+description = "The Python binding, which the wheel's extension module is built from."
+documentation.workspace = true
 # The version, the edition and the licence are the workspace's, declared once
 # in the root Cargo.toml.
 version.workspace = true

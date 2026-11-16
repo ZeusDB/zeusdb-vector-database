@@ -96,6 +96,12 @@ env:
   NEWEST_CPYTHON_MACOS: cpython-3.15.1-macos-aarch64-none
   # uv takes no interpreter from the runner image.
   UV_PYTHON_PREFERENCE: only-managed
+  # Every cargo command of every job, the ones maturin runs among them, fails
+  # where a crate of the workspace prints a warning, a warning cargo replays
+  # for a unit it does not build again included. It changes no compiler
+  # argument, so it compiles nothing a run without it would not. A crate from
+  # the registry prints no warning, since cargo caps its lints.
+  CARGO_BUILD_WARNINGS: deny
 
 jobs:
   lint:
@@ -151,6 +157,28 @@ jobs:
         if: steps.scope.outputs.documentation-only != 'true'
         # The code that feature compiles, which no other step here builds.
         run: cargo clippy --workspace --all-targets --locked --features zeusdb-vector-python/test-support -- -D warnings
+      - name: Run clippy on the libraries as the wheels and a library alone compile them
+        if: steps.scope.outputs.documentation-only != 'true'
+        # The two runs above build every target, so the dev-dependencies turn
+        # on the core crate's test-support, and neither builds the release
+        # profile. This step checks each library in the dev profile without
+        # test-support, as `cargo build -p` compiles it alone, and the wheel's
+        # release configuration for the three targets no job here builds,
+        # Windows and both musl targets. No crate turns on a feature of
+        # another through a normal dependency, so `--workspace --lib` compiles
+        # each library as it compiles alone and as the wheel compiles it.
+        # pyo3-build-config takes its default configuration from abi3-py310
+        # for a target with no interpreter of its own.
+        env:
+          # maturin compiles a musl wheel's library with crt-static off, as a
+          # cdylib needs, so the check of each musl target does the same.
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: -C target-feature=-crt-static
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: -C target-feature=-crt-static
+        run: |
+          set -euo pipefail
+          rustup target add x86_64-pc-windows-msvc x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+          cargo clippy --workspace --lib --locked -- -D warnings
+          cargo clippy --workspace --lib --locked --release --target x86_64-pc-windows-msvc --target x86_64-unknown-linux-musl --target aarch64-unknown-linux-musl -- -D warnings
       # The three steps below hold the workspace's shape, and each guards
       # against something a member manifest could undo without a warning.
       # Clippy reads the clippy.toml nearest each crate's manifest and

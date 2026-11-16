@@ -353,8 +353,12 @@ pub enum Locked {
 #[derive(Debug)]
 pub enum LockFailure {
     /// Another holder has it, in a mode that excludes this one. `holder` is
-    /// what the lock file records of the last exclusive holder, where the
-    /// system lets it be read, as a phrase a refusal quotes.
+    /// the phrase a refusal quotes, which names the holder only as another
+    /// holder, and quotes the last record an exclusive holder wrote in the
+    /// lock file as that record, or says the lock file records no holder,
+    /// holds no readable record or cannot be read, with the system's error.
+    /// Where Windows refuses the read because another handle holds the lock
+    /// exclusive, it says the system does not let a second handle read it.
     Held { holder: String },
     /// The filesystem answered the lock with an error of its own, so it
     /// cannot lock.

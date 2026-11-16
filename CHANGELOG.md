@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **One index at a time writes a directory.** `<path>.zdblock` beside the directory takes the operating system's file lock. A journaled index holds it for as long as it lives, a save holds it for the save, and a load holds it shared while it reads. A second holder in this process or another raises `RuntimeError`, which names the holder's process and host where the system lets a second handle read the lock file, and the system releases the lock when the holder's process ends, however it ends. Where the lock file cannot be locked, `journal_to()` and `save()` raise `RuntimeError` and write nothing.
+- **One index at a time writes a directory.** `<path>.zdblock` beside the directory takes the operating system's file lock. A journaled index holds it for as long as it lives, a save holds it for the save, and a load holds it shared while it reads. A second holder in this process or another raises `RuntimeError`, which names the holder only as another holder. Where the system lets a second handle read the lock file, the error quotes the last record an exclusive holder wrote there, being its process, its host, its mode and the moment, or says that the lock file records no holder, holds no readable record, or cannot be read, with the system's error. The host is the machine's DNS host name on Windows and the C library's host name on Linux and macOS. The system releases the lock when the holder's process ends, however it ends. Where the lock file cannot be locked, `journal_to()` and `save()` raise `RuntimeError` and write nothing.
 
 - **A journaled directory this process cannot write opens read only.** Where the medium or a missing permission refuses the first write a load needs, `load()` replays the journal in memory, writes nothing, and issues a `RuntimeWarning` naming the directory and the system's refusal. The index raises `RuntimeError` on every mutation, on `checkpoint()`, on `journal_to()` and on a save into the directory it was read from. A save into another directory writes a copy that opens writable.
 
@@ -264,6 +264,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The frame mutator and the graph dump mutator compile under the core crate's `test-support` feature and in its tests alone. The text crate's tests take the feature through a dev-dependency.
 
 - **A search, each phase of an insertion, the exact scan, the rerank, the rerank's calibration and the timing of a graph check the processor for AVX once**, and every distance each of them evaluates runs on the kernel that check chose. Every distance returns the bits it returned.
+
+- Every cargo command in CI, in the lock order workflow and in the release workflow fails where a crate of the workspace prints a warning, through `CARGO_BUILD_WARNINGS=deny`. The lint job also runs clippy on each library in the dev profile without the `test-support` feature, and on the wheel's release configuration for `x86_64-pc-windows-msvc`, `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`. The release workflow's build of the aarch64 manylinux wheel allows rustc's `linker_messages` lint for that target alone, since the linker of its pinned image reports a property of the standard library's metadata objects that it does not read.
+
+- Each crate manifest holds a description and takes the documentation address from the workspace, so `maturin sdist` prints no warning.
 
 ### Format
 

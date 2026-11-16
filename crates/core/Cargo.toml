@@ -4,6 +4,12 @@
 # and `cargo test -p zeusdb-vector-core` links no Python library.
 [package]
 name = "zeusdb-vector-core"
+# What the crate is, and where the wheel's documentation is, an address the
+# root Cargo.toml declares once. cargo package, which maturin sdist runs on
+# each crate the wheel builds from, warns where a manifest has no
+# description, or has none of documentation, homepage and repository.
+description = "The engine's floor, which every index crate and the binding stand on."
+documentation.workspace = true
 # The version, the edition and the licence are the workspace's, declared once
 # in the root Cargo.toml.
 version.workspace = true

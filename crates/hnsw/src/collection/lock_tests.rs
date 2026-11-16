@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde_json::json;
-use zeusdb_vector_core::{Error, FsStorage, LockMode, Locked, Storage};
+use zeusdb_vector_core::{Error, FsStorage, LockGuard, LockMode, Locked, Storage};
 
 use super::journal_support::TempDir;
 use super::{Collection, Declaration, ParsedRecord};
@@ -48,6 +48,40 @@ fn locked<T>(result: Result<T, Error>, what: &str) -> String {
         Ok(_) => panic!("{what}: expected the lock's refusal, and it opened"),
     }
 }
+
+/// The words a user reads in the lock's refusal, held to being that
+/// refusal.
+fn refusal_words<T>(result: Result<T, Error>, what: &str) -> String {
+    match result {
+        Err(refusal @ Error::CollectionLocked { .. }) => refusal.to_string(),
+        Err(other) => panic!("{what}: expected the lock's refusal, got {other}"),
+        Ok(_) => panic!("{what}: expected the lock's refusal, and it went through"),
+    }
+}
+
+/// The lock a load takes, shared and handed the record a load hands it,
+/// held until the guard drops. A shared holder writes nothing into the lock
+/// file.
+fn held_as_a_load(storage: &FsStorage) -> Box<dyn LockGuard> {
+    let record = crate::journal::holder_record(LockMode::Shared);
+    match storage.lock(LockMode::Shared, &record) {
+        Ok(Locked::Writable(guard)) => guard,
+        other => panic!("expected a shared lock, got {other:?}"),
+    }
+}
+
+/// What a refusal says, after the words that name the holder only as
+/// another holder, where it quotes the lock file's last record.
+const LAST_RECORD: &str =
+    "is held by another holder, and its lock file holds the last record an exclusive holder wrote, ";
+
+/// What a refusal says where the lock file is empty.
+const NO_HOLDER_RECORDED: &str =
+    "is held by another holder, and its lock file records no holder, so it cannot be";
+
+/// What a refusal says where the lock file's bytes are not UTF-8.
+const NO_READABLE_RECORD: &str =
+    "is held by another holder, and its lock file holds no readable record, so it cannot be";
 
 // ============================================================================
 // IN ONE PROCESS
@@ -145,6 +179,105 @@ fn a_load_lets_the_lock_go_when_it_returns() {
     assert!(temp.at("released.zdb.zdblock").is_file(), "the file stays");
 }
 
+/// A save refused while a load holds the lock, where the lock file's last
+/// record is this process's own from its earlier save, quotes that record as
+/// the last record an exclusive holder wrote and names the holder, which is
+/// the load, only as another holder.
+#[test]
+fn a_refusal_beside_a_load_quotes_the_refused_process_as_the_last_record() {
+    let temp = TempDir::new("lock-tests");
+    let path = temp.at("own.zdb");
+    let dir = path.to_str().unwrap();
+    let collection = Collection::build(declaration(), None);
+    add(&collection, "a");
+    collection.save(dir).unwrap();
+    let storage = FsStorage::at(&path).unwrap();
+    let _load = held_as_a_load(&storage);
+    let words = refusal_words(collection.save(dir), "a second save beside a load");
+    assert!(
+        words.contains(&format!(
+            "{LAST_RECORD}process {}, host ",
+            std::process::id()
+        )),
+        "{words}"
+    );
+}
+
+/// A directory with no lock file gets an empty one from the first holder
+/// that takes the lock shared, as a load does, and a shared holder writes
+/// nothing into it, though it is handed a record. A save refused beside that
+/// holder names the lock file as recording no holder, and a read of the file
+/// beside the holder gives its contents, which are empty.
+#[test]
+fn a_refusal_beside_an_empty_lock_file_names_it_as_recording_no_holder() {
+    let temp = TempDir::new("lock-tests");
+    let path = temp.at("empty.zdb");
+    let dir = path.to_str().unwrap();
+    let collection = Collection::build(declaration(), None);
+    add(&collection, "a");
+    collection.save(dir).unwrap();
+    let storage = FsStorage::at(&path).unwrap();
+    std::fs::remove_file(storage.lock_path()).unwrap();
+    let _load = held_as_a_load(&storage);
+    assert_eq!(
+        std::fs::read(storage.lock_path()).unwrap(),
+        b"",
+        "a second handle reads the lock file beside the shared holder"
+    );
+    let words = refusal_words(collection.save(dir), "a save beside a load");
+    assert!(words.contains(NO_HOLDER_RECORDED), "{words}");
+}
+
+/// A lock file whose bytes are not UTF-8 is read, and its read gives them
+/// as no text. A save refused beside a holder that holds the lock shared, as
+/// a load holds it, names the lock file as holding no readable record, and
+/// not as one the system does not let a second handle read.
+#[test]
+fn a_refusal_beside_a_lock_file_that_is_not_utf8_names_no_readable_record() {
+    let temp = TempDir::new("lock-tests");
+    let path = temp.at("bytes.zdb");
+    let dir = path.to_str().unwrap();
+    let collection = Collection::build(declaration(), None);
+    add(&collection, "a");
+    collection.save(dir).unwrap();
+    let storage = FsStorage::at(&path).unwrap();
+    let bytes = b"process 1\nhost \xff\xfe\nmode exclusive\n";
+    std::fs::write(storage.lock_path(), bytes).unwrap();
+    let _load = held_as_a_load(&storage);
+    assert_eq!(
+        std::fs::read(storage.lock_path()).unwrap(),
+        bytes,
+        "a second handle reads the lock file's bytes beside the shared holder"
+    );
+    let words = refusal_words(collection.save(dir), "a save beside a load");
+    assert!(words.contains(NO_READABLE_RECORD), "{words}");
+}
+
+/// A load of a directory that has no lock file creates the lock file empty
+/// and writes nothing into it. A save refused while the next load holds the
+/// lock names the lock file as recording no holder.
+#[test]
+fn a_load_without_a_lock_file_leaves_one_that_records_no_holder() {
+    let temp = TempDir::new("lock-tests");
+    let path = temp.at("unlocked.zdb");
+    let dir = path.to_str().unwrap();
+    let collection = Collection::build(declaration(), None);
+    add(&collection, "a");
+    collection.save(dir).unwrap();
+    let storage = FsStorage::at(&path).unwrap();
+    std::fs::remove_file(storage.lock_path()).unwrap();
+    let loaded = Collection::load(dir).unwrap();
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(
+        std::fs::read(storage.lock_path()).unwrap(),
+        b"",
+        "the load created the lock file empty"
+    );
+    let _next_load = held_as_a_load(&storage);
+    let words = refusal_words(collection.save(dir), "a save beside the next load");
+    assert!(words.contains(NO_HOLDER_RECORDED), "{words}");
+}
+
 /// A child process holds a copy of every file its parent has open from its
 /// fork to its exec, the lock file among them, and a lock goes only when its
 /// file is unlocked or the last copy of the file closes. The index the
@@ -205,7 +338,8 @@ const CHILD_TEST: &str = "collection::lock_tests::the_lock_child";
 /// The child, run in a process of its own. Under `hold` it journals the
 /// directory, adds a record, says it is ready and waits until it is told to
 /// go or is killed. Under `load` it loads the directory and writes what the
-/// load said.
+/// load said. Under `save` it saves a collection of one record into the
+/// directory, writes its process id and ends.
 #[test]
 #[ignore = "the parent runs this in a process of its own"]
 fn the_lock_child() {
@@ -237,7 +371,30 @@ fn the_lock_child() {
             };
             std::fs::write(&said, outcome).unwrap();
         }
+        "save" => {
+            let collection = Collection::build(declaration(), None);
+            add(&collection, "child");
+            collection.save(dir.to_str().unwrap()).unwrap();
+            std::fs::write(&said, std::process::id().to_string()).unwrap();
+        }
         _ => {}
+    }
+}
+
+/// `child`'s exit, waiting at most a minute, after which the child is ended
+/// and the test fails.
+fn ended(mut child: std::process::Child) -> std::process::ExitStatus {
+    let start = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        if start.elapsed() > Duration::from_secs(60) {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the child did not end within a minute");
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -341,4 +498,29 @@ fn a_second_writer_in_another_process_is_refused_at_its_load() {
     let mut third = child(&dir, "load");
     assert!(third.wait().unwrap().success());
     assert_eq!(std::fs::read_to_string(&said).unwrap(), "opened 2");
+}
+
+/// A process that saved the directory and ended left its record in the lock
+/// file. A save refused while a load holds the lock quotes that record as
+/// the last record an exclusive holder wrote and names the holder, which is
+/// the load, only as another holder. The child has ended before the lock is
+/// held shared.
+#[test]
+fn a_refusal_beside_a_load_quotes_an_ended_savers_record_as_the_last_record() {
+    let temp = TempDir::new("lock-tests");
+    let path = temp.at("ended.zdb");
+    assert!(ended(child(&path, "save")).success());
+    let saver = std::fs::read_to_string(path.with_extension("said")).unwrap();
+    let storage = FsStorage::at(&path).unwrap();
+    let _load = held_as_a_load(&storage);
+    let collection = Collection::build(declaration(), None);
+    add(&collection, "ours");
+    let words = refusal_words(
+        collection.save(path.to_str().unwrap()),
+        "a save beside a load",
+    );
+    assert!(
+        words.contains(&format!("{LAST_RECORD}process {saver}, host ")),
+        "{words}"
+    );
 }

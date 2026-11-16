@@ -384,7 +384,7 @@ impl GraphRoom {
 /// What it costs is reallocation on a build past the budget. The arenas grow
 /// geometrically, so a 50,000 record build at dimension 1,536 crosses it twice
 /// and moves roughly 400 MB in total, against a build that takes 70 seconds.
-pub const RESERVE_BYTES: usize = 1 << 27;
+pub(super) const RESERVE_BYTES: usize = 1 << 27;
 
 /// Records the reservation is taken for, being `expected_size` or as many as
 /// [`RESERVE_BYTES`] holds, whichever is smaller.

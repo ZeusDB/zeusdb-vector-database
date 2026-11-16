@@ -258,19 +258,62 @@ pub(crate) fn holder_record(mode: LockMode) -> String {
     )
 }
 
-/// The machine's name, from what each system offers without a library:
-/// `COMPUTERNAME` on Windows, the kernel's hostname on Linux and `HOSTNAME`
-/// elsewhere.
+/// The machine's name as the system holds it, so the record names the
+/// machine whatever the process's environment holds: the DNS host name of
+/// the machine itself on Windows, and the C library's host name on every
+/// Unix. `an unknown host` where the system gives no name.
 fn host_name() -> String {
     #[cfg(windows)]
-    let name = std::env::var("COMPUTERNAME").ok();
-    #[cfg(target_os = "linux")]
-    let name = std::fs::read_to_string("/proc/sys/kernel/hostname").ok();
-    #[cfg(not(any(windows, target_os = "linux")))]
-    let name = std::env::var("HOSTNAME").ok();
+    let name = windows_host_name();
+    #[cfg(unix)]
+    let name = unix_host_name();
+    #[cfg(not(any(windows, unix)))]
+    let name: Option<String> = None;
     name.map(|name| name.trim().to_string())
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| "an unknown host".to_string())
+}
+
+/// The DNS host name of the machine itself, through `GetComputerNameExW`
+/// with `ComputerNamePhysicalDnsHostname`, which names the machine and not a
+/// cluster it serves, read into a buffer longer than any such name. `None`
+/// where the call fails.
+#[cfg(windows)]
+fn windows_host_name() -> Option<String> {
+    /// `ComputerNamePhysicalDnsHostname` of `COMPUTER_NAME_FORMAT`.
+    const PHYSICAL_DNS_HOSTNAME: i32 = 5;
+    /// The buffer's length in UTF-16 units.
+    const UNITS: u32 = 256;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetComputerNameExW(format: i32, buffer: *mut u16, units: *mut u32) -> i32;
+    }
+    let mut buffer = [0u16; UNITS as usize];
+    let mut units = UNITS;
+    // SAFETY: `units` holds the buffer's length in units, and the call
+    // writes no more than that many.
+    if unsafe { GetComputerNameExW(PHYSICAL_DNS_HOSTNAME, buffer.as_mut_ptr(), &mut units) } == 0 {
+        return None;
+    }
+    buffer.get(..units as usize).map(String::from_utf16_lossy)
+}
+
+/// The host name the C library holds, through `gethostname`, read into a
+/// buffer longer than any name the system holds. `None` where the call
+/// fails, or where the name fills the buffer with no NUL after it.
+#[cfg(unix)]
+fn unix_host_name() -> Option<String> {
+    extern "C" {
+        fn gethostname(name: *mut std::ffi::c_char, len: usize) -> std::ffi::c_int;
+    }
+    let mut buffer = [0u8; 256];
+    // SAFETY: the buffer is writable for the whole length the call is
+    // given, and the call writes no more than that length.
+    if unsafe { gethostname(buffer.as_mut_ptr().cast(), buffer.len()) } != 0 {
+        return None;
+    }
+    let len = buffer.iter().position(|&byte| byte == 0)?;
+    Some(String::from_utf8_lossy(&buffer[..len]).into_owned())
 }
 
 /// A lock that was not taken, as the caller's refusal. `directory` is the
@@ -1573,24 +1616,147 @@ mod tests {
         assert_eq!(Durability::DEFAULT_INTERVAL, Duration::from_millis(10));
     }
 
-    /// The holder's record is four lines naming this process, a host, the
-    /// mode and the moment, and nothing a decision reads.
+    /// The holder's record is four lines naming this process, this machine
+    /// by the name the system gives it, the mode and the moment, and nothing
+    /// a decision reads.
     #[test]
     fn the_holder_record_names_the_process_the_host_the_mode_and_the_moment() {
         let record = holder_record(LockMode::Exclusive);
         let lines: Vec<&str> = record.lines().collect();
         assert_eq!(lines.len(), 4, "{record}");
         assert_eq!(lines[0], format!("process {}", std::process::id()));
-        assert!(
-            lines[1].starts_with("host ") && lines[1].len() > 5,
-            "{record}"
-        );
+        assert_eq!(lines[1], format!("host {}", machine_name()), "{record}");
         assert_eq!(lines[2], "mode exclusive");
         let since = lines[3].strip_prefix("since ").unwrap();
         assert!(
             chrono::DateTime::parse_from_rfc3339(since).is_ok(),
             "{since}"
         );
+    }
+
+    /// The variables a system or a shell holds the machine's name in.
+    const NAME_VARIABLES: [&str; 3] = ["COMPUTERNAME", "HOSTNAME", "HOST"];
+
+    /// Set where the parent asks the child for the record it builds.
+    const ENV_RECORD: &str = "ZEUSDB_HOLDER_RECORD";
+
+    /// The child test, as `--exact` spells it.
+    const RECORD_CHILD: &str = "journal::tests::the_holder_records_child";
+
+    /// What the child prints before each line of the record, so the parent
+    /// finds the record among the test harness's own lines.
+    const RECORD_MARK: &str = "holder record line ";
+
+    /// The longest wait for a child process or a program to end.
+    const PROCESS_BOUND: Duration = Duration::from_secs(60);
+
+    /// The child of the test below, run in a process of its own. Ignored, so
+    /// the ordinary suite does not reach it, and a run that reaches it
+    /// without the parent's variable does nothing.
+    #[test]
+    #[ignore = "the parent runs this in a process of its own"]
+    fn the_holder_records_child() {
+        if std::env::var_os(ENV_RECORD).is_none() {
+            return;
+        }
+        for line in holder_record(LockMode::Exclusive).lines() {
+            println!("{RECORD_MARK}{line}");
+        }
+    }
+
+    /// A process whose environment holds none of the variables a system or a
+    /// shell names the machine in still records the machine's name, since
+    /// the record reads it from the system. The child is this test binary,
+    /// with those variables removed and nothing else changed.
+    #[test]
+    fn the_holder_record_names_the_machine_where_the_environment_names_none() {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", RECORD_CHILD, "--ignored", "--nocapture"])
+            .env(ENV_RECORD, "1");
+        for name in NAME_VARIABLES {
+            command.env_remove(name);
+        }
+        let output = output_within(command, "the child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{output:?}");
+        let record: Vec<&str> = stdout
+            .lines()
+            .filter_map(|line| line.strip_prefix(RECORD_MARK))
+            .collect();
+        assert_eq!(record.len(), 4, "{stdout}");
+        assert_eq!(record[1], format!("host {}", machine_name()), "{stdout}");
+    }
+
+    /// The machine's name, read by a route the engine does not take: the
+    /// kernel's file on Linux, the program `uname -n` on every other Unix,
+    /// and the program `hostname` on Windows. A route that fails or gives
+    /// no name fails the test.
+    fn machine_name() -> String {
+        #[cfg(target_os = "linux")]
+        let name = std::fs::read_to_string("/proc/sys/kernel/hostname")
+            .expect("the kernel's host name file reads");
+        #[cfg(all(unix, not(target_os = "linux")))]
+        let name = program_output("uname", &["-n"]);
+        #[cfg(windows)]
+        let name = program_output("hostname", &[]);
+        #[cfg(not(any(unix, windows)))]
+        let name = String::new();
+        let name = name.trim().to_string();
+        assert!(!name.is_empty(), "the system gives the machine no name");
+        name
+    }
+
+    /// What `program` prints, held to a run that succeeds.
+    #[cfg(any(windows, all(unix, not(target_os = "linux"))))]
+    fn program_output(program: &str, args: &[&str]) -> String {
+        let mut command = std::process::Command::new(program);
+        command.args(args);
+        let output = output_within(command, program);
+        assert!(output.status.success(), "{program}: {output:?}");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    /// `command`'s output once it ends, waiting at most [`PROCESS_BOUND`],
+    /// after which the process is ended and the test fails naming `what`.
+    fn output_within(mut command: std::process::Command, what: &str) -> std::process::Output {
+        use std::io::Read;
+        use std::process::Stdio;
+        let mut child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|error| panic!("{what} does not start: {error}"));
+        let mut stdout = child.stdout.take().unwrap();
+        let mut stderr = child.stderr.take().unwrap();
+        let out = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = stdout.read_to_end(&mut bytes);
+            bytes
+        });
+        let err = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = stderr.read_to_end(&mut bytes);
+            bytes
+        });
+        let start = std::time::Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if start.elapsed() > PROCESS_BOUND {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{what} did not end within {PROCESS_BOUND:?}");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        std::process::Output {
+            status,
+            stdout: out.join().unwrap(),
+            stderr: err.join().unwrap(),
+        }
     }
 
     #[test]
