@@ -1,10 +1,11 @@
 # Lints and tests every push and pull request on main and development.
 #
 # Cached, so the gate stays fast. The lint and the floor interpreter run on
-# x86-64 Linux, and the Rust suite and the Python suite run on x86-64 Linux,
-# on arm64 Linux and on arm64 macOS, so the engine's tests run on each
-# processor a wheel ships for. The cross-platform build is covered by the
-# wheel matrix in publish-pypi.yml.
+# x86-64 Linux, the Rust suite runs on x86-64 Linux, on arm64 Linux and on
+# arm64 macOS, and the Python suite runs on those three and on x86-64
+# Windows, so the engine's tests run on each processor a wheel ships for and
+# the Python suite on Linux, macOS and Windows. The cross-platform build is
+# covered by the wheel matrix in publish-pypi.yml.
 #
 # NEITHER TRIGGER HAS A PATH FILTER, AND ONE MUST NOT BE ADDED.
 #
@@ -38,12 +39,13 @@
 # date instead of silently updating it. Keep the flag on every cargo step
 # that accepts it.
 #
-# The Python suite runs on the newest CPython release in test-python, and in
-# test-python-arm64 and test-python-macos on arm64, and on the oldest version
-# the package supports in test-python-floor, each an exact build that uv
-# installs and checks against the SHA-256 in its own list. uv itself is pinned
-# by version and by the SHA-256 of its archive for each runner. Every Python
-# job builds the extension with the maturin uv.lock names, and lint checks that
+# The Python suite runs on the newest CPython release in test-python, in
+# test-python-arm64 and test-python-macos on arm64 and in test-python-windows
+# on Windows, and on the oldest version the package supports in
+# test-python-floor, each an exact build that uv installs and checks against
+# the SHA-256 in its own list. uv itself is pinned by version and by the
+# SHA-256 of its archive for each runner. Every Python job builds the
+# extension with the maturin uv.lock names, and lint checks that
 # .github/requirements/maturin.txt names the same one for the release. Each
 # job runs the suite on the release build without tests/test_interpreter.py
 # and tests/test_overlap.py, then builds again with the binding's
@@ -59,9 +61,10 @@
 # `extension-module` off, which is a different feature set from the one the
 # other jobs build.
 #
-# Every job names its runner image, ubuntu-24.04, ubuntu-24.04-arm or
-# macos-15, rather than a label such as ubuntu-latest that GitHub moves to a
-# newer image on its own schedule. A change of image is a change to this file.
+# Every job names its runner image, ubuntu-24.04, ubuntu-24.04-arm, macos-15
+# or windows-2025-vs2026, rather than a label such as ubuntu-latest that
+# GitHub moves to a newer image on its own schedule. A change of image is a
+# change to this file.
 # lint uses the image's own python3 for two checks, so the label fixes that
 # version too.
 name: CI
@@ -82,11 +85,13 @@ permissions:
 env:
   # uv for every job that installs it, and the SHA-256 GitHub publishes at
   # that version for uv-x86_64-unknown-linux-gnu.tar.gz,
-  # uv-aarch64-unknown-linux-gnu.tar.gz and uv-aarch64-apple-darwin.tar.gz.
+  # uv-aarch64-unknown-linux-gnu.tar.gz, uv-aarch64-apple-darwin.tar.gz and
+  # uv-x86_64-pc-windows-msvc.zip.
   PINNED_UV_VERSION: "0.13.5"
   PINNED_UV_SHA256_LINUX: f68d291c75783122dad58ab77def0e13f3233f358731db5d6d7e8715603b928f
   PINNED_UV_SHA256_LINUX_ARM64: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403
   PINNED_UV_SHA256_MACOS: 743f85035a1996ecb350659e01cd9faea9709829be09b1b4b03c73eaf3c9cd73
+  PINNED_UV_SHA256_WINDOWS: a38b8d1902b7cfbc76b423ba1bb456f623f42064cdc72628b6075b89afd1019a
   # The CPython builds uv installs, as uv names them. The floor is the oldest
   # version the package supports, which is the floor requires-python declares
   # and the abi3 target, and the newest is the newest CPython release.
@@ -94,6 +99,7 @@ env:
   NEWEST_CPYTHON_LINUX: cpython-3.15.1-linux-x86_64-gnu
   NEWEST_CPYTHON_LINUX_ARM64: cpython-3.15.1-linux-aarch64-gnu
   NEWEST_CPYTHON_MACOS: cpython-3.15.1-macos-aarch64-none
+  NEWEST_CPYTHON_WINDOWS: cpython-3.15.1-windows-x86_64-none
   # uv takes no interpreter from the runner image.
   UV_PYTHON_PREFERENCE: only-managed
   # Every cargo command of every job, the ones maturin runs among them, fails
@@ -704,6 +710,73 @@ jobs:
           # The newest build. The action sets UV_PYTHON to it for every later
           # step.
           python-version: ${{ env.NEWEST_CPYTHON_MACOS }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Install the locked environment without the project
+        if: steps.scope.outputs.documentation-only != 'true'
+        # See test-python.
+        run: uv sync --locked --extra dev --no-install-project
+      - name: Build the extension and install the project
+        if: steps.scope.outputs.documentation-only != 'true'
+        # See test-python.
+        run: uv run --no-sync maturin develop --release --locked
+      - name: Run the Python test suite
+        if: steps.scope.outputs.documentation-only != 'true'
+        # See test-python.
+        run: uv run --no-sync pytest tests --ignore=tests/test_interpreter.py --ignore=tests/test_overlap.py
+      - name: Build the extension with the test-support feature
+        if: steps.scope.outputs.documentation-only != 'true'
+        # See test-python.
+        run: uv run --no-sync maturin develop --release --locked --features test-support
+      - name: Run the checks that need the test-support feature
+        if: steps.scope.outputs.documentation-only != 'true'
+        run: uv run --no-sync pytest tests/test_interpreter.py tests/test_overlap.py
+
+  # test-python on x86-64 Windows, on the image the release builds the Windows
+  # wheel on. Each step is test-python's with this runner's uv and CPython, and
+  # every step runs in bash, so each step's command is the Linux jobs' command.
+  # A CPython install on Windows names its interpreter python and carries no
+  # python3, so the first step runs the image's python.
+  test-python-windows:
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # See the lint job.
+          fetch-depth: 0
+      - name: Decide whether the change is documentation alone
+        id: scope
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python .github/scripts/documentation_only.py
+      # From rust-toolchain.toml, as in the lint job. See test-python.
+      - name: Install the pinned toolchain
+        if: steps.scope.outputs.documentation-only != 'true'
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: steps.scope.outputs.documentation-only != 'true'
+        with:
+          workspaces: ". -> target"
+          # Its own key, the release profile on this runner. See test-python.
+          shared-key: workspace-release-windows
+          # See the lint job.
+          env-vars: ImageOS ImageVersion
+          cache-on-failure: true
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        if: steps.scope.outputs.documentation-only != 'true'
+        with:
+          version: ${{ env.PINNED_UV_VERSION }}
+          checksum: ${{ env.PINNED_UV_SHA256_WINDOWS }}
+          # The newest build. The action sets UV_PYTHON to it for every later
+          # step.
+          python-version: ${{ env.NEWEST_CPYTHON_WINDOWS }}
           enable-cache: true
           cache-dependency-glob: uv.lock
       - name: Install the locked environment without the project

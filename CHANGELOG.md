@@ -33,6 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **A text space stores a term of at most 4,294,967,295 bytes.** `add()` refuses a record that carries a longer term with `RuntimeError`, before the term takes an id.
 
+- **CPython 3.15.** The package supports CPython 3.15, and its metadata lists every supported version, 3.10 to 3.15, as a classifier on PyPI. One wheel for each platform installs on each of these versions.
+
 ### Changed
 
 - **The journal is a directory of segments.** `journal_to(path)` opens `<path>.zdbjournal`, and `journal_path` names it. Each segment is named for the first sequence it holds, and its header names the collection and the checkpoint it follows. The journal moves to a new segment at the first commit after the active one passes 64 MiB. A checkpoint starts a new segment and deletes the old ones once its save has committed. `journal_bytes` is the length of every segment together.

@@ -14,9 +14,18 @@ requires-python = ">=3.10"
 license = "Apache-2.0"
 # CPython only, and now literally so. A stable ABI wheel cannot be loaded by
 # PyPy or by a free-threaded build, so no wheel is produced for either.
+# One version classifier for each minor release from the floor above to the
+# newest CPython release that CI runs the Python suite on, on Linux, macOS and
+# Windows. A release joins the list only once every Python job passes on it.
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
 ]
 dependencies = [
     "numpy>=2.2.6,<3.0.0"
