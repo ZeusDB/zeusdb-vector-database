@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Builds one Linux wheel inside a pinned build image, for publish-pypi.yml.
+# Builds one Linux wheel inside a pinned build image, for publish-pypi.yml and
+# for the musl job of ci.yml.
 #
 # The linux and musllinux jobs run it through `docker run`, with the
 # repository at /io as the working directory and the maturin binary installed
@@ -12,11 +13,15 @@
 # The first argument is the Rust target triple. The second is the wheel's
 # compatibility, either a value for maturin's --compatibility or "auto", which
 # leaves maturin to choose the tag from what the build links, as the manylinux
-# images have always done.
+# images have always done. The third, which may be left out, names the cargo
+# features maturin builds with beside pyproject.toml's, as ci.yml's musl job
+# passes test-support. publish-pypi.yml passes no third argument, so every
+# wheel it publishes is built with pyproject.toml's features alone.
 set -euo pipefail
 
 target="$1"
 compatibility="$2"
+features="${3:-}"
 
 # The manylinux images carry no rustup, and the musl images carry their own.
 # Where it is missing, this is the rustup the runner images carry,
@@ -68,5 +73,8 @@ maturin=/usr/local/bin/maturin
 args=(build --release --locked --out dist --target "$target")
 if [ "$compatibility" != "auto" ]; then
   args+=(--compatibility "$compatibility")
+fi
+if [ -n "$features" ]; then
+  args+=(--features "$features")
 fi
 "$maturin" "${args[@]}"

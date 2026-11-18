@@ -2,10 +2,12 @@
 #
 # Cached, so the gate stays fast. The lint and the floor interpreter run on
 # x86-64 Linux, the Rust suite runs on x86-64 Linux, on arm64 Linux and on
-# arm64 macOS, and the Python suite runs on those three and on x86-64
-# Windows, so the engine's tests run on each processor a wheel ships for and
-# the Python suite on Linux, macOS and Windows. The cross-platform build is
-# covered by the wheel matrix in publish-pypi.yml.
+# arm64 macOS, and the Python suite runs on those three, on x86-64 Windows
+# and on x86-64 Linux with musl, so the engine's tests run on each processor
+# a wheel ships for and the Python suite on Linux with glibc and with musl,
+# on macOS and on Windows. The cross-platform build is covered by the wheel
+# matrix in publish-pypi.yml, whose suite jobs run the Python suite on every
+# wheel it builds.
 #
 # NEITHER TRIGGER HAS A PATH FILTER, AND ONE MUST NOT BE ADDED.
 #
@@ -50,7 +52,9 @@
 # job runs the suite on the release build without tests/test_interpreter.py
 # and tests/test_overlap.py, then builds again with the binding's
 # test-support feature and runs those two modules alone, since their checks
-# arm pauses the wheel does not carry.
+# arm pauses the wheel does not carry. test-python-musl does the same on
+# musl with wheels it builds as the release builds its musllinux wheel, since
+# its Alpine image holds no Rust toolchain; see the job.
 # test-rust, test-rust-arm64 and test-rust-macos link their test executables
 # against the libpython of the newest build for their runner, which uv
 # installs the same way.
@@ -108,6 +112,13 @@ env:
   # argument, so it compiles nothing a run without it would not. A crate from
   # the registry prints no warning, since cargo caps its lints.
   CARGO_BUILD_WARNINGS: deny
+  # test-python-musl's two images, by the digests publish-pypi.yml pins for
+  # its x86-64 musllinux build and for its suite on the newest CPython. A pin
+  # moves by hand, so each moves in both files.
+  # ghcr.io/rust-cross/rust-musl-cross, tag x86_64-musl
+  MUSL_BUILD_IMAGE: ghcr.io/rust-cross/rust-musl-cross@sha256:ce75e9174325d4fbb3de85c309e2d7ca29f7500169bc4b5d2c611ff7e86d549a
+  # python, tag 3.15-alpine
+  NEWEST_IMAGE_ALPINE: python@sha256:d44b1254cb92329418d164b22b20d86bbd3869d48e80e09e476531a409a728bb
 
 jobs:
   lint:
@@ -798,3 +809,118 @@ jobs:
       - name: Run the checks that need the test-support feature
         if: steps.scope.outputs.documentation-only != 'true'
         run: uv run --no-sync pytest tests/test_interpreter.py tests/test_overlap.py
+
+  # test-python on x86-64 Linux with musl, on the newest CPython. musl changes
+  # the C library, which is the same on both processors, and arm64 runs on
+  # glibc in test-python-arm64, so one processor shows a fault of musl at the
+  # commit that makes it. publish-pypi.yml's musllinux-suite runs both
+  # processors and both interpreters on the wheels it publishes.
+  # The Alpine image holds no Rust toolchain, so the extension is built as
+  # publish-pypi.yml builds its x86-64 musllinux wheel, in the pinned musl
+  # image through .github/scripts/build-linux-wheel.sh, once on the release
+  # profile and once with the binding's test-support feature. The uv pinned
+  # here is linked against glibc and cannot run in Alpine, so uv writes the
+  # environment from uv.lock on the runner and the image's pip installs it in
+  # the container from wheels alone, each held to its locked hash. The suite
+  # runs as the runner's user and group, so every case runs.
+  test-python-musl:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # See the lint job.
+          fetch-depth: 0
+      - name: Decide whether the change is documentation alone
+        id: scope
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 .github/scripts/documentation_only.py
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        if: steps.scope.outputs.documentation-only != 'true'
+        with:
+          version: ${{ env.PINNED_UV_VERSION }}
+          checksum: ${{ env.PINNED_UV_SHA256_LINUX }}
+          # uv export needs an interpreter, and this is the newest build. The
+          # suite runs on the Alpine image's CPython.
+          python-version: ${{ env.NEWEST_CPYTHON_LINUX }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Install maturin and patchelf
+        if: steps.scope.outputs.documentation-only != 'true'
+        # As publish-pypi.yml's musllinux job installs them, from the
+        # hash-locked files, on the floor build. Each wheel holds a static
+        # binary, which the build image runs from a read-only mount.
+        run: |
+          uv venv "$RUNNER_TEMP/maturin" --python "$FLOOR_CPYTHON_LINUX"
+          uv pip install --python "$RUNNER_TEMP/maturin" --require-hashes --only-binary :all: --no-deps -r .github/requirements/maturin.txt -r .github/requirements/patchelf.txt
+      - name: Build the musllinux wheel and the test-support wheel
+        if: steps.scope.outputs.documentation-only != 'true'
+        # As publish-pypi.yml's musllinux job builds its x86-64 wheel. The
+        # second build passes test-support, the script's third argument, and
+        # each build's wheel leaves dist before the next build writes there.
+        run: |
+          build() {
+            docker run --rm \
+              --volume "$GITHUB_WORKSPACE:/io" \
+              --volume "$RUNNER_TEMP/maturin/bin/maturin:/usr/local/bin/maturin:ro" \
+              --volume "$RUNNER_TEMP/maturin/bin/patchelf:/opt/patchelf/bin/patchelf:ro" \
+              --workdir /io \
+              --env CARGO_INCREMENTAL=0 \
+              --env CARGO_TERM_COLOR=always \
+              --env CARGO_BUILD_WARNINGS \
+              "$MUSL_BUILD_IMAGE" \
+              bash .github/scripts/build-linux-wheel.sh x86_64-unknown-linux-musl musllinux_1_2 "$@"
+            sudo chown -R "$(id -u):$(id -g)" dist
+          }
+          build
+          mv dist "$RUNNER_TEMP/release-wheel"
+          build test-support
+          mv dist "$RUNNER_TEMP/support-wheel"
+      - name: Export the locked environment
+        if: steps.scope.outputs.documentation-only != 'true'
+        # See publish-pypi.yml's musllinux-suite.
+        run: uv export --locked --extra dev --no-emit-project --format requirements.txt --output-file "$RUNNER_TEMP/suite.txt"
+      - name: Run the Python test suite
+        if: steps.scope.outputs.documentation-only != 'true'
+        # On the release wheel in the Alpine image, as publish-pypi.yml's
+        # musllinux-suite runs it.
+        run: |
+          docker run --rm --interactive \
+            --user "$(id -u):$(id -g)" \
+            --env HOME=/tmp \
+            --env PIP_DISABLE_PIP_VERSION_CHECK=1 \
+            --volume "$GITHUB_WORKSPACE:/io" \
+            --volume "$RUNNER_TEMP/suite.txt:/suite.txt:ro" \
+            --volume "$RUNNER_TEMP/release-wheel:/wheel:ro" \
+            --workdir /io \
+            "$NEWEST_IMAGE_ALPINE" sh -eu <<'SUITE'
+          python -m venv /tmp/suite
+          /tmp/suite/bin/python -m pip install --require-hashes --only-binary :all: --no-deps -r /suite.txt
+          /tmp/suite/bin/python -m pip install --no-index --no-deps --find-links /wheel zeusdb-vector-database
+          /tmp/suite/bin/python .github/scripts/installed_engine.py
+          /tmp/suite/bin/python -m pytest tests --ignore=tests/test_interpreter.py --ignore=tests/test_overlap.py
+          SUITE
+      - name: Run the checks that need the test-support feature
+        if: steps.scope.outputs.documentation-only != 'true'
+        # The same container on the test-support wheel, with the two modules
+        # alone.
+        run: |
+          docker run --rm --interactive \
+            --user "$(id -u):$(id -g)" \
+            --env HOME=/tmp \
+            --env PIP_DISABLE_PIP_VERSION_CHECK=1 \
+            --volume "$GITHUB_WORKSPACE:/io" \
+            --volume "$RUNNER_TEMP/suite.txt:/suite.txt:ro" \
+            --volume "$RUNNER_TEMP/support-wheel:/wheel:ro" \
+            --workdir /io \
+            "$NEWEST_IMAGE_ALPINE" sh -eu <<'SUITE'
+          python -m venv /tmp/suite
+          /tmp/suite/bin/python -m pip install --require-hashes --only-binary :all: --no-deps -r /suite.txt
+          /tmp/suite/bin/python -m pip install --no-index --no-deps --find-links /wheel zeusdb-vector-database
+          /tmp/suite/bin/python .github/scripts/installed_engine.py --test-support
+          /tmp/suite/bin/python -m pytest tests/test_interpreter.py tests/test_overlap.py
+          SUITE

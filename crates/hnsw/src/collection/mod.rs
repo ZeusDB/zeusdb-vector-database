@@ -2273,12 +2273,29 @@ impl Collection {
 
     /// The storage mode as `get_storage_mode` reports it.
     ///
-    /// Reaches the graph's read guard through `is_quantized`, so it cannot be
-    /// asked under a storage guard; `remove_point_internal` reads it before it
-    /// takes any.
+    /// Reads each value only where the name depends on it. The declaration
+    /// comes first, the quantizer is asked only on a space that declares one,
+    /// and the graph only once the quantizer is fitted, so a space without
+    /// quantization reads neither. `try_storage_mode` gives the same names
+    /// through `storage_mode_name`.
+    ///
+    /// Reaches the graph's read guard through `is_quantized` where the
+    /// quantizer is fitted, so it cannot be asked under a storage guard;
+    /// `remove_point_internal` reads it before it takes any.
     pub fn storage_mode(&self) -> String {
-        self.storage_mode_name(self.can_use_quantization(), self.is_quantized())
-            .to_string()
+        if !self.has_quantization() {
+            "raw_only".to_string()
+        } else if !self.can_use_quantization() {
+            if self.training_threshold_reached.load(Ordering::Acquire) {
+                "raw_ready_for_training".to_string()
+            } else {
+                "raw_collecting_for_training".to_string()
+            }
+        } else if self.is_quantized() {
+            "quantized_active".to_string()
+        } else {
+            "raw_trained_not_rebuilt".to_string()
+        }
     }
 
     /// The storage mode's name, from whether the quantizer is fitted and
@@ -2719,12 +2736,17 @@ mod tests {
 
     use super::construct::MAX_DIM;
     use super::journal_support::TempDir;
-    use super::{Collection, Declaration, ParsedRecord, StorageMode};
+    use super::{
+        Collection, Declaration, Int8Codec, Int8Scale, ParsedRecord, SparseHalf, StorageMode,
+    };
     use crate::journal::Durability;
     use serde_json::{json, Value};
     use std::collections::HashMap;
     use std::sync::mpsc::{channel, Receiver, Sender};
-    use zeusdb_vector_core::JOURNAL_MAX_PAYLOAD;
+    use std::sync::Arc;
+    use zeusdb_vector_core::test_support::clustered;
+    use zeusdb_vector_core::{SparseVector, JOURNAL_MAX_PAYLOAD};
+    use zeusdb_vector_sparse::SparseConfig;
 
     /// The journal's payload ceiling is derived from this crate's ceilings,
     /// being a codebook at the widest `dim` and the most centroids `bits`
@@ -2956,5 +2978,143 @@ mod tests {
         assert!(poisoned.is_err());
         assert_eq!(collecting.try_len(), None);
         assert_eq!(collecting.try_contains("r1"), None);
+    }
+
+    /// `storage_mode` names each state of each kind of space, and
+    /// `try_storage_mode` gives the same name where no guard is held.
+    ///
+    /// A space without quantization is `raw_only`, empty or filled, with or
+    /// without a sparse space. A quantized space is
+    /// `raw_collecting_for_training` below its training size,
+    /// `raw_ready_for_training` once the threshold is reached with no
+    /// quantizer fitted, `raw_trained_not_rebuilt` once the quantizer is
+    /// fitted while the graph still scores raw vectors, and
+    /// `quantized_active` once the training's rebuild has run. The ready
+    /// state is set through the loader's setter, which a load of a directory
+    /// saved in that state calls. The state between the fit and the rebuild
+    /// is reached by fitting the space's own quantizer, or installing its
+    /// codec, without the rebuild, which is what a failed rebuild leaves.
+    #[test]
+    fn storage_mode_names_each_state_of_each_kind_of_space() {
+        const DIM: usize = 8;
+        const TRAINING_SIZE: usize = 1000;
+        let vectors = clustered(TRAINING_SIZE, DIM, 0x0228_b001);
+        let records = |n: usize, sparse: bool| -> Vec<ParsedRecord> {
+            vectors[..n]
+                .iter()
+                .enumerate()
+                .map(|(i, vector)| ParsedRecord {
+                    id: format!("r{i}"),
+                    vector: vector.clone(),
+                    sparse: sparse.then(|| {
+                        SparseHalf::Vector(SparseVector {
+                            dims: vec![(i % 7) as u32, 7 + (i % 5) as u32],
+                            values: vec![1.0, 2.0],
+                        })
+                    }),
+                    metadata: HashMap::new(),
+                })
+                .collect()
+        };
+        let fill = |collection: &Collection, n: usize, sparse: bool| {
+            let added = collection.add_records(records(n, sparse), vec![], false);
+            assert_eq!(added.total_errors, 0, "{:?}", added.errors);
+        };
+        let names = |collection: &Collection, expected: &str, state: &str| {
+            assert_eq!(collection.storage_mode(), expected, "storage_mode, {state}");
+            assert_eq!(
+                collection.try_storage_mode().as_deref(),
+                Some(expected),
+                "try_storage_mode, {state}"
+            );
+        };
+        let declaration = || Declaration::validate(DIM, "l2", 6, 60, 2000, Vec::new()).unwrap();
+
+        let raw = Collection::build(declaration(), None);
+        names(&raw, "raw_only", "no quantization, empty");
+        fill(&raw, 200, false);
+        names(&raw, "raw_only", "no quantization, filled");
+
+        let with_sparse = Collection::build(
+            declaration()
+                .with_sparse("terms", SparseConfig::default())
+                .unwrap(),
+            None,
+        );
+        names(
+            &with_sparse,
+            "raw_only",
+            "no quantization, a sparse space, empty",
+        );
+        fill(&with_sparse, 200, true);
+        names(
+            &with_sparse,
+            "raw_only",
+            "no quantization, a sparse space, filled",
+        );
+
+        type Fit = fn(&Collection, &[Vec<f32>]);
+        let fit_codebook: Fit = |collection, sample| {
+            let pq = collection.dense().pq.as_ref().unwrap();
+            pq.train(sample).unwrap();
+        };
+        let fit_scales: Fit = |collection, sample| {
+            let codec = Int8Codec::fit(sample[0].len(), sample).unwrap();
+            assert!(collection
+                .dense()
+                .install_int8_codec(Arc::new(codec))
+                .is_ok());
+        };
+        let pq = |mode: StorageMode| {
+            declaration()
+                .quantization(4, 4, TRAINING_SIZE, None, mode)
+                .unwrap()
+        };
+        let scalar = declaration()
+            .scalar_quantization(
+                Int8Scale::PER_DIMENSION,
+                TRAINING_SIZE,
+                None,
+                StorageMode::QuantizedOnly,
+            )
+            .unwrap();
+        let kinds = [
+            (
+                "product quantized, keeping raw vectors",
+                pq(StorageMode::QuantizedWithRaw),
+                fit_codebook,
+            ),
+            (
+                "product quantized, keeping codes alone",
+                pq(StorageMode::QuantizedOnly),
+                fit_codebook,
+            ),
+            ("scalar quantized", scalar, fit_scales),
+        ];
+        for (kind, config, fit) in kinds {
+            let mut collection = Collection::build(declaration(), Some(config.clone()));
+            fill(&collection, 200, false);
+            names(
+                &collection,
+                "raw_collecting_for_training",
+                &format!("{kind}, collecting"),
+            );
+            collection.set_training_threshold_reached(true);
+            names(
+                &collection,
+                "raw_ready_for_training",
+                &format!("{kind}, ready"),
+            );
+            fit(&collection, &vectors);
+            names(
+                &collection,
+                "raw_trained_not_rebuilt",
+                &format!("{kind}, fitted and not rebuilt"),
+            );
+
+            let active = Collection::build(declaration(), Some(config));
+            fill(&active, TRAINING_SIZE, false);
+            names(&active, "quantized_active", &format!("{kind}, active"));
+        }
     }
 }

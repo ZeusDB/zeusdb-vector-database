@@ -271,6 +271,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Each crate manifest holds a description and takes the documentation address from the workspace, so `maturin sdist` prints no warning.
 
+- **The release workflow runs the Python suite on every wheel before it publishes.** The jobs `linux-suite`, `musllinux-suite`, `windows-suite` and `macos-suite` each check a wheel against the digest its build recorded, then run the suite on it with CPython 3.10.22 and 3.15.1, on the wheel's own processor and C library. The publish job needs all four. CI also runs the suite on musl, in `test-python-musl`.
+
 ### Format
 
 Every directory this release saves declares format version 5.0.0 and lists its features, and a 5.x manifest without its features is refused. A 5.0.0 directory holds its journal as a directory of segments, records as `identity.sequence` the last journal sequence its records include, and lists no `identity` feature, since every 5.0.0 directory holds one. This release reads 1.x, 2.x, 3.x, 4.x and 5.x, so a directory an earlier release saved opens here, and saving it again writes 5.0.0. A journaled directory at 3.0.0, 3.1.0 or 4.0.0 is written again at 5.0.0 when it opens. 0.5.0 to 0.13.0 refuse a 5.0.0 directory at the version check with a message naming the newer release, and 0.3.0 to 0.4.1, which read no format version, refuse it when they decode its `mappings.bin`. A 5.0.0 directory holds its graph dump at version 2, which holds each record's stored vector, code or scalar row, and its `metadata.json` names the records that hold a field. A directory at 1.x to 4.x opens with its version 1 dump read, and saving it again writes 5.0.0.

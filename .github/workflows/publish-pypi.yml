@@ -55,6 +55,22 @@
 # needs it and a dispatch runs it, so a wheel that reaches outside the limited
 # API, or a musllinux wheel without its libraries, fails every run.
 #
+# Four suite jobs, linux-suite, musllinux-suite, windows-suite and
+# macos-suite, run the Python suite on every wheel before anything can be
+# published. Each needs its own build job alone, so a leg starts once its
+# wheel exists. A leg downloads its wheel, holds it to the digest its build
+# recorded, and runs the suite on it on hardware of the wheel's own processor
+# and with its own C library, on the floor and the newest CPython, as the
+# runner's own user, so the cases that skip under root run too. The aarch64
+# legs run on ubuntu-24.04-arm, and the musllinux legs in the install check's
+# Alpine images, on each processor natively. Every leg installs the
+# environment uv.lock names, from wheels alone. The suite is the gate's
+# without tests/test_interpreter.py and tests/test_overlap.py, whose checks
+# need the binding's test-support feature, which no wheel carries, and which
+# ci.yml runs on its own builds. The suite matrices turn fail-fast off, so
+# one failed leg does not hide another's result. The publish job needs all
+# four, and a dispatch runs them.
+#
 # The publish job uploads through pypa/gh-action-pypi-publish, which exchanges
 # the job's OIDC token for an index credential and mints a PEP 740 attestation
 # for every file from that same identity, so PyPI verifies each file against
@@ -113,6 +129,7 @@ env:
   # uv, and the SHA-256 GitHub publishes for its archive on each runner.
   PINNED_UV_VERSION: "0.13.5"
   PINNED_UV_SHA256_LINUX: f68d291c75783122dad58ab77def0e13f3233f358731db5d6d7e8715603b928f
+  PINNED_UV_SHA256_LINUX_ARM64: 4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403
   PINNED_UV_SHA256_WINDOWS: a38b8d1902b7cfbc76b423ba1bb456f623f42064cdc72628b6075b89afd1019a
   PINNED_UV_SHA256_MACOS: 743f85035a1996ecb350659e01cd9faea9709829be09b1b4b03c73eaf3c9cd73
   # The CPython builds uv installs, as uv names them. The floor is the oldest
@@ -120,12 +137,21 @@ env:
   # newest CPython release.
   FLOOR_CPYTHON_LINUX: cpython-3.10.22-linux-x86_64-gnu
   NEWEST_CPYTHON_LINUX: cpython-3.15.1-linux-x86_64-gnu
+  FLOOR_CPYTHON_LINUX_ARM64: cpython-3.10.22-linux-aarch64-gnu
+  NEWEST_CPYTHON_LINUX_ARM64: cpython-3.15.1-linux-aarch64-gnu
   FLOOR_CPYTHON_WINDOWS: cpython-3.10.22-windows-x86_64-none
   NEWEST_CPYTHON_WINDOWS: cpython-3.15.1-windows-x86_64-none
   FLOOR_CPYTHON_MACOS: cpython-3.10.22-macos-aarch64-none
   NEWEST_CPYTHON_MACOS: cpython-3.15.1-macos-aarch64-none
   # uv takes no interpreter from the runner image.
   UV_PYTHON_PREFERENCE: only-managed
+  # The musllinux job's install check and musllinux-suite run these two
+  # images. Each digest names a multi-platform index, so one pin serves both
+  # processors, and each image carries its own CPython on musl.
+  # python, tag 3.10-alpine
+  FLOOR_IMAGE_ALPINE: python@sha256:8ca9f9d0f4df2af674092e7e9d79ce7985e783cecfe070f8ea850801b6520bf7
+  # python, tag 3.15-alpine
+  NEWEST_IMAGE_ALPINE: python@sha256:d44b1254cb92329418d164b22b20d86bbd3869d48e80e09e476531a409a728bb
   # Every wheel build and the sdist check's build fail where a crate of the
   # workspace prints a warning, as in ci.yml. The Linux builds run in a
   # container, which takes the variable through `--env`. It changes no
@@ -431,12 +457,6 @@ jobs:
             docker-platform: linux/arm64
             # ghcr.io/rust-cross/rust-musl-cross, tag aarch64-musl
             image: ghcr.io/rust-cross/rust-musl-cross@sha256:ecae5dd62d1c938c14f8071d36c16fa699860aace03bfb5284fb1216474d2643
-    env:
-      # The install check's two images, multi-platform as in the linux job.
-      # python, tag 3.10-alpine
-      FLOOR_IMAGE: python@sha256:8ca9f9d0f4df2af674092e7e9d79ce7985e783cecfe070f8ea850801b6520bf7
-      # python, tag 3.15-alpine
-      NEWEST_IMAGE: python@sha256:d44b1254cb92329418d164b22b20d86bbd3869d48e80e09e476531a409a728bb
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -503,11 +523,11 @@ jobs:
           cache-image: false
       - name: Install and import the built wheel on two interpreters
         # Runs in a musl container, because a musllinux wheel does not install
-        # on the glibc runner that builds it. The floor and the newest release
-        # bracket the abi3 claim. The import fails where `_engine` holds
-        # `_Pause`; see the header.
+        # on the glibc runner that builds it, in the workflow's two Alpine
+        # images. The floor and the newest release bracket the abi3 claim.
+        # The import fails where `_engine` holds `_Pause`; see the header.
         run: |
-          for image in "$FLOOR_IMAGE" "$NEWEST_IMAGE"; do
+          for image in "$FLOOR_IMAGE_ALPINE" "$NEWEST_IMAGE_ALPINE"; do
             docker run --rm --platform ${{ matrix.platform.docker-platform }} \
               --volume "${{ github.workspace }}/dist:/dist:ro" \
               "$image" \
@@ -802,6 +822,276 @@ jobs:
           fi
           "$RUNNER_TEMP/abi3audit/bin/abi3audit" --strict --verbose --assume-minimum-abi3 3.10 "${wheels[@]}"
 
+  # The Python suite on each manylinux wheel, on hardware of its processor
+  # with glibc, on the floor and the newest CPython. The environment is the
+  # one uv.lock names, as in ci.yml, and the wheel takes the place of the
+  # extension a ci.yml job builds. See the header.
+  linux-suite:
+    name: Run the suite on the manylinux wheel (${{ matrix.platform.target }}, ${{ matrix.python }})
+    needs: linux
+    runs-on: ${{ matrix.platform.runner }}
+    # As the Python jobs of ci.yml.
+    timeout-minutes: 30
+    strategy:
+      # Every leg reports, so one failure does not hide another's result.
+      fail-fast: false
+      matrix:
+        platform:
+          - runner: ubuntu-24.04
+            target: x86_64
+          - runner: ubuntu-24.04-arm
+            target: aarch64
+        python: [floor, newest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Download the wheel
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: wheels-linux-${{ matrix.platform.target }}
+          path: dist
+      - name: Download the digest its build recorded
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: digests-linux-${{ matrix.platform.target }}
+          path: digests
+      - name: Hold the wheel to its digest
+        # So the suite runs on the bytes the publish job verifies and uploads.
+        # The same text in every suite job, as in the builds' digest step.
+        shell: bash
+        env:
+          DIGEST_NAME: linux-${{ matrix.platform.target }}
+        run: |
+          set -euo pipefail
+          cd dist
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum --check --strict "../digests/SHA256SUMS-${DIGEST_NAME}"
+          else
+            shasum -a 256 --check --strict "../digests/SHA256SUMS-${DIGEST_NAME}"
+          fi
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: ${{ env.PINNED_UV_VERSION }}
+          checksum: ${{ matrix.platform.target == 'aarch64' && env.PINNED_UV_SHA256_LINUX_ARM64 || env.PINNED_UV_SHA256_LINUX }}
+          # The leg's build for its processor. The action sets UV_PYTHON to it
+          # for every later step.
+          python-version: ${{ matrix.platform.target == 'aarch64' && (matrix.python == 'floor' && env.FLOOR_CPYTHON_LINUX_ARM64 || env.NEWEST_CPYTHON_LINUX_ARM64) || (matrix.python == 'floor' && env.FLOOR_CPYTHON_LINUX || env.NEWEST_CPYTHON_LINUX) }}
+          enable-cache: false
+      - name: Install the locked environment without the project
+        run: uv sync --locked --extra dev --no-install-project
+      - name: Install the wheel
+        run: uv pip install --python .venv --no-index --no-deps dist/*.whl
+      - name: Check that the interpreter imports the wheel's extension
+        run: uv run --no-sync python .github/scripts/installed_engine.py
+      - name: Run the Python test suite
+        # The gate's suite, as ci.yml runs it on the release build.
+        run: uv run --no-sync pytest tests --ignore=tests/test_interpreter.py --ignore=tests/test_overlap.py
+
+  # The Python suite on each musllinux wheel, in the workflow's two Alpine
+  # images on the runner of the wheel's processor, so no emulator runs. The
+  # uv this workflow pins is linked against glibc and cannot run in Alpine,
+  # so uv writes the environment from uv.lock on the runner, with every
+  # locked hash and marker, and the image's pip installs it in the container
+  # from wheels alone. See the header.
+  musllinux-suite:
+    name: Run the suite on the musllinux wheel (${{ matrix.platform.target }}, ${{ matrix.python }})
+    needs: musllinux
+    runs-on: ${{ matrix.platform.runner }}
+    timeout-minutes: 30
+    strategy:
+      # Every leg reports, so one failure does not hide another's result.
+      fail-fast: false
+      matrix:
+        platform:
+          - runner: ubuntu-24.04
+            target: x86_64
+            docker-platform: linux/amd64
+          - runner: ubuntu-24.04-arm
+            target: aarch64
+            docker-platform: linux/arm64
+        python: [floor, newest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Download the wheel
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: wheels-musllinux-${{ matrix.platform.target }}
+          path: dist
+      - name: Download the digest its build recorded
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: digests-musllinux-${{ matrix.platform.target }}
+          path: digests
+      - name: Hold the wheel to its digest
+        # See linux-suite.
+        shell: bash
+        env:
+          DIGEST_NAME: musllinux-${{ matrix.platform.target }}
+        run: |
+          set -euo pipefail
+          cd dist
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum --check --strict "../digests/SHA256SUMS-${DIGEST_NAME}"
+          else
+            shasum -a 256 --check --strict "../digests/SHA256SUMS-${DIGEST_NAME}"
+          fi
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: ${{ env.PINNED_UV_VERSION }}
+          checksum: ${{ matrix.platform.target == 'aarch64' && env.PINNED_UV_SHA256_LINUX_ARM64 || env.PINNED_UV_SHA256_LINUX }}
+          # uv export needs an interpreter, so it is given the runner's newest
+          # build. The suite runs on the image's CPython.
+          python-version: ${{ matrix.platform.target == 'aarch64' && env.NEWEST_CPYTHON_LINUX_ARM64 || env.NEWEST_CPYTHON_LINUX }}
+          enable-cache: false
+      - name: Export the locked environment
+        # Every package of the dev extra and the project's dependencies, with
+        # its markers and every hash uv.lock records, and no project line.
+        run: uv export --locked --extra dev --no-emit-project --format requirements.txt --output-file "$RUNNER_TEMP/suite.txt"
+      - name: Run the Python test suite in the Alpine image
+        # As the runner's user and group, so every case runs and the checkout
+        # stays writable to its owner. pip takes wheels alone, holds each to
+        # its locked hash and installs no dependency the export does not
+        # name, so a package with no musl wheel fails the install rather than
+        # building from source.
+        env:
+          IMAGE: ${{ matrix.python == 'floor' && env.FLOOR_IMAGE_ALPINE || env.NEWEST_IMAGE_ALPINE }}
+          PLATFORM: ${{ matrix.platform.docker-platform }}
+        run: |
+          docker run --rm --interactive --platform "$PLATFORM" \
+            --user "$(id -u):$(id -g)" \
+            --env HOME=/tmp \
+            --env PIP_DISABLE_PIP_VERSION_CHECK=1 \
+            --volume "$GITHUB_WORKSPACE:/io" \
+            --volume "$RUNNER_TEMP/suite.txt:/suite.txt:ro" \
+            --workdir /io \
+            "$IMAGE" sh -eu <<'SUITE'
+          python -m venv /tmp/suite
+          /tmp/suite/bin/python -m pip install --require-hashes --only-binary :all: --no-deps -r /suite.txt
+          /tmp/suite/bin/python -m pip install --no-index --no-deps --find-links dist zeusdb-vector-database
+          /tmp/suite/bin/python .github/scripts/installed_engine.py
+          /tmp/suite/bin/python -m pytest tests --ignore=tests/test_interpreter.py --ignore=tests/test_overlap.py
+          SUITE
+
+  # The Python suite on the Windows wheel, on the image that builds it, on
+  # the floor and the newest CPython. Every step runs in bash, so each step's
+  # command is the Linux legs' command. See the header.
+  windows-suite:
+    name: Run the suite on the Windows wheel (${{ matrix.python }})
+    needs: windows
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 30
+    strategy:
+      # Every leg reports, so one failure does not hide another's result.
+      fail-fast: false
+      matrix:
+        python: [floor, newest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Download the wheel
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: wheels-windows-x64
+          path: dist
+      - name: Download the digest its build recorded
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: digests-windows-x64
+          path: digests
+      - name: Hold the wheel to its digest
+        # See linux-suite.
+        env:
+          DIGEST_NAME: windows-x64
+        run: |
+          set -euo pipefail
+          cd dist
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum --check --strict "../digests/SHA256SUMS-${DIGEST_NAME}"
+          else
+            shasum -a 256 --check --strict "../digests/SHA256SUMS-${DIGEST_NAME}"
+          fi
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: ${{ env.PINNED_UV_VERSION }}
+          checksum: ${{ env.PINNED_UV_SHA256_WINDOWS }}
+          # The leg's build. The action sets UV_PYTHON to it for every later
+          # step.
+          python-version: ${{ matrix.python == 'floor' && env.FLOOR_CPYTHON_WINDOWS || env.NEWEST_CPYTHON_WINDOWS }}
+          enable-cache: false
+      - name: Install the locked environment without the project
+        run: uv sync --locked --extra dev --no-install-project
+      - name: Install the wheel
+        run: uv pip install --python .venv --no-index --no-deps dist/*.whl
+      - name: Check that the interpreter imports the wheel's extension
+        run: uv run --no-sync python .github/scripts/installed_engine.py
+      - name: Run the Python test suite
+        # See linux-suite.
+        run: uv run --no-sync pytest tests --ignore=tests/test_interpreter.py --ignore=tests/test_overlap.py
+
+  # The Python suite on the macOS wheel, on the image that builds it, on the
+  # floor and the newest CPython. See the header.
+  macos-suite:
+    name: Run the suite on the macOS wheel (${{ matrix.python }})
+    needs: macos
+    runs-on: macos-15
+    timeout-minutes: 30
+    strategy:
+      # Every leg reports, so one failure does not hide another's result.
+      fail-fast: false
+      matrix:
+        python: [floor, newest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Download the wheel
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: wheels-macos-aarch64
+          path: dist
+      - name: Download the digest its build recorded
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: digests-macos-aarch64
+          path: digests
+      - name: Hold the wheel to its digest
+        # See linux-suite.
+        shell: bash
+        env:
+          DIGEST_NAME: macos-aarch64
+        run: |
+          set -euo pipefail
+          cd dist
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum --check --strict "../digests/SHA256SUMS-${DIGEST_NAME}"
+          else
+            shasum -a 256 --check --strict "../digests/SHA256SUMS-${DIGEST_NAME}"
+          fi
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: ${{ env.PINNED_UV_VERSION }}
+          checksum: ${{ env.PINNED_UV_SHA256_MACOS }}
+          # The leg's build. The action sets UV_PYTHON to it for every later
+          # step.
+          python-version: ${{ matrix.python == 'floor' && env.FLOOR_CPYTHON_MACOS || env.NEWEST_CPYTHON_MACOS }}
+          enable-cache: false
+      - name: Install the locked environment without the project
+        run: uv sync --locked --extra dev --no-install-project
+      - name: Install the wheel
+        run: uv pip install --python .venv --no-index --no-deps dist/*.whl
+      - name: Check that the interpreter imports the wheel's extension
+        run: uv run --no-sync python .github/scripts/installed_engine.py
+      - name: Run the Python test suite
+        # See linux-suite.
+        run: uv run --no-sync pytest tests --ignore=tests/test_interpreter.py --ignore=tests/test_overlap.py
+
   publish-pypi:
     name: Publish to PyPI
     runs-on: ubuntu-24.04
@@ -813,7 +1103,9 @@ jobs:
     if: >-
       ${{ github.event_name == 'push'
       && needs.check-version.outputs.prerelease == 'false' }}
-    needs: [check-version, linux, musllinux, windows, macos, sdist, audit]
+    # Every build, the audit and every suite job, so one failed suite leg
+    # stops every upload.
+    needs: [check-version, linux, musllinux, windows, macos, sdist, audit, linux-suite, musllinux-suite, windows-suite, macos-suite]
     permissions:
       # Use to sign the release artifacts
       id-token: write
