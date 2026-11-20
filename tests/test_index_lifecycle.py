@@ -274,10 +274,10 @@ def test_get_performance_info_reports_only_real_behaviour():
     }
     assert quantized_info["quantization_compression"] == "16.0x"
 
-    # The accuracy claim was "slight_recall_reduction". Measured on clustered
-    # data it is 0.16 at 10 against 1.00 unquantized, which rerank recovers and
-    # only quantized_with_raw can rerank, so the two modes now say different
-    # things and neither says slight.
+    # Product quantization scores against codes that approximate each vector,
+    # so its recall is below that of the same data unquantized. Only
+    # quantized_with_raw can rerank against the raw vectors, so the two modes
+    # report different impacts.
     assert quantized_info["quantization_accuracy_impact"] == (
         "large_recall_loss_no_rerank_available")
 

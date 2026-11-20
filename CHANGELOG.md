@@ -131,6 +131,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **The docstrings of `create()`, `load()`, `add()` and `recovery`** describe the bound on a sparse value and the read-only load of a directory past it.
 
+- **The README** gives the reranked search times and calibrated fetches that this release measures, the fetch that each measured dataset needs to reach the calibration's recall target, and where the rerank ceiling binds.
+
 ### Fixed
 
 - **`load()` refuses a journal whose segments follow another checkpoint of the same index**, with a `RuntimeError` naming both checkpoints, and replays none of it. A segment from another checkpoint that holds nothing past the directory's sequence is passed over, and deleted by a load that can write.

@@ -1409,28 +1409,19 @@ Measured resident, one index per interpreter, 50,000 records of real embeddings 
 
 **Quantized search is far less accurate than raw search, and `quantized_only` cannot be repaired by tuning.** ADC scores candidates against the codes, and a code discards most of the information in a vector. Rerank fixes this by over-fetching candidates and rescoring them against raw vectors, which is only possible when the raw vectors are still there.
 
-Measured on 6,000 clustered 128-dimensional vectors with 8 subvectors and 8 bits, recall at 10 against exact cosine search:
-
-| Configuration | Recall@10 |
-|---------------|-----------|
-| No quantization | 1.00 |
-| `quantized_only` | 0.16 |
-| `quantized_with_raw`, `rerank=0` | 0.15 |
-| `quantized_with_raw`, default rerank | 1.00 |
-
-The exact figures depend on your data, but the shape does not. If you need quantization and you need accuracy, use `quantized_with_raw` and leave rerank on.
+If you need quantization and you need accuracy, use `quantized_with_raw` and leave rerank on.
 
 **A product quantized `cosine` index ranks by the cosine distance to the reconstruction, and reports it.** A reconstruction is assembled from independently trained per-subspace centroids and nothing renormalises it, so it is not a unit vector even where the record it stands for was. Measured on 25,000 OpenAI `text-embedding-ada-002` vectors at `dim=1,536` with 48 subvectors and 8 bits, reconstructed norms ran 0.85 to 0.96 against a stored norm of 1.0.
 
 That matters because a quantized graph works from a table of squared L2 distances, and on those reconstructions the squared L2 ran at about 1.86 times the cosine distance rather than at exactly twice it. The gap is each record's own reconstruction length, which the index recovers from the codes, so the score you get back is the cosine distance and not a multiple of it. Ranking by cosine rather than by squared L2 also moves the page, and it measured better on every corpus and subvector count tried, by 0.0015 to 0.0518 of recall at 10 over 40,000 held-out queries each. A scalar `cosine` row carries the reciprocal of its decoded length beside its bytes, so a scalar index scores the cosine distance to the decoded vector at unit length and needs no such recovery.
 
-**How deep a search has to fetch to hold that recall depends on your data, not on the record count.** Measured on three real datasets at 100,000 records with the default `subvectors`, the fetch that reaches mean recall at 10 of 0.99:
+**How deep a search has to fetch to hold that recall depends on your data.** Measured on three real datasets with the default `subvectors`, the table gives the smallest fetch that reaches mean recall at 10 of 0.99. dbpedia-openai was measured at 49,000 records, and the other two at 100,000.
 
 | dataset | dim | compression | fetch for 0.99 | share of corpus |
 |---|---:|---:|---:|---:|
-| dbpedia-openai (ada-002) | 1,536 | 128x | 494 | 0.49% |
-| sift-128 | 128 | 64x | 426 | 0.43% |
-| glove-100 | 100 | 40x | 5,143 | 5.14% |
+| dbpedia-openai (ada-002) | 1,536 | 128x | 860 | 1.76% |
+| sift-128 | 128 | 64x | 450 | 0.45% |
+| glove-100 | 100 | 40x | 3,300 | 3.30% |
 
 No formula in the record count fits those three, so ZeusDB measures the fetch on your data instead. A `quantized_with_raw` index measures it when training completes, and scales what it measured with the record count and with the page size you ask for. `get_stats()["rerank_default_fetch"]` reports what a search at `top_k=10` will fetch on the index as it stands, after the ceiling below.
 
@@ -1448,7 +1439,7 @@ A page below ten fetches what a page of ten fetches, so pass `rerank` explicitly
 
 An index trained before the calibration existed, and any index loaded from a directory saved by one, carries no calibration and falls back to a fixed fetch of 2% of the record count, held under the same ceiling. `get_stats()["rerank_calibrated"]` reads `false` for it. Rebuild the index to calibrate it.
 
-**The default fetch is held under a ceiling.** The depth the calibration asks for at a page of ten is held under a tenth of the live records, with a floor of 1,500 candidates and an absolute ceiling of 25,000, and the page term scales what survives; a whole fetch never exceeds a quarter of the records. It exists because a calibrated fetch on data whose codes rank badly grows in proportion to the corpus, and every candidate is one exact distance over a full width vector. Measured at 100,000 records on the one dataset of three where it binds, glove-100, the ceiling shortened the fetch from 11,439 candidates to 10,000 for 0.0004 of recall at 10, and it changed nothing on the other two. An explicit `rerank` factor is not held under it. `get_stats()` reports the bound, the fetch performed and whether the bound changed it:
+**The default fetch is held under a ceiling.** The depth the calibration asks for at a page of ten is held under a tenth of the live records, with a floor of 1,500 candidates and an absolute ceiling of 25,000, and the page term scales what survives; a whole fetch never exceeds a quarter of the records. It exists because a calibrated fetch on data whose codes rank badly grows in proportion to the corpus, and every candidate is one exact distance over a full width vector. Measured at 10,000 to 100,000 records on three real datasets, it binds on none of them. On glove-100, whose request is the largest, the calibration asks for 6,569 candidates at 100,000 records against a ceiling of 10,000. An explicit `rerank` factor is not held under it. `get_stats()` reports the bound, the fetch performed and whether the bound changed it:
 
 ```python
 reranked = vdb.create("hnsw", dim=1536, expected_size=2500, quantization_config={
@@ -1469,18 +1460,18 @@ rerank_default_fetch 625
 rerank_fetch_capped true
 ```
 
-`rerank_requested_fetch` is what the calibration asked for, which on the uniform random vectors of this example exceeds the corpus, so the fetch performed is the quarter of the 2,500 records the whole-fetch bound allows and `rerank_fetch_capped` says so. On real embeddings the request sits under the ceiling on most data and the two figures agree.
+`rerank_requested_fetch` is what the calibration asked for, which on the uniform random vectors of this example exceeds the corpus, so the fetch performed is the quarter of the 2,500 records the whole-fetch bound allows and `rerank_fetch_capped` says so. On the three real datasets measured, the request sits under the ceiling and the two figures agree.
 
-**Above roughly 10,000 records a reranked quantized search is slower than an unquantized one, and the gap widens as the index grows.** That is the price of the default holding recall. On dbpedia-openai at `dim=1,536`, paired against an unquantized index over the same records, 200 queries one each in turn:
+**A reranked quantized search is faster than an unquantized one at 10,000 records, level with it at 25,000 and slower at 50,000, and the ratio rises with the record count.** That is the price of the default holding recall. On dbpedia-openai at `dim=1,536`, paired against an unquantized index over the same records, 200 queries one each in turn, at up to 50,000 records.
 
 | records | calibrated fetch | unquantized | quantized, default rerank | ratio |
 |---:|---:|---:|---:|---:|
-| 10,000 | 277 | 0.75 ms | 0.71 ms | 0.95 |
-| 25,000 | 411 | 0.79 ms | 0.97 ms | 1.23 |
-| 50,000 | 554 | 1.17 ms | 1.54 ms | 1.32 |
-| 100,000 | 747 | 1.18 ms | 2.12 ms | 1.79 |
+| 10,000 | 275 | 0.60 ms | 0.46 ms | 0.76 |
+| 25,000 | 411 | 0.66 ms | 0.64 ms | 0.97 |
+| 50,000 | 557 | 0.86 ms | 0.90 ms | 1.04 |
+| 100,000 | 754 | | | |
 
-Each row is one process building both indexes over the same records, so the ratio is the figure to read. Quantization remains a memory decision that costs query time. Lower `rerank` explicitly if query time matters more to you than recall, and measure what it costs you.
+Each row is one process holding both indexes over the same records, so the ratio is the figure to read. The times are at up to 50,000 records, and the row of 100,000 gives its calibrated fetch alone. Quantization remains a memory decision, and above about 25,000 records it costs query time. Lower `rerank` explicitly if query time matters more to you than recall, and measure what it costs you.
 
 **`ef_search` does nothing on a reranked quantized search.** The graph traversal widens to the number of candidates the fetch asks for, which is already wider than any `ef_search` a caller is likely to set, and setting it smaller is discarded. Change `rerank` instead. On an unquantized search, and on a quantized search with `rerank=0`, `ef_search` applies normally.
 
@@ -1488,7 +1479,7 @@ Each row is one process building both indexes over the same records, so the rati
 
 - **Training**: happens once, on the `add()` call that reaches `training_size`. That call takes noticeably longer than the others. On `quantized_with_raw` it also calibrates the rerank fetch, which `get_stats()["rerank_calibration_ms"]` prices.
 - **Memory**: a record's code is `subvectors` bytes against `dim × 4` for a raw vector, and a raw vector is held once. `quantized_only` saves and `quantized_with_raw` costs. The table in Storage modes prices both, and a scalar row of `dim` bytes, at `dim=100`, `dim=128` and `dim=1,536`.
-- **Search speed**: an unreranked quantized search is faster than a raw search. A reranked one is slower above roughly 10,000 records, and the table above prices it.
+- **Search speed**: an unreranked quantized search is faster than a raw search. A reranked one is slower above about 25,000 records, and the table above prices it.
 - **Build speed**: a quantized build is faster than an unquantized one, and it slows as `subvectors` rises. At 100,000 records of `dim=768` it is 137 s against 231 s at the default `subvectors`.
 - **Accuracy**: see the tables above. Treat quantization as a memory decision that costs accuracy and query time, not as a free win.
 

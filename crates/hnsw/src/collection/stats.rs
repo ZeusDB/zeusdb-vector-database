@@ -1161,13 +1161,13 @@ impl Collection {
                 "quantization_compression".to_string(),
                 format!("{:.1}x", compression_ratio),
             );
-            // Measured at 0.16 recall at 10 against 1.00 for the same data
-            // unquantized, so "slight" was wrong by a factor the word cannot
-            // carry. Only QuantizedWithRaw can rerank, so the two modes get
-            // different answers. Rerank recovers most of the loss rather than
-            // all of it, and how much depends on the fetch depth, which is why
-            // the default fetch is derived from the live record count rather
-            // than fixed; see `DEFAULT_RERANK_CORPUS_DIVISOR`.
+            // Product quantization scores against codes that approximate each
+            // vector, so its recall is below that of the same data unquantized.
+            // Only QuantizedWithRaw can rerank, so the two modes get
+            // different answers. How much of the loss rerank recovers depends
+            // on the fetch depth, which is why the default fetch is derived
+            // from the live record count rather than fixed; see
+            // `DEFAULT_RERANK_CORPUS_DIVISOR`.
             // A scalar graph measured between 0.006 and 0.018 of recall at 10
             // below a raw graph at 100,000 records on three corpora, with no
             // rerank to recover it and none needed.
