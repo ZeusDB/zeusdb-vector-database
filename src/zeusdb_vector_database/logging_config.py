@@ -111,8 +111,7 @@ def _detect_environment() -> str:
 # `ignoring zeusdb_vector_database=warning` line on stderr and no filtering.
 #
 # This is the Python half of the table. `canonical_level` in bindings/python/src/
-# logging.rs is the Rust half, and it accepts the same spellings, so the Rust
-# side is right on its own for a caller who has disabled the auto-configuration.
+# logging.rs is the Rust half, and it accepts the same spellings.
 _LEVEL_ALIASES = {
     'WARN': 'WARNING',
     'WARNING': 'WARNING',
@@ -276,8 +275,8 @@ def _configure_rust_logging(config: Dict[str, Any]) -> None:
     # Rust side reads. That spelling need not be one `EnvFilter` accepts, and
     # `warning` is exactly the case that used to break: the filter refused it,
     # printed `ignoring zeusdb_vector_database=warning` and then filtered
-    # nothing. `canonical_level` in bindings/python/src/logging.rs resolves it there
-    # instead, which also covers a caller who has disabled this module.
+    # nothing. `canonical_level` in bindings/python/src/logging.rs resolves it
+    # there instead.
     #
     # Overwriting it here would work for that case and break another: this
     # function is idempotent only if what it writes is what it would read back,

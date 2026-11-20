@@ -23,9 +23,9 @@ sample so the fetch can be scaled to a corpus larger than the one it was
 measured on. It is also taken at pages of 1, 10 and 100, because the hundredth
 true neighbour sits deeper than the tenth, and a search interpolates between
 those three for whatever page you ask for. This file runs at dimension 64, where
-`create()` warns that quantization removes only a few percent of what an
-unquantized index holds. That warning is the point of the file rather than a
-problem with it.
+`create()` warns that quantization holds more than an unquantized index at
+this record count. That warning is the point of the file rather than a problem
+with it.
 
 The short version, which the numbers below reproduce every run. Use
 `quantized_with_raw` and leave rerank on, or do not quantize.

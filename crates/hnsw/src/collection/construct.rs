@@ -49,30 +49,15 @@ pub(crate) const MAX_DIM: usize = 65_536;
 
 /// Largest `expected_size` a caller may declare.
 ///
-/// `expected_size` reaches `PointIndexation::new` in the vendored graph crate,
-/// which reserves capacity for it across the 16 layers at creation. Since the
-/// layer reservation was corrected the reservation is one `Arc` slot per
-/// declared record, measured at 8.02 bytes per declared record and flat across
-/// declarations of 10 million through 4 billion. This bound therefore caps the
-/// creation-time reservation at 764 MB, which was measured rather than derived.
+/// `validate_index_parameters` refuses a larger one, from `create()`, from
+/// `rebuild()` and from a `config.json`. Every reservation an index takes from
+/// `expected_size` at creation is capped whatever the declaration: the graph's
+/// and the dense index's by `RESERVE_BYTES`, and the id store's, the metadata
+/// store's and the columns' by their own `RESERVE_CAP`.
 ///
-/// The bound exists because the reservation is not fallible. `Vec::with_capacity`
-/// aborts the process on allocation failure rather than unwinding, so a
-/// declaration too large for the machine cannot be turned into a Python
-/// exception after the fact. A declared 20 billion asks for 155 GB in the layer
-/// zero reservation alone and the process dies with no traceback. Making that
-/// path fallible means `try_reserve` inside the vendored crate, which is not a
-/// change this package makes.
-///
-/// One hundred million is far above anything this index holds. A real 100,000
-/// record build at 768 dimensions measured 10,617 bytes per record, so a hundred
-/// million records is roughly a terabyte of process memory for the data alone.
-/// Declaring less than the truth is safe, because a layer that receives more
-/// points than reserved grows through the ordinary `Vec::push` path, so capping
-/// the declaration costs a caller nothing it can observe.
-///
-/// The bound is not a guarantee. A machine whose commit limit is below the
-/// reservation can still abort at a declaration under it.
+/// Declaring less than the truth is safe, because a structure that receives
+/// more records than it reserved grows geometrically, so capping the
+/// declaration costs a caller nothing it can observe.
 const MAX_EXPECTED_SIZE: usize = 100_000_000;
 
 /// Largest `ef_construction` a caller may declare, and the largest a saved
@@ -100,9 +85,7 @@ const MAX_EXPECTED_SIZE: usize = 100_000_000;
 ///
 /// What it costs at the ceiling, measured on 20,000 records of 64
 /// dimensions. 2.28 s to build at 200 and 30.0 s at 4,096, thirteen times the
-/// default, against 47.4 s at 8,192. The README's 50,000 record build of
-/// 1,536 dimensions, linear above 100 at 0.31 s per unit of width, would run
-/// about 21 minutes at the ceiling. At the ceiling the two heaps are 64 KiB,
+/// default, against 47.4 s at 8,192. At the ceiling the two heaps are 64 KiB,
 /// which is an allocation the process can refuse rather than one it dies on.
 pub(crate) const MAX_EF_CONSTRUCTION: usize = 4_096;
 

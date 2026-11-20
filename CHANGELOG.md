@@ -327,7 +327,7 @@ Every directory this release saves declares format version 5.0.0 and lists its f
 
 ### Unchanged, and verified
 
-The format is unchanged at 4.0.0, and a save writes the same bytes for the same records. Across the change, 43,200 result pages over 24 index configurations are identical, and the crash tests give the same result at all 171 of their points.
+The format is unchanged at 4.0.0, and a save writes the same bytes for the same records. Across the change, 43,200 result pages over 16 index configurations are identical, and the crash tests give the same result at all 171 of their points.
 
 ## [0.12.0] - 2026-10-03
 
@@ -663,7 +663,7 @@ This release repairs the index graph. Search results change on upgrade for every
 
 - Quantized search returned meaningless results in every release that offered it. The graph of a quantized index was built on distances that all evaluated as infinite, so its structure carried no information about the data. Measured at 10,000 records of dimension 768 at `top_k` 10, recall against exact search was 0.0035 where an unquantized index reached 0.9995, and a large result request returned 34 results out of 1,000 asked for. The graph is now built on real distances between codes and reranked against raw vectors where they are stored. Upgrading fixes this. A quantized directory saved by an earlier release is rebuilt on load with the corrected construction, so loading it once and saving it again persists the repaired graph.
 - Between 1 and 2 percent of records were unreachable by any query, including a search for the record's own vector, measured at 1,000 and 10,000 points. Two graph construction defects caused this, one assigning reverse links to the wrong layers and one evicting a point's last inbound link. Both are fixed. Newly built graphs no longer strand records, and a directory saved by an earlier release gets the corrected construction when its graph is rebuilt on load.
-- A deleted or overwritten record kept its node in the graph, where it consumed result slots and degraded search results as churn accumulated. Removed records are now excluded from traversal, and `compact()` rebuilds the graph to reclaim the stranded nodes when their memory matters.
+- A deleted or overwritten record kept its node in the graph, where it consumed result slots and degraded search results as churn accumulated. Removed records are now excluded from results, and `compact()` rebuilds the graph to reclaim the stranded nodes when their memory matters.
 - Loading a `quantized_only` directory dropped every record added after training, and restored the codebook as all zeroes, so quantized distances after a reload were meaningless. Both are fixed. A directory saved once by an earlier release recovers in full when loaded under this release. A directory that an earlier release loaded and then saved again lost those records permanently, and no upgrade can recover them.
 - A quantized index came back from `load()` in a degraded state that kept full-width vectors in memory. It now loads back as quantized and the memory saving survives the reload.
 - Creating an index reserved graph capacity for hundreds of neighbours per expected record. It now reserves one slot per record, and memory at creation drops accordingly.
@@ -1032,7 +1032,6 @@ were actually validating that cosine normalization was properly implemented.
   - Self-updating error messages showing all available index types
   - Supports case-insensitive index types (e.g. "HNSW" and "hnsw")
 - **`available_index_types()`** class method for programmatic type discovery
-- Future-ready architecture for IVF, LSH, Annoy, and Flat index types
 
 ### Changed
 - ⚠️ **Breaking Change**: Replaced index-specific factory methods with generic `create()`
@@ -1051,7 +1050,7 @@ were actually validating that cosine normalization was properly implemented.
 ## [0.0.9] - 2025-07-10
 
 ### Added
-- `search()` is a more accurate and industry-standard term for vector similarity retrieval.
+- `search()` for vector similarity retrieval.
 
 ### Changed
 - ⚠️ Breaking Changes - Renamed `HNSWIndex.query()` → `HNSWIndex.search()` to better reflect its role as a k-nearest neighbor (KNN) similarity search method.

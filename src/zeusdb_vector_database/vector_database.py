@@ -78,11 +78,11 @@ class VectorDatabase:
     def _warn_if_selection_disabled(m: Any, ef_construction: Any) -> None:
         """Warn where ef_construction switches the neighbour selection heuristic off.
 
-        `select_neighbours` in the vendored crate opens with
-        `if candidates.len() <= nb_neighbours_asked`, and with
-        `extend_candidates` false it copies every candidate into the neighbour
-        list and returns from inside that branch. The budget is `2 * m` at
-        layer zero and `m` above it, both set at `hnsw.rs:1270` to `:1278`.
+        `select_neighbours` in `crates/core/src/graph/mutable/insert.rs` opens
+        with `if candidates.len() <= nb_neighbours_asked`, and in that branch it
+        copies every candidate into the neighbour list and returns. The budget
+        is `2 * m` at layer zero and `m` above it, both set in `plan` in the
+        same file.
 
         The candidate list is exactly `ef_construction` long once the index
         holds more records than that, which is a property of `search_layer`
@@ -222,13 +222,12 @@ class VectorDatabase:
                   insertion runs (default: 200, max: 4,096). It sets the supply the
                   neighbour selection draws from, and m sets how much of it is
                   kept, so it changes neither search latency nor the size of
-                  the finished index. Build time is linear in it above 100: at
-                  50,000 records of 1,536 dimensions, 62.7s, 131.2s, 262.8s and
-                  464.9s at 100, 200, 400 and 800. Recall at 10 plateaus at 100
-                  on SIFT and at 200 on OpenAI embeddings, and on GloVe raising
-                  ef_search on the graph already built buys more than raising
-                  this. The neighbour selection heuristic runs only while this
-                  is above 2 * m, and create() warns where it is not.
+                  the finished index. Build time is linear in it above 100.
+                  Recall at 10 plateaus at 100 on SIFT and at 200 on OpenAI
+                  embeddings, and on GloVe raising ef_search on the graph
+                  already built buys more than raising this. The neighbour
+                  selection heuristic runs only while this is above 2 * m, and
+                  create() warns where it is not.
                   index.rebuild(ef_construction=...) changes it afterwards, at
                   the cost of a full rebuild.
                 - expected_size (int): Expected number of vectors (default: 10000,

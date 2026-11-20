@@ -2439,18 +2439,20 @@ impl Collection {
 
     /// Live records matching a filter, or every live record when none is given.
     ///
-    /// **Exact, and therefore a complete walk.** With a filter this evaluates
-    /// every record's metadata and counts the matches. It cannot stop early:
+    /// **Exact.** Where every field the filter names is declared, this counts
+    /// the bits of the columns' selection. Where some are, it judges the
+    /// metadata of the records the declared fields leave, and where none are,
+    /// the metadata of every record. It cannot stop early:
     /// a count is a statement about the whole index, so the first record it
     /// skipped would make the answer a lower bound rather than a count.
-    /// `scan_candidates` stops at `FULL_SCAN_THRESHOLD` because a search only
+    /// `admit_plan` stops at `FULL_SCAN_THRESHOLD` because a search only
     /// needs to know whether the matching set is small enough to rank directly,
     /// which is a question an early exit answers and this one is not.
     ///
     /// The filter arrives compiled, so nothing here can fail on it and there is
-    /// no error channel, which is the argument `Filtered::judge` makes for the
-    /// search path. A filter matching every record is one map length, as is no
-    /// filter at all.
+    /// no error channel, which is the argument `MetadataAdmit::judge` makes for
+    /// the search path. A filter matching every record is one map length, as is
+    /// no filter at all.
     pub fn count(&self, filter: Option<&Filter>) -> usize {
         let Some(conditions) = filter else {
             return self.ids.read().unwrap().len();

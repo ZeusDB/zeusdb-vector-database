@@ -249,7 +249,7 @@ def main():
     print("not (brand == acme) finds it:",
           "item_no_brand" in [h["id"] for h in hits({"$not": {"brand": "acme"}}, top_k=5)])
 
-    # And the filter for a missing field, which no operator can express.
+    # And the filter for a missing field.
     # `{"all": []}` is the empty conjunction, so it holds for every value the
     # field can carry and fails only where the field is absent.
     no_brand = {"$not": {"brand": {"all": []}}}

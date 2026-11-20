@@ -24,7 +24,7 @@ DAYS = 7
 
 
 def report(label, index):
-    """graph_nodes minus stranded_graph_nodes is what search actually walks."""
+    """graph_nodes is what search walks, stranded_graph_nodes among them."""
     stats = index.get_stats()
     print(
         f"  {label:<22s} records {stats['total_vectors']:>5s}   "

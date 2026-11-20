@@ -1198,22 +1198,6 @@ impl Collection {
     /// order, closing the positions up, and drop the old graph once every
     /// guard is let go.
     ///
-    /// The paths that replace the whole backend, `compact`, `rebuild`, both
-    /// training transitions and the persistence rebuilds, all used to write
-    /// `*hnsw_guard = new_hnsw` directly. That assignment drops the old graph
-    /// while the write guard is still held, and dropping a graph is not a quiet
-    /// operation. `PointIndexation::drop` in the vendored crate clears each
-    /// layer with `into_par_iter().for_each(...)`, so the drop forks to rayon.
-    ///
-    /// A rayon fork under the graph's write guard deadlocks whenever the pool is
-    /// occupied by search tasks. `batch_search_parallel` fans a batch of more
-    /// than five queries across the pool and each task takes a read guard, so
-    /// once a writer is queued every worker blocks behind it. The fork then has
-    /// no worker to run on and the writer never reaches the point of releasing.
-    /// The rule is that no path forks to rayon while holding a write guard, and
-    /// this is a fork that rule is easy to miss on, because it is hidden inside
-    /// an assignment rather than written as a call.
-    ///
     /// The close-up builds the replacement's numbering and every other
     /// structure off to the side and trades them in under the guards, so the
     /// swap is a set of moves and the old graph goes out with the parts it
@@ -2687,7 +2671,7 @@ impl Collection {
     fn add_raw_vector(
         &self,
         id: &str,
-        vector: Vec<f32>, // Already processed by extract_single_vector
+        vector: Vec<f32>, // Already processed
         metadata: HashMap<String, Value>,
         internal_id: usize,
         level: usize,

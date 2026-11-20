@@ -1219,7 +1219,7 @@ impl Collection {
         // this measured the traversal a query of norm sqrt(dim / 3) takes,
         // which is not the traversal a caller's query takes. `raw_search_no_gil`
         // is the one search path that does not process its own input, because
-        // every other one is fed from `validate_and_process_query_vector` or
+        // every other one is fed from `validate_query` or
         // `process_vector_for_space`.
         let queries: Vec<Vec<f32>> = (0..query_count)
             .map(|_| {

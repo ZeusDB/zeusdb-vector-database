@@ -318,7 +318,7 @@ fn load_index_body(
 #[pymodule(name = "_engine")]
 fn engine(py: Python, m: &Bound<pyo3::types::PyModule>) -> PyResult<()> {
     // Auto-initialize logging on module import
-    // Respects ZEUSDB_DISABLE_AUTOLOG for power users
+    // Respects ZEUSDB_DISABLE_AUTO_LOGGING for power users
     logging::init_logging();
 
     // Core classes. Neither carries a `#[new]`, so both are importable for

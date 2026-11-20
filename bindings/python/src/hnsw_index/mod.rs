@@ -1218,9 +1218,10 @@ impl HNSWIndex {
     /// they differ in what an operating system crash or a power loss costs.
     ///
     /// - `"call"`, the default: every record of a call is on the device before
-    ///   the call returns, or the call raised. One flush per call, about a
-    ///   millisecond, which a caller adding in batches does not notice and a
-    ///   caller adding one record at a time pays on every record.
+    ///   the call returns, or the call reported or raised the failure. One
+    ///   flush per call, about a millisecond, which a caller adding in batches
+    ///   does not notice and a caller adding one record at a time pays on
+    ///   every record.
     /// - `"interval"`: every record is in the kernel when the call returns, and
     ///   a thread of the index's own flushes the file within `interval_ms`
     ///   milliseconds, 10 by default, of the first call that dirtied it. The

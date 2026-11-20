@@ -61,9 +61,9 @@ impl DenseSpace {
         }
     }
 
-    /// Helper for query processing (mirrors extract_single_vector validation)
+    /// Helper for query processing (mirrors extract_single_vector_safe validation)
     pub(super) fn validate_query(&self, vector: Vec<f32>) -> Result<Vec<f32>, Error> {
-        // Same validation as extract_single_vector
+        // Same validation as extract_single_vector_safe
         if vector.is_empty() {
             error!(
                 target: LOG_TARGET,

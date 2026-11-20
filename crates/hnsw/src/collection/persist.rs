@@ -1592,7 +1592,7 @@ impl Collection {
     /// and two rebuilds of one directory are one graph.
     ///
     /// What is reproduced exactly from the path this replaced is
-    /// `extract_single_vector`'s validation and its call to
+    /// `extract_single_vector_safe`'s validation and its call to
     /// `process_vector_for_space`. A stored vector is already normalized for
     /// a cosine index, and normalizing it a second time is what `add` did, so
     /// it is what this does. Skipping it would build a different graph, which
