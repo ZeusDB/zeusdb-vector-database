@@ -57,11 +57,8 @@ class VectorDatabase:
 
         The ladder stops at 32 because that is where the measurements stop. At
         100,000 records m 64 bought 0.0060 recall over m 32 for 1.55x the build
-        time, and it raises the capacity the graph reserves at creation from
-        3,787 to 4,542 bytes per declared record, which matters most to exactly
-        the large indexes a third step would be aimed at. An index well past
-        250,000 records may want 64, but nothing here measured that, so it is
-        left to the caller rather than guessed at.
+        time. An index well past 250,000 records may want 64, but nothing here
+        measured that, so it is left to the caller rather than guessed at.
 
         expected_size is a declaration rather than a limit, so understating it
         leaves the graph under-provisioned for the data that actually arrives.

@@ -507,9 +507,7 @@ def test_default_m_scales_with_expected_size(expected_size, expected_m):
     scale, and expected_size is the size the user already declares.
 
     The expression is checked directly rather than through create() for every
-    size, because the graph reserves about 3KB of capacity per declared record
-    at creation, so building an index at the larger sizes here would commit
-    tens of gigabytes. The sizes that are built are checked below.
+    size. The sizes that are built are checked below.
     """
     assert VectorDatabase._default_m(expected_size) == expected_m
 

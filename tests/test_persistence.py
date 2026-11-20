@@ -1166,8 +1166,7 @@ def test_load_validates_the_declaration_in_config_json(tmp_path):
                        match=r"config\.json: m must be less than or equal to 256, got 300"):
         vdb.load(corrupted("m300.zdb", "m", 300))
 
-    # An expected_size above the cap, which create() refuses because the layer
-    # reservation is not fallible.
+    # An expected_size above the cap, which create() refuses.
     with pytest.raises(ValueError,
                        match=r"config\.json: expected_size must be at most 100000000"):
         vdb.load(corrupted("esbig.zdb", "expected_size", 200_000_000))

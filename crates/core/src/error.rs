@@ -11,9 +11,8 @@
 //! select a phrase from a field, count and pluralise, or truncate a list, and
 //! a hand written arm keeps that in the one place the message lives.
 //!
-//! The messages are the ones the engine has always raised, byte for byte. A
-//! message that reads badly is kept as it is; changing one is a change to what
-//! a caller sees and is made on its own.
+//! A message that reads badly is kept as it is; changing one is a change to
+//! what a caller sees and is made on its own.
 
 use std::fmt;
 use std::path::PathBuf;
@@ -1039,22 +1038,9 @@ impl fmt::Display for Error {
             ),
             ExpectedSizeTooLarge { source, value, max } => write!(
                 f,
-                "{}expected_size must be at most {}, got {}. The graph reserves one \
- slot per \
-                 declared record at creation, 8 bytes each, so this \
- declaration would ask for \
-                 {:.1} GB before a single record is \
- added. That allocation is not fallible: \
-                 above this bound the \
- process aborts rather than raising. expected_size is a \
-                 capacity \
- hint and not a limit, and under-declaring only costs some \
- \
-                 reallocation, so declare what you expect to hold.",
-                source,
-                max,
-                value,
-                (*value as f64 * 8.0) / 1_000_000_000.0
+                "{}expected_size must be at most {}, got {}. An index accepts more \
+                 records than its expected_size declares.",
+                source, max, value
             ),
             MBelowMinimum { source, m } => write!(
                 f,
