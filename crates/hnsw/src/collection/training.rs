@@ -1,6 +1,6 @@
 //! Quantizer training, and the graph rebuild that follows it.
 //!
-//! Training fires once, on the `add` that reaches `training_size`, once the
+//! Training fires on the `add` that reaches `training_size`, once the
 //! segment holding that record has committed and installed. It fits the
 //! codebook or the scales, measures the rerank fetch on the sample it has
 //! just fitted to where the storage mode reranks, hands the training's record
@@ -864,9 +864,9 @@ impl Collection {
     ///
     /// Re-encodes whatever raw vectors the index still holds through the
     /// trained codebook and rebuilds the graph from the stored codes. It never
-    /// retrains the codebook; training runs exactly once, on the `add` that
-    /// reaches `training_size`. Returns false when there is no trained
-    /// quantizer or nothing stored to rebuild from. Takes the mutation guard,
+    /// retrains the codebook. Returns false when there is no trained
+    /// quantizer, or when a product quantized collection holds nothing to
+    /// rebuild from. Takes the mutation guard,
     /// which the training path already holds when it reaches the body, and
     /// hands the record over before the body runs, whether or not the body
     /// turns out to rebuild, since a replay of the record decides that the

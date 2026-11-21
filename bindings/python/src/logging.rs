@@ -7,7 +7,8 @@
 //!
 //! - **Global and immutable**: After any initialization (auto or manual), the logging
 //!   configuration is process-global and cannot be changed. Subsequent `init_*` calls
-//!   will return `False` and have no effect.
+//!   will return `False` and have no effect, or raise `ValueError` for a level they
+//!   cannot read.
 //! - **File target**: `ZEUSDB_LOG_FILE` names the file that is written, exactly as
 //!   given (e.g. `app.log` writes `app.log`). Set `ZEUSDB_LOG_ROTATION=daily` to
 //!   bound disk growth, which appends a date (`app.log.2026-08-03`). The resolved
@@ -334,9 +335,11 @@ fn requested_filter(call: &str, level: Option<&str>) -> PyResult<EnvFilter> {
 
 /// Python-exposed logging initialization (JSON to console)
 ///
-/// Returns true if initialization occurred, false if already initialized.
+/// Returns true if initialization occurred, false if already initialized,
+/// and raises ValueError for a level it cannot read.
 /// Forces JSON to stdout regardless of ZEUSDB_LOG_TARGET; use env vars for other formats.
-/// `level` left out or `None` is `info`, under a `RUST_LOG` that takes precedence.
+/// `level` left out or `None` is `info`, under a `RUST_LOG` that takes precedence
+/// where it parses.
 #[pyfunction(name = "init_logging")]
 #[pyo3(signature = (level = None))]
 pub fn py_init_logging(level: Option<String>) -> PyResult<bool> {
@@ -367,9 +370,11 @@ pub fn py_init_logging(level: Option<String>) -> PyResult<bool> {
 
 /// Python-exposed file logging initialization (JSON to rotating files)
 ///
-/// Returns true if initialization occurred, false if already initialized.
+/// Returns true if initialization occurred, false if already initialized,
+/// and raises ValueError for an empty `log_dir` or a level it cannot read.
 /// `level` left out or `None` is `info`, under a `RUST_LOG` that takes
-/// precedence, and `file_prefix` left out or `None` is `zeusdb`.
+/// precedence where it parses, and `file_prefix` left out or `None` is
+/// `zeusdb`.
 #[pyfunction(name = "init_file_logging")]
 #[pyo3(signature = (log_dir, level = None, file_prefix = None))]
 pub fn py_init_file_logging(
@@ -435,7 +440,6 @@ pub fn py_init_file_logging(
 /// Check if logging has been initialized
 ///
 /// Returns true if logging initialization has occurred (either auto or manual).
-/// Useful for determining whether to set ZEUSDB_DISABLE_AUTO_LOGGING or not.
 #[pyfunction]
 pub fn is_logging_initialized() -> bool {
     INIT.is_completed()

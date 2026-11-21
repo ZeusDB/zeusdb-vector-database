@@ -27,8 +27,6 @@ use zeusdb_vector_core::{CodeKernel, PqMetric, PQ};
 ///
 /// The depth is the cluster size in records and it is not a share of anything.
 ///
-/// The fetch is the largest of three terms, capped at the live record count.
-///
 /// `DEFAULT_RERANK_CORPUS_DIVISOR` is the corpus term. It is a bound rather
 /// than a law, because how a corpus's indistinguishable groups grow with the
 /// record count is a property of the corpus and no index measurement settles
@@ -74,10 +72,6 @@ use zeusdb_vector_core::{CodeKernel, PqMetric, PQ};
 /// served by a traversal narrower than F. That is a property of the algorithm
 /// rather than a choice, and it is why an `ef_search` below the fetch is
 /// discarded.
-///
-/// A traversal wider than the fetch buys nothing, because the candidates a
-/// fetch returns are limited by the ADC ordering rather than by the traversal.
-/// It costs query time in every case.
 ///
 /// A lower compression ratio mostly does not buy query time either. It puts
 /// the true neighbours shallower, so the fetch shrinks, and it lengthens the
@@ -1093,16 +1087,13 @@ impl SearchParams {
     /// Candidates to ask the graph for
     ///
     /// The requested page unless the page is going to be reordered, and the
-    /// over-fetch capped at the live record count when it is. The cap means a
-    /// large factor degrades to a full scan rather than to an allocation the
-    /// size of the factor, and it is also what keeps the default from
-    /// over-fetching more than a small index holds.
+    /// over-fetch capped at the larger of the live record count and the page
+    /// when it is. The cap means a large factor degrades to a full scan rather
+    /// than to an allocation the size of the factor, and it is also what keeps
+    /// the default from over-fetching more than a small index holds.
     ///
-    /// A caller's own factor is a multiple of the page, unchanged. An unset
-    /// factor takes what training measured on this index's own data, scaled to
-    /// the live record count; see `RerankCalibration`. Where there is no
-    /// calibration it takes the largest of the corpus term, the floor and the
-    /// page term, for the reasons recorded on those three constants.
+    /// A caller's own factor is a multiple of the page, under the cap. An unset
+    /// factor takes `default_rerank_fetch`.
     pub fn fetch_k(&self, live_records: usize) -> usize {
         match self.rerank {
             Some(plan) => match plan.factor {
@@ -1137,8 +1128,7 @@ impl SearchParams {
 /// differ.
 ///
 /// **A caller's own `rerank` factor does not come through here.** The ceiling
-/// bounds the default and nothing else, so an explicit factor still asks for
-/// exactly what it names; see `SearchParams::fetch_k`.
+/// bounds the default and nothing else; see `SearchParams::fetch_k`.
 pub fn default_rerank_fetch(
     calibration: Option<RerankCalibration>,
     live_records: usize,

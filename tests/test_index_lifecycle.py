@@ -715,7 +715,7 @@ def test_the_factory_docstrings_say_what_it_raises():
     assert "held to their rules by the Rust constructor" in fields_doc
     from zeusdb_vector_database import _engine
     assert "load(path, tokenizer=None)" not in _engine._load_index.__doc__
-    assert "ZEUSDB_DISABLE_AUTO_LOGGING" in _engine.is_logging_initialized.__doc__
+    assert "Useful for determining whether to set" not in _engine.is_logging_initialized.__doc__
 
 
 # ------------------------------------------------------------

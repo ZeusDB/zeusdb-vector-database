@@ -11,8 +11,9 @@
 //! the directory read only, meaning a build without the feature reads every
 //! record correctly and a directory it wrote would not hold the feature, so
 //! the collection refuses every change, every save, a checkpoint, a journal
-//! and a backup. Any other mark, `incompatible` among them, is refused,
-//! naming the feature. The marks are read at every major.
+//! and a backup, and a replay that meets a record of a kind the build does
+//! not know refuses the load. Any other mark, `incompatible` among them, is
+//! refused, naming the feature. The marks are read at every major.
 //!
 //! | Name | Mark | Listed where |
 //! | --- | --- | --- |

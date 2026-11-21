@@ -95,7 +95,7 @@ class VectorDatabase:
 
     @staticmethod
     def _warn_if_selection_disabled(m: Any, ef_construction: Any) -> None:
-        """Warn where ef_construction switches the neighbour selection heuristic off.
+        """Warn where ef_construction switches the neighbour selection heuristic off at layer zero.
 
         `select_neighbours` in `crates/core/src/graph/mutable/insert.rs` opens
         with `if candidates.len() <= nb_neighbours_asked`, and in that branch it
@@ -229,7 +229,8 @@ class VectorDatabase:
                   0.017 and 0.039 of recall at 10 below a raw index under
                   'dot' and 'l1', against 0.006 to 0.018 under 'cosine' and
                   'l2'.
-                - m (int): Bidirectional links per node (min: 2, max: 256). Defaults
+                - m (int): The most links a node keeps per layer, twice that at
+                  layer zero (min: 2, max: 256). Defaults
                   to 16 up to an expected_size of 25,000 and 32 above it. A graph
                   too sparse for the record count loses recall that no search
                   width recovers and no add() revises m, so set expected_size
@@ -239,20 +240,18 @@ class VectorDatabase:
                   degenerate.
                 - ef_construction (int): Width of the candidate search each
                   insertion runs (default: 200, max: 4,096). It sets the supply the
-                  neighbour selection draws from, and m sets how much of it is
-                  kept, so it changes neither search latency nor the size of
-                  the finished index. Build time is linear in it above 100.
+                  neighbour selection draws from, and m caps how much of it is
+                  kept. Build time is linear in it above 100.
                   Recall at 10 plateaus at 100 on SIFT and at 200 on OpenAI
                   embeddings, and on GloVe raising ef_search on the graph
-                  already built buys more than raising this. The neighbour
-                  selection heuristic runs only while this is above 2 * m, and
-                  create() warns where it is not.
+                  already built buys more than raising this. create() warns
+                  where this is at or below 2 * m.
                   index.rebuild(ef_construction=...) changes it afterwards, at
                   the cost of a full rebuild.
                 - expected_size (int): Expected number of vectors (default: 10000,
                   max: 100,000,000). Also selects the default m, see above. It is
                   a capacity hint rather than a limit, and an index that grows
-                  past twice its declaration logs a warning once.
+                  past twice its declaration logs a warning.
                 - indexed_fields (list[str]): Metadata fields this index builds a
                   column for, so that a search filtering on them does not have to
                   read every record. Empty by default, which is what every index
@@ -301,10 +300,9 @@ class VectorDatabase:
 
                   A filter naming only declared fields is answered from the
                   columns. A filter naming anything else returns exactly the same
-                  records and reads every record's metadata to do it, which costs
-                  about 250 nanoseconds a record, and the index logs one warning
-                  naming the field. Declaring a field is not required and nothing
-                  becomes unfilterable by being left out.
+                  records and reads records' metadata to do it, which costs about
+                  250 nanoseconds a record. Declaring a field is not required and
+                  nothing becomes unfilterable by being left out.
 
                   What it costs is four bytes a record for a field with few
                   distinct values. A field whose value differs on nearly every
@@ -316,10 +314,10 @@ class VectorDatabase:
                     'type': 'pq',              # 'pq' (Product Quantization) or 'int8' (scalar), see below
                     'subvectors': 24,          # Number of subvectors (must divide dim evenly).
                                                # Default: dim / 32 clamped to 8..192 and snapped to
-                                               # a divisor of dim, so 128x compression from dim 256 up
+                                               # a divisor of dim
                     'bits': 8,                 # Bits per subvector (1-8, controls centroids, default: 8)
-                    'training_size': None,     # Auto-calculated based on subvectors & bits (or specify manually)
-                    'max_training_vectors': None,  # Optional limit on training vectors used
+                    'training_size': None,     # Records collected before training (default 10000)
+                    'max_training_vectors': None,  # Optional, at least training_size; training uses training_size records
                     'storage_mode': 'quantized_only' # 'quantized_only' for memory, 'quantized_with_raw' for accuracy
                 }
 
@@ -328,28 +326,25 @@ class VectorDatabase:
                     'type': 'int8',
                     'scale': 'per_dimension',  # The one scale rule this build fits (default)
                     'training_size': None,     # Records collected before the scales are fitted (default 10000)
-                    'max_training_vectors': None,  # Optional limit on training vectors used
+                    'max_training_vectors': None,  # Optional, at least training_size; fitting uses training_size records
                     'storage_mode': 'quantized_only' # The one mode a scalar index takes
                 }
 
-            Note on 'int8': every value is held as one signed byte, decoded
-            through one scale per dimension fitted as the largest magnitude
-            seen in that dimension over the training sample divided by 127,
-            so a record costs dim bytes, plus four for its length under
-            'cosine', against dim * 4 raw. The graph scores against the
-            decoded values inside the distance, so no vector is held at full
-            width anywhere in the index and all four spaces are served. A
-            value beyond the range its dimension's sample reached is clipped
-            to the edge of the range rather than refused; get_stats() counts
-            such values under quantization_saturated_values. Measured on
-            this engine's own corpora at 100,000 records, a scalar index sits
+            Note on 'int8': once its scales are fitted, every value is held as
+            one signed byte, decoded through one scale per dimension, so a
+            record costs dim bytes, plus four under 'cosine', against dim * 4
+            raw. The graph scores against the decoded values inside the
+            distance, so all four spaces are served. A value its byte cannot
+            hold is clipped rather than refused; get_stats() counts such
+            values under quantization_saturated_values. Measured on this
+            engine's own corpora at 100,000 records, a scalar index sits
             between 0.006 and 0.018 of recall at 10 below a raw index and
             searches no slower, and it holds about a third of what a raw
-            index holds at 100 dimensions and a fifth at 1,536. It keeps no
-            raw vector and never reranks, so 'quantized_with_raw' is refused
-            for it, and 'subvectors' and 'bits' are refused under it as
-            'scale' is refused under 'pq'. get_records() returns the decoded
-            vector, at unit length under 'cosine'.
+            index holds at 100 dimensions and a fifth at 1,536.
+            'quantized_with_raw' is refused for it, and 'subvectors' and
+            'bits' are refused under it as 'scale' is refused under 'pq'.
+            get_records() returns the decoded vector once fitted, at unit
+            length under 'cosine'.
 
             Note: Product quantization replaces each vector with a code of one byte per
             subvector, so the code is dim * 4 / subvectors smaller than the vector.
@@ -396,7 +391,7 @@ class VectorDatabase:
             vdb = VectorDatabase()
             index = vdb.create("hnsw", dim=1536)
             
-            # HNSW index with Product Quantization (auto-calculated training size)
+            # HNSW index with Product Quantization (default training size)
             quantization_config = {
                 'type': 'pq',
                 'subvectors': 8,
@@ -413,7 +408,7 @@ class VectorDatabase:
                 'type': 'pq',
                 'subvectors': 16,         # More subvectors = longer code, lower ratio, better accuracy
                 'bits': 6,                # Fewer bits = fewer centroids, smaller codebook and table
-                'training_size': 75000,    # Override auto-calculation
+                'training_size': 75000,    # Override the default
                 'storage_mode': 'quantized_only'  # Drop raw vectors once training completes
             }
             index = vdb.create(
@@ -428,6 +423,9 @@ class VectorDatabase:
                 keyword is not one the index type takes.
             ValueError: If index_type is not supported, a parameter breaks the
                 rules above, or the quantization config is invalid.
+            OverflowError: If dim, m, ef_construction, expected_size,
+                training_size or max_training_vectors lies outside the signed
+                64 bit range.
             RuntimeError: If the call fails inside the engine.
         """
         # A wrong type is a TypeError, as the docstring says, before the
@@ -533,30 +531,32 @@ class VectorDatabase:
         copy from before the upgrade where you may need to go back.
 
         The load holds the directory's lock, a file beside it named
-        <path>.zdblock, while it reads, and a journaled index keeps it until
-        the index is dropped, so a second index on the same directory, in
-        this process or another, raises RuntimeError (CollectionLocked). A
-        journaled directory this process cannot write, such as one on
-        read-only media, opens read only with a RuntimeWarning: every record
-        is replayed in memory, nothing on the medium changes, every change
-        raises RuntimeError (CollectionReadOnly), and save() into another
-        directory copies it somewhere writable. A directory holding a feature
-        this build does not know, which its manifest marks read_only, opens
-        read only the same way whatever the medium, and there every change,
-        every save, checkpoint(), journal_to() and backup() raises
-        RuntimeError (FeatureReadOnly). A journaled directory below format
-        5.0.0 whose identity records the largest generation a manifest can
-        hold opens read only the same way, since its upgrade is a save and
-        no save can record the generation after it, and every change,
-        save, checkpoint() and backup() raises RuntimeError naming that
-        generation. A directory a release before 0.14.0 wrote from values
-        past a bound, being a stored vector of an l2, dot or l1 index whose
-        Euclidean norm passes 2^62, a codebook value past 2^62, a scale past
-        the largest one vectors within 2^62 fit, a sparse value whose
-        magnitude passes 2^40 or a term weighting k1 past 2^40, opens read
-        only the same way, journaled or not: a RuntimeWarning
-        names the value, its file and the bound, and every change, save,
-        checkpoint() and backup() raises RuntimeError in the same words.
+        <path>.zdblock, while it reads where that file can be locked, and a
+        journaled index keeps it until the index is dropped, so a second
+        index on the same directory, in this process or another, raises
+        RuntimeError (CollectionLocked). A journaled directory this process
+        cannot write, such as one on read-only media, opens read only with a
+        RuntimeWarning: every record is replayed in memory, nothing on the
+        medium changes, every change is refused with RuntimeError
+        (CollectionReadOnly), and save() into another directory copies it
+        somewhere writable. A directory holding a feature this build does
+        not know, which its manifest marks read_only, opens read only the
+        same way whatever the medium, where its journal holds no record of a
+        kind this build does not know, and there every change, every save,
+        checkpoint(), journal_to() and backup() is refused with RuntimeError
+        (FeatureReadOnly). A journaled directory below format 5.0.0 whose
+        identity records the largest generation a manifest can hold opens
+        read only the same way, since its upgrade is a save and no save can
+        record the generation after it, and every change, save, checkpoint()
+        and backup() is refused with RuntimeError naming that generation. A
+        directory a release before 0.14.0 wrote from values past a bound,
+        being a stored vector of an l2, dot or l1 index whose Euclidean norm
+        passes 2^62, a codebook value past 2^62, a scale past the largest one
+        vectors within 2^62 fit, a sparse value whose magnitude passes 2^40
+        or a term weighting k1 past 2^40, opens read only the same way,
+        journaled or not and whatever the medium: a RuntimeWarning names the
+        value, its file and the bound, and every change, save, checkpoint()
+        and backup() is refused with RuntimeError in the same words.
 
         Args:
             path: Path to the .zdb directory containing the saved index
@@ -565,8 +565,8 @@ class VectorDatabase:
                 whose sparse space was declared with tokenizer="simple"
                 records that and needs nothing here. One declared with a
                 callable of your own records the tokenizer as external and
-                cannot reproduce it, so it opens only when the same callable
-                is handed here, and raises RuntimeError naming the space
+                cannot reproduce it, so it opens only when a callable is
+                handed here, and raises RuntimeError naming the space
                 otherwise. A callable handed for a directory that recorded
                 "simple", "simple" handed for one that recorded external,
                 and anything handed for a directory with no text layer are
@@ -601,12 +601,14 @@ class VectorDatabase:
                 call and everything after it in the journal are copied into
                 <path>.zdbjournal/quarantine/ beside a repair.json that
                 describes them, the journal is cut there, and the directory
-                is saved. A RuntimeWarning names the damage, the records set
-                aside and the folder, and index.recovery reports the same. A
-                directory with nothing damaged loads as it would without
-                repair. On a medium this process cannot write, nothing is
-                set aside or changed and the index opens read only. Refused
-                beside checkpoint_only with ValueError.
+                is saved. A stale segment whose header does not read is
+                copied there whole instead, and nothing is cut. A
+                RuntimeWarning names the damage, the records set aside and
+                the folder, and index.recovery reports the same. A directory
+                with nothing damaged and no repair unfinished loads as it
+                would without repair. Where the index opens read only,
+                nothing is set aside or changed. Refused beside
+                checkpoint_only with ValueError.
 
         Returns:
             HNSWIndex: The loaded index ready for use. index.recovery says

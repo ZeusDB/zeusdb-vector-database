@@ -498,7 +498,7 @@ fn reinsert_refused(error: Error, what: &str) -> Error {
 }
 
 impl Collection {
-    /// Warn once when the index holds materially more records than it declared
+    /// Warn when the index holds materially more records than it declared
     ///
     /// `expected_size` is a capacity hint rather than a limit, so exceeding it is
     /// legal and the index keeps working. What it costs is not the reservation,
@@ -512,8 +512,10 @@ impl Collection {
     /// remedy is `rebuild`, which is a full pass over every record and therefore
     /// the caller's call rather than something an `add` should do to them.
     ///
-    /// Fires once per index. The flag is claimed with a compare and exchange, so
-    /// two writers crossing the threshold together produce one line and not two.
+    /// Fires once until `clear` or a rebuild naming `expected_size` clears the
+    /// flag, and a loaded index starts with it clear. The flag is claimed with a
+    /// compare and exchange, so two writers crossing the threshold together
+    /// produce one line and not two.
     pub(super) fn warn_if_outgrown_expected_size(&self) {
         if self.overgrowth_warned.load(Ordering::Acquire) {
             return;
@@ -1682,10 +1684,10 @@ impl Collection {
     /// degree meant for the smaller one, and no search width recovers the recall
     /// that costs. This rebuilds the graph at a new degree, in place.
     ///
-    /// **Everything except the graph survives untouched.** Each record is
-    /// re-inserted under the internal id it already holds, which is what
-    /// `compact` does, so the id store, the metadata store and every
-    /// column stay correct without being rewritten. A quantized index is
+    /// **Every record survives unchanged.** Each record is re-inserted under
+    /// the internal id it already holds, which is what `compact` does, so the
+    /// id store, the metadata store and every column stay correct, rewritten
+    /// where removals have left gaps. A quantized index is
     /// rebuilt from its stored codes rather than re-encoded, so the codebook is
     /// not retrained and no record's code changes; a `quantized_with_raw` index
     /// carries its raw store over node by node.
@@ -3082,10 +3084,10 @@ impl Collection {
 
     /// Resolve a rebuild request against the configuration the index holds.
     ///
-    /// At least one of the three has to be given, since rebuilding the graph
-    /// as it stands is `compact`. The three are held to the rules `create()`
-    /// applies, on the same five values, and an invalid one raises the message
-    /// `create()` raises for it. The plan is returned rather than acted on so
+    /// At least one of the three has to be given. The three are held to the
+    /// rules `create()` applies, on the same five values, and an invalid one
+    /// raises the message `create()` raises for it. The plan is returned rather
+    /// than acted on so
     /// the binding can raise the neighbour selection warning, which needs the
     /// interpreter, between the check and the rebuild.
     pub fn plan_rebuild(

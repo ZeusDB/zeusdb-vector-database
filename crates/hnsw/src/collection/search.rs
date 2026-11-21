@@ -690,7 +690,8 @@ impl Collection {
     /// reconstruction of its codes where the index keeps no raw vector, a
     /// candidate that has neither sorts last, and the best `top_k` are kept.
     /// The single space search and the query path both apply it, so a dense
-    /// arm inside a query returns the page the single space search returns.
+    /// arm inside a query returns the page the single space search returns
+    /// for its fetch.
     pub(super) fn rescore_page(
         &self,
         scored: &mut Vec<(Named<'_>, f32)>,

@@ -89,7 +89,7 @@ Under `cosine`, vectors are normalized to unit length when they are stored. A ve
 
 A zero vector has no direction, so under `cosine` it sits at distance 1.0 from everything, including itself.
 
-**On a quantized index the score is a distance to the record's reconstruction, not to the vector you inserted.** Under `l2` it is the euclidean distance to that reconstruction and under `cosine` it is the cosine distance to it, so either way the number is on the scale a raw index of the same space reports and the two are comparable. It is not equal to the raw score, because the index no longer holds the vector you gave it, and the difference is the quantization error. Rerank replaces it with an exact distance to the raw vector, and it is on by default for `quantized_with_raw`. A scalar quantized index keeps no raw vector and never reranks, so its score is the distance to the decoded row, which under `cosine` is at unit length.
+**On a quantized index the score is a distance to the record's reconstruction, not to the vector you inserted.** Under `l2` it is the euclidean distance to that reconstruction and under `cosine` it is the cosine distance to it, so either way the number is on the scale a raw index of the same space reports and the two are comparable. It is not equal to the raw score, because the index no longer holds the vector you gave it, and the difference is the quantization error. Rerank replaces it with an exact distance to the raw vector, and it is on by default for `quantized_with_raw`. A fitted scalar quantized index keeps no raw vector and never reranks, so its score is the distance to the decoded row, which under `cosine` is at unit length.
 
 ```python
 from zeusdb_vector_database import VectorDatabase
@@ -218,8 +218,8 @@ HNSWIndex(dim=8, space=cosine, m=16, ef_construction=200, expected_size=5, vecto
 | `index_type`     | `str`  | `"hnsw"`  | The type of vector index to create. Currently only `"hnsw"` is supported. Case-insensitive. |
 | `dim`            | `int`  | *required* | Dimensionality of the vectors to be indexed, from 1 to 65,536. Each vector must have this length. **Required as of 0.8.0**, see below. |
 | `space`          | `str`  | `"cosine"`| Distance metric used for similarity search. One of `"cosine"`, `"l1"`, `"l2"`, `"dot"`. Case-insensitive. `"l1"` and `"dot"` cannot be combined with a `quantization_config` of type `"pq"`; type `"int8"` takes all four. |
-| `m`              | `int`  | `16` or `32`, see below | Number of bi-directional connections created for each new node, from 2 to 256. Higher `m` improves recall but increases index size and build time. |
-| `ef_construction`| `int`  | `200`     | Width of the candidate search each insertion runs, from 1 to 4,096. It costs build time and buys graph quality, and it changes neither search latency nor the size of the finished index. See below. |
+| `m`              | `int`  | `16` or `32`, see below | The most links a node keeps per layer, twice that at layer zero, from 2 to 256. Higher `m` improves recall but increases index size and build time. |
+| `ef_construction`| `int`  | `200`     | Width of the candidate search each insertion runs, from 1 to 4,096. It costs build time and buys graph quality. See below. |
 | `expected_size`  | `int`  | `10000`   | Estimated number of records to be inserted, from 1 to 100,000,000. Used for preallocating internal data structures and for choosing the default `m`. Not a hard limit, see below. |
 | `quantization_config` | `dict` | `None` | Product or scalar quantization, chosen by its `type`. See [Product Quantization](#️-product-quantization) and [Scalar Quantization](#-scalar-quantization). |
 | `indexed_fields` | `list[str]` | `None` | Metadata fields to build a column for, so that a filter naming only those fields does not read every record. Up to 32 names, no duplicates, none of `$and`, `$or` or `$not`. See [Declaring the fields you filter on](#-declaring-the-fields-you-filter-on). |
@@ -246,11 +246,11 @@ vdb.create("hnsw", dim=8, expected_size=25_000).get_stats()["m"]   # '16'
 vdb.create("hnsw", dim=8, expected_size=25_001).get_stats()["m"]   # '32'
 ```
 
-**`expected_size` is a hint and not a limit.** An index accepts more records than it declared and the graph grows to fit them. What it does not change is `m`, which [`rebuild()`](#️-change-m-after-the-fact-with-rebuild) does. Passing twice the declared size logs a warning once, on the `add()` that crosses it.
+**`expected_size` is a hint and not a limit.** An index accepts more records than it declared and the graph grows to fit them. What it does not change is `m`, which [`rebuild()`](#️-change-m-after-the-fact-with-rebuild) does. An index that passes twice the declared size logs a warning.
 
-**`ef_construction` costs build time and buys graph quality.** It changes neither search latency nor the size of the finished index. Build time is linear in it above 100. Recall stops improving at or near the default on most data, and where it keeps climbing a larger `ef_search` buys more for less, so raise `ef_search` before raising this. The default does not move with `m`, so 200 is 6.25 times the layer zero neighbour budget of 32 at `m=16` and 3.125 times the budget of 64 at `m=32`. Measured at 50,000 records with `m=32`, raising it to 400 bought 0.0010 recall at 10 on OpenAI embeddings of `dim=1536`, 0.0002 on SIFT and 0.0078 on GloVe, for 1.9 to 2.2 times the build time, which is why the constant stays.
+**`ef_construction` costs build time and buys graph quality.** Build time is linear in it above 100. Recall stops improving at or near the default on most data, and where it keeps climbing a larger `ef_search` buys more for less, so raise `ef_search` before raising this. The default does not move with `m`, so 200 is 6.25 times the layer zero neighbour budget of 32 at `m=16` and 3.125 times the budget of 64 at `m=32`. Measured at 50,000 records with `m=32`, raising it to 400 bought 0.0010 recall at 10 on OpenAI embeddings of `dim=1536`, 0.0002 on SIFT and 0.0078 on GloVe, for 1.9 to 2.2 times the build time, which is why the constant stays.
 
-**Keep `ef_construction` above `2 × m`.** At or below the neighbour budget the graph keeps every candidate the insertion search returned and prunes none of them. `create()` and [`rebuild()`](#️-change-m-after-the-fact-with-rebuild) both warn when the pair reaches that point, and both take the pair, so either remedy the warning names can be taken. The defaults are clear of it.
+**Keep `ef_construction` above `2 × m`.** `create()` and [`rebuild()`](#️-change-m-after-the-fact-with-rebuild) both warn when the pair reaches that point, and both take the pair, so either remedy the warning names can be taken. The defaults are clear of it.
 
 <br/>
 
@@ -917,9 +917,9 @@ print(sized_wrong.m, sized_wrong.expected_size, len(sized_wrong))
 16 400 400
 ```
 
-It returns the node count of the graph it built, which is the live record count. Passing none of the three raises, because rebuilding the graph as it stands is `compact()`. An invalid value raises the message `create()` raises for it.
+It returns the node count of the graph it built, which is the live record count. Passing none of the three raises. An invalid value raises the message `create()` raises for it.
 
-**Raise `m` where an index outgrew its declaration, and schedule it.** It costs a full rebuild, 27.0 seconds at 100,000 real 128 dimensional vectors, and it holds both graphs in memory while it runs. Nothing outside the graph is touched, so every filter returns what it returned and a save afterwards carries the new `m`.
+**Raise `m` where an index outgrew its declaration, and schedule it.** It costs a full rebuild, 27.0 seconds at 100,000 real 128 dimensional vectors, and it holds both graphs in memory while it runs. Every record survives unchanged, so every filter returns what it returned and a save afterwards carries the new `m`.
 
 <br/>
 
@@ -1154,7 +1154,7 @@ The index above declared 300 records and was given 500, so its graph and its sto
 
 **No node, edge or distance is touched**, so every search returns the same page with the same scores.
 
-**Call it on an index that holds its records, not on one about to receive them.** On an empty index it hands back the whole creation reservation that `expected_size` bought, so every later insertion regrows the arenas from nothing.
+**Call it on an index that holds its records, not on one about to receive them.** On an empty index it hands back the arenas `expected_size` reserved, so every later insertion regrows them from nothing.
 
 **The index stays writable.** The buffers grow again on the next `add()`, which costs one reallocation. That is why it is never automatic.
 
@@ -1215,12 +1215,12 @@ To enable PQ, pass a `quantization_config` dictionary to the `.create()` index m
 | `subvectors` | `int` | Number of vector subspaces. Must divide `dim` evenly | 1 to `dim` | derived from `dim`, see below |
 | `bits` | `int` | Bits per quantized code, which sets the centroids per subvector to 2^bits | 1 to 8 | `8` |
 | `training_size` | `int` | Records collected before training is triggered | ≥ 1000 | `10000` |
-| `max_training_vectors` | `int \| None` | Maximum records used during training | ≥ `training_size` | `None` |
+| `max_training_vectors` | `int \| None` | Training uses `training_size` records, whatever this is set to | ≥ `training_size` | `None` |
 | `storage_mode` | `str` | `"quantized_only"` or `"quantized_with_raw"` | see below | `"quantized_only"` |
 
 **Compression ratio is `dim × 4 / subvectors`.** More subvectors means a longer code, so it lowers the compression ratio and raises accuracy. Fewer subvectors means the opposite. At `dim=1536`, 8 subvectors gives 768x and 16 subvectors gives 384x.
 
-**`subvectors` defaults to `dim / 32`, clamped to between 8 and 192, snapped to a divisor of `dim`.** That holds the compression ratio at 128x, which is the quantity accuracy follows.
+**`subvectors` defaults to `dim / 32`, clamped to between 8 and 192, snapped to a divisor of `dim`.**
 
 | `dim` | default `subvectors` | compression |
 |-------|----------------------|-------------|
@@ -1473,7 +1473,7 @@ rerank_fetch_capped true
 
 Each row is one process holding both indexes over the same records, so the ratio is the figure to read. The times are at up to 50,000 records, and the row of 100,000 gives its calibrated fetch alone. Quantization remains a memory decision, and above about 25,000 records it costs query time. Lower `rerank` explicitly if query time matters more to you than recall, and measure what it costs you.
 
-**`ef_search` does nothing on a reranked quantized search.** The graph traversal widens to the number of candidates the fetch asks for, which is already wider than any `ef_search` a caller is likely to set, and setting it smaller is discarded. Change `rerank` instead. On an unquantized search, and on a quantized search with `rerank=0`, `ef_search` applies normally.
+**`ef_search` takes effect on a reranked quantized search only where it is larger than the fetch.** The graph traversal widens to the number of candidates the fetch asks for, which is already wider than any `ef_search` a caller is likely to set, and setting it smaller is discarded. Change `rerank` instead. On an unquantized search, and on a quantized search with `rerank=0`, `ef_search` applies normally.
 
 ### 📊 Performance Characteristics
 
@@ -1487,9 +1487,9 @@ Each row is one process holding both indexes over the same records, so the ratio
 
 ## 🔢 Scalar Quantization
 
-Scalar quantization holds every value of a vector as one signed byte. One scale per dimension is fitted when training triggers, as the largest magnitude that dimension reaches over the training sample divided by 127, and the graph decodes each byte through its scale inside every distance it evaluates. A record costs `dim` bytes, plus four under `cosine` for the length of its decoded vector, against `dim × 4` raw.
+Scalar quantization holds every value of a vector as one signed byte. One scale per dimension is fitted when training triggers, and the graph decodes each byte through its scale inside every distance it evaluates. A record costs `dim` bytes, plus four under `cosine`, against `dim × 4` raw.
 
-It takes all four metrics, because the kernel applies the metric's own arithmetic to the decoded values and no table fitted to one objective sits between them. It keeps no raw vector and never reranks, so `quantized_only` is the one storage mode it takes.
+It takes all four metrics, because the kernel applies the metric's own arithmetic to the decoded values and no table fitted to one objective sits between them. `quantized_only` is the one storage mode it takes.
 
 ### 📘 Configuration
 
@@ -1498,7 +1498,7 @@ It takes all four metrics, because the kernel applies the metric's own arithmeti
 | `type` | `str` | Quantization algorithm type | `"int8"` | *required* |
 | `scale` | `str` | How the scales are fitted, one per dimension | `"per_dimension"` | `"per_dimension"` |
 | `training_size` | `int` | Records collected before the scales are fitted | ≥ 1000 | `10000` |
-| `max_training_vectors` | `int \| None` | Maximum records used to fit the scales | ≥ `training_size` | `None` |
+| `max_training_vectors` | `int \| None` | Fitting uses `training_size` records, whatever this is set to | ≥ `training_size` | `None` |
 | `storage_mode` | `str` | The one mode a scalar index takes | `"quantized_only"` | `"quantized_only"` |
 
 `subvectors` and `bits` belong to `"pq"` and are refused under `"int8"`, as `scale` is refused under `"pq"`. `storage_mode="quantized_with_raw"` is refused, because the mode exists to rerank against raw vectors and a scalar index gives up too little for that to be worth four bytes a value.
@@ -1831,8 +1831,8 @@ The journal is `<path>.zdbjournal`, a sibling of the directory rather than a fil
 | `durability` | When the call returns | A process that stops | An OS crash or power loss |
 |---|---|---|---|
 | `"call"`, the default | every record is on the device, or the call reported or raised the failure | nothing acknowledged is lost | nothing acknowledged is lost |
-| `"interval"` | every record is in the kernel, flushed within `interval_ms`, 10 by default | nothing acknowledged is lost | up to one interval of acknowledged calls |
-| `"none"` | every record is in the kernel until the next checkpoint | nothing acknowledged is lost | everything since the last checkpoint |
+| `"interval"` | every record is in the kernel, flushed after `interval_ms`, 10 by default | nothing acknowledged is lost | the acknowledged calls not yet flushed |
+| `"none"` | every record is in the kernel, on the device by the next checkpoint | nothing acknowledged is lost | up to everything since the last checkpoint |
 
 `get_stats()` reports the `journal_` keys on a journaled index, being the four the example prints, `journal_segments`, and `journal_interval_ms` under `"interval"`.
 
@@ -1840,7 +1840,7 @@ An index that is never checkpointed opens by replaying every record in its journ
 
 ### 🪪 Identifying a Directory - .identity
 
-Every save records what the directory is, under `identity` in `manifest.json`, and an index reports the same values as its `identity` property.
+Every save records what the directory is in `manifest.json`, and an index reports the same values as its `identity` property.
 
 | Key | What it is |
 |---|---|
@@ -1849,7 +1849,7 @@ Every save records what the directory is, under `identity` in `manifest.json`, a
 | `snapshot` | The id of the directory the index last saved or read, drawn at that save, or `None` before the first |
 | `parent` | The `snapshot` that directory was saved from, or `None` on a first save |
 | `saved_at` | The time, in RFC 3339, that directory's manifest records as its save, or `None` where `snapshot` is `None` |
-| `sequence` | The journal sequence that directory's state holds, or 0 where it records none |
+| `sequence` | The journal sequence that directory's manifest records under `identity`, or 0 where it records none |
 
 ```python
 index = vdb.create("hnsw", dim=4, expected_size=100)
@@ -1878,7 +1878,7 @@ True
 True
 ```
 
-Of two directories of one index, the higher `generation` is the later save. A copy taken before the last save is one generation behind the directory saved after it, and that directory names the copy's `snapshot` as its `parent`. Two directories naming the same `parent` under different snapshots were each saved from the same state, which is what a copy opened and saved in its own place looks like. `clear()` keeps them all, since a cleared index is the same index, and `get_stats()` does not carry them.
+A copy taken before the last save is one generation behind the directory saved after it, and that directory names the copy's `snapshot` as its `parent`. Two directories naming the same `parent` under different snapshots were each saved from that `parent`, which is what a copy opened and saved in its own place looks like. `clear()` keeps them all, since a cleared index is the same index, and `get_stats()` does not carry them.
 
 A directory saved by 0.11.0 or earlier records no identity. A journaled one takes the id its journal names, and any other is given one when it is opened. Its next save records that id at generation 1.
 
@@ -1934,7 +1934,7 @@ A release that meets a feature it does not know refuses the directory with a mes
 
 - **Same volume.** The staging directory is a sibling of the target, so both are on the target's volume and the move is a rename rather than a copy.
 
-- **Version compatibility.** Every directory this release saves declares format version 5.0.0 and lists its features, see [What a Directory Holds](#-what-a-directory-holds---features). This release reads any 1.x to 5.x, so a directory an earlier release saved opens here, and saving it again writes 5.0.0. A 5.0.0 directory holds `mappings.bin`, `vectors.bin` and `pq_centroids.bin` inside a frame with checksums of its own, and 0.5.0 to 0.13.0 refuse it at the version check with a message naming the newer release, and 0.3.0 to 0.4.1, which read no format version, refuse it when they decode its `mappings.bin`.
+- **Version compatibility.** Every directory this release saves declares format version 5.0.0 and lists its features, see [What a Directory Holds](#-what-a-directory-holds---features). This release reads 1.x to 5.x. A 5.0.0 directory holds `mappings.bin`, `vectors.bin` and `pq_centroids.bin` inside a frame with checksums of its own, and 0.5.0 to 0.13.0 refuse it at the version check, and 0.3.0 to 0.4.1, which read no format version, refuse it when they decode its `mappings.bin`.
 
 - **Integrity checks on load.** Five run, in this order: the format version, then the features against the ones this release knows, then `files_included` against the directory, then each artefact against its recorded length and, for a JSON artefact, its digest, a binary artefact verifying its own checksums as it is read, then the restored record count against the count in `config.json`. Once `config.json` and `quantization.json` are read, the features a 4.0.0 directory lists are held to what it holds. A directory holding a sparse space adds two, being every record the space holds against the id mappings, and every term id the postings carry against the length of the dictionary. A journaled directory adds the journal's own, being the collection id in its header against the manifest's, its first record against the sequence the checkpoint holds, a record in its middle whose bytes changed after it was written, and every replayed record against the index it lands on. A directory recording an identity adds its own, being every id 32 hexadecimal digits and the generation 1 or more, and, where it is journaled, the collection id its journal record names against the identity's. A trained scalar directory adds the bounds of its scales, being one finite positive scale per declared dimension. A 4.0.0 directory adds the bounds of its binary artefacts, being every internal id `vectors.bin` and `pq_codes.bin` name one that `mappings.bin` holds, one vector of the declared width for every record `mappings.bin` holds where the directory holds `vectors.bin`, one code of the declared width for each record coded, and a codebook of the shape `quantization.json` describes.
 
@@ -2098,7 +2098,7 @@ print(matched({"$not": {"$or": [{"lang": "es"}, {"tier": "gold"}]}}))
 
 ### ⏱️ What a filtered search costs
 
-**A filter over a field left out of `indexed_fields` reads every record's metadata**, so it costs a great deal more than an unfiltered search. Declaring the field builds a column and removes that cost, which the next section measures.
+**A filter over a field left out of `indexed_fields` reads records' metadata**, so it costs a great deal more than an unfiltered search. Declaring the field builds a column and removes that cost, which the next section measures.
 
 Two paths serve a filter and the index chooses between them per search. At or below 5,000 matching records it scores every record that matched and ranks them, which is exact. Above 5,000 the graph traversal runs instead with the filter tested at every node it reaches, and recall there is the graph's own, measured at 0.96 and above on three real 100,000 record sets.
 
@@ -2119,7 +2119,7 @@ Measured on three real 100,000 record sets with no field declared, milliseconds 
 
 ### 🚀 Declaring the fields you filter on
 
-`create(indexed_fields=[...])` builds a column for each field named, so a filter naming only declared fields is answered from those columns rather than by reading every record's metadata. It changes which records come back in no way, only what finding them costs.
+`create(indexed_fields=[...])` builds a column for each field named, so a filter naming only declared fields is answered from those columns rather than by reading records' metadata. It changes which records come back in no way, only what finding them costs.
 
 ```python
 from zeusdb_vector_database import VectorDatabase
@@ -2465,9 +2465,9 @@ hits = index.query(
 |-----|----|-------|
 | `ef_search` | a dense arm | The search width, as `search()` takes it |
 | `rerank` | a dense arm | How many candidates to rescore against true vectors |
-| `idf` | a sparse or text arm | `"corpus"` counts term rarity over the records the filter admits, `"global"` over every record. Defaults to `"corpus"` |
+| `idf` | a sparse or text arm | Applies under `bm25`. `"corpus"` counts term rarity over the records the filter admits, `"global"` over every record. Defaults to `"corpus"` |
 
-**A one arm query is that arm's search.** A single dense arm returns the page `search()` returns, id for id and score for score, with each hit carrying its `contributions` as well. `query()` is the shape to reach for whenever more than one arm is in play.
+`query()` is the shape to reach for whenever more than one arm is in play.
 
 ---
 
@@ -2671,7 +2671,7 @@ print("initialized:", success)
 vdb = zeusdb_vector_database.VectorDatabase()
 ```
 
-**Only the first initializer to run takes effect.** Both functions return `True` if they installed the subscriber and `False` if one was already installed, so calling both leaves the second with no effect and a `False` return. `zeusdb_vector_database.is_logging_initialized()` reports whether either has run.
+**Only the first initializer to run takes effect.** Both functions return `True` if they installed the subscriber and `False` if one was already installed, and raise `ValueError` for a level they cannot read, so calling both leaves the second with no effect and a `False` return. `zeusdb_vector_database.is_logging_initialized()` reports whether either has run.
 
 **The file target is drained at exit.** Records reach the file through a background writer, so a record emitted immediately before the process ends is still in flight when it ends. Importing the package registers the drain with `atexit`, which covers a normal exit and needs no call. `zeusdb_vector_database.shutdown_logging()` runs the same drain on demand and returns `True` if it drained a file appender, or `False` if there was nothing to drain, which is the answer for the `stdout` and `stderr` targets and for a second call. It closes the file, so records emitted after it are discarded. Nothing runs on `os._exit` or on a crash, and records still in flight at either are lost.
 

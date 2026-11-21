@@ -371,7 +371,7 @@ The format is unchanged at 4.0.0, and a save writes the same bytes for the same 
 
 ### Format
 
-Every directory this release saves declares format version 4.0.0 and lists its features. This release reads 1.x, 2.x, 3.x and 4.x, so a directory an earlier release saved opens here as it opens on 0.11.0, and saving it again writes 4.0.0. 0.5.0 to 0.11.0 refuse a 4.0.0 directory at the version check with a message naming the newer release, and 0.3.0 to 0.4.1, which read no format version, refuse it when they decode its `mappings.bin`.
+Every directory this release saves declares format version 4.0.0 and lists its features. This release reads 1.x, 2.x, 3.x and 4.x, so a directory an earlier release saved opens here as it opens on 0.11.0, and saving it again writes 4.0.0. 0.5.0 to 0.11.0 refuse a 4.0.0 directory at the version check, and 0.3.0 to 0.4.1, which read no format version, refuse it when they decode its `mappings.bin`.
 
 ## [0.11.0] - 2026-09-08
 

@@ -246,7 +246,7 @@ def test_the_rebuild_asked_for_reads_the_rows_and_refuses_damaged_ones(tmp_path,
 def test_a_feature_marked_read_only_opens_the_directory_read_only(tmp_path):
     """A directory listing a feature this build does not know, marked
     read_only, opens read only with a RuntimeWarning naming the feature, and
-    every change, save, checkpoint, journal and backup raises RuntimeError."""
+    every change, save, checkpoint, journal and backup is refused."""
     index = build(40)
     path = tmp_path / "probe.zdb"
     index.save(str(path))

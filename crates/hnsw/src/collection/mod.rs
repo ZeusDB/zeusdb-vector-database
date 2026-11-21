@@ -540,8 +540,7 @@ impl JournalStatus {
 /// `generation` counts the saves the collection has committed. A new
 /// collection is at 0, its first save writes 1, and every save writes one
 /// more than the generation of the directory the collection last committed
-/// or read, so of two directories of one collection the higher generation
-/// is the later save. It is not the journal's sequence, which counts
+/// or read. It is not the journal's sequence, which counts
 /// records, restarts when `journal_to` opens a journal, and does not move
 /// between two checkpoints with nothing between them.
 ///
@@ -552,8 +551,8 @@ impl JournalStatus {
 ///
 /// `parent` names the snapshot that directory was saved from. A copy left
 /// behind by a later save is therefore the parent the later directory
-/// names, and two directories naming one parent under two snapshots are two
-/// saves from one state.
+/// names, and two directories naming one parent under two snapshots were
+/// both saved from it.
 ///
 /// `snapshot` is absent on a collection that has neither been saved nor
 /// read from a directory that records one. `parent` is absent on a
@@ -601,7 +600,7 @@ impl Identity {
 /// What a caller reads of a collection's identity, and what a backup
 /// returns of the copy it wrote: the four values of [`Identity`], the time
 /// the manifest of the directory `snapshot` names records as its save, and
-/// the journal sequence that directory's state holds.
+/// the journal sequence that manifest records under `identity`.
 ///
 /// `saved_at` is `None` where `snapshot` is. `sequence` is 0 where the
 /// directory records none, which is every directory below format 5.0.0 and
@@ -1423,7 +1422,8 @@ pub struct Collection {
 
     /// Set once the index has warned that it holds materially more records than
     /// `expected_size` declared, so the warning fires once rather than on every
-    /// subsequent `add`.
+    /// subsequent `add`, until `clear` or a rebuild naming `expected_size`
+    /// clears it.
     overgrowth_warned: AtomicBool,
 
     /// What stopped the index, set once by the first call that panicked
@@ -2451,8 +2451,9 @@ impl Collection {
     ///
     /// **Exact.** Where every field the filter names is declared, this counts
     /// the bits of the columns' selection. Where some are, it judges the
-    /// metadata of the records the declared fields leave, and where none are,
-    /// the metadata of every record. It cannot stop early:
+    /// metadata of the records the declared fields leave, or of every record
+    /// where they leave more than a third, and where none are, the metadata
+    /// of every record. It cannot stop early:
     /// a count is a statement about the whole index, so the first record it
     /// skipped would make the answer a lower bound rather than a count.
     /// `admit_plan` stops at `FULL_SCAN_THRESHOLD` because a search only
@@ -2529,10 +2530,10 @@ impl Collection {
 
     /// Records by id, with the vector where one was asked for.
     ///
-    /// Looks the ids up in the union of the raw vectors and the quantized
-    /// codes. An absent id is dropped, or reported through
-    /// `Error::RecordsAbsent` naming every absent id in sorted order when
-    /// `strict` is set. The vector is the raw one where the index holds one
+    /// Looks the ids up in the id store. An absent id is dropped, or reported
+    /// through `Error::RecordsAbsent`, which counts the absent ids and names
+    /// the first ten in sorted order, when `strict` is set. The vector is the
+    /// raw one where the index holds one
     /// and the reconstruction from the codes where it does not, which under
     /// `quantized_only` is every record once training completes. The contract
     /// behind those choices is documented on the Python entry point.

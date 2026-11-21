@@ -56,9 +56,9 @@ def main():
     # ------------------------------------------------------------------
     # The grid
     # ------------------------------------------------------------------
-    # m is the number of bi-directional links each node gets. It is fixed at
-    # creation and cannot be changed afterwards, so it is the one parameter here
-    # you have to get right up front.
+    # m is the most links a node keeps per layer, twice that at layer zero. It is
+    # fixed at creation, and changing it afterwards costs a full rebuild, so it is
+    # the one parameter here you have to get right up front.
     print(f"recall@{TOP_K} over {QUERIES} queries against {RECORDS} vectors")
     print(" " * 8 + "".join(f"ef_search={width}".ljust(14) for width in WIDTHS).rstrip())
     for degree in DEGREES:

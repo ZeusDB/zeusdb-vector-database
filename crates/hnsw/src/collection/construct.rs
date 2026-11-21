@@ -74,8 +74,9 @@ const MAX_EXPECTED_SIZE: usize = 100_000_000;
 /// `validate_index_parameters` with the other three rather than in `build`.
 ///
 /// The ceiling is reasoned from `m` rather than invented. The neighbour
-/// selection heuristic runs only while `ef_construction` is above the
-/// neighbour budget of `2 * m`, that budget is 512 at the largest `m` of 256,
+/// selection heuristic runs at layer zero only while `ef_construction` is
+/// above the neighbour budget of `2 * m`, that budget is 512 at the largest
+/// `m` of 256,
 /// and the default of 200 sits 6.25 times above the budget at the default
 /// `m` of 16. Carrying that margin to the largest `m` is 3,200, and 4,096 is
 /// the first power of two above it, so every `m` the index allows has the

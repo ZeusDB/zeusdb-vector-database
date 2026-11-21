@@ -169,28 +169,29 @@ impl From<PyEngineError> for PyErr {
 /// A journaled directory saved by a release before 0.14.0 is upgraded by its
 /// first load: its journal is replayed and the directory is written again at
 /// format 5.0.0, after which those releases do not open it. A load holds the
-/// directory's lock, `<path>.zdblock`, while it reads, and a journaled index
-/// keeps it for its life, so a second holder is refused with
-/// `CollectionLocked`. A journaled directory this process cannot write opens
-/// read only, with a `RuntimeWarning` naming the reason: every record is
-/// replayed in memory, nothing on the medium changes, every change raises
-/// `CollectionReadOnly`, and `save` into another directory copies it. A
-/// directory holding a feature this build does not know, which its manifest
-/// marks `read_only`, opens read only the same way whatever the medium, and
-/// every change, every save, `checkpoint`, `journal_to` and `backup` raises
-/// `FeatureReadOnly`. A journaled directory below format 5.0.0 whose
-/// identity records the largest generation a manifest can hold opens read
-/// only the same way, since its upgrade is a save and no save can record
-/// the generation after it: a `RuntimeWarning` names that generation, and
-/// every change, save, `checkpoint` and `backup` raises `RuntimeError` in
-/// the same words. A directory holding a value past a bound, being a stored
-/// vector of an l2, dot or l1 index whose Euclidean norm passes 2^62, a
-/// codebook value past 2^62, a scale past the largest one vectors within
-/// 2^62 fit, a sparse value whose magnitude passes 2^40 or a term weighting
-/// `k1` past 2^40, opens read only the same way, journaled or not: a
-/// `RuntimeWarning` names the value, its file and the bound, and
-/// every change, save, `checkpoint` and `backup` raises `RuntimeError` in
-/// the same words.
+/// directory's lock, `<path>.zdblock`, while it reads where that file can be
+/// locked, and a journaled index keeps it for its life, so a second holder is
+/// refused with `CollectionLocked`. A journaled directory this process cannot
+/// write opens read only, with a `RuntimeWarning` naming the reason: every
+/// record is replayed in memory, nothing on the medium changes, every change
+/// is refused with `CollectionReadOnly`, and `save` into another directory
+/// copies it. A directory holding a feature this build does not know, which
+/// its manifest marks `read_only`, opens read only the same way whatever the
+/// medium, where its journal holds no record of a kind this build does not
+/// know, and every change, every save, `checkpoint`, `journal_to` and
+/// `backup` is refused with `FeatureReadOnly`. A journaled directory below
+/// format 5.0.0 whose identity records the largest generation a manifest can
+/// hold opens read only the same way, since its upgrade is a save and no save
+/// can record the generation after it: a `RuntimeWarning` names that
+/// generation, and every change, save, `checkpoint` and `backup` is refused
+/// with `RuntimeError` in the same words. A directory holding a value past a
+/// bound, being a stored vector of an l2, dot or l1 index whose Euclidean
+/// norm passes 2^62, a codebook value past 2^62, a scale past the largest one
+/// vectors within 2^62 fit, a sparse value whose magnitude passes 2^40 or a
+/// term weighting `k1` past 2^40, opens read only the same way, journaled or
+/// not and whatever the medium: a `RuntimeWarning` names the value, its file
+/// and the bound, and every change, save, `checkpoint` and `backup` is
+/// refused with `RuntimeError` in the same words.
 ///
 /// `repair=True` loads a journal whose own history is broken: a corrupt
 /// record with records after it, damage in a segment that is not the last,
@@ -199,13 +200,14 @@ impl From<PyEngineError> for PyErr {
 /// the first call the damage touches is replayed, that call and every byte
 /// after it are copied into `<path>.zdbjournal/quarantine/<UTC stamp>-<first
 /// sequence set aside>/` with a `repair.json` describing them, the journal
-/// is cut there, and a checkpoint is written. A `RuntimeWarning` names the
-/// damage, the records set aside and the folder, and `index.recovery`
-/// reports the same. A load that finds nothing damaged and no repair
-/// unfinished is a plain load. A journal that belongs to another collection
-/// or another checkpoint is refused as without it. On a medium this process
-/// cannot write, the kept calls are replayed in memory, nothing is set
-/// aside or changed, and the index opens read only.
+/// is cut there, and a checkpoint is written. A stale segment whose header
+/// does not read is copied there whole instead, and nothing is cut. A
+/// `RuntimeWarning` names the damage, the records set aside and the folder,
+/// and `index.recovery` reports the same. A load that finds nothing damaged
+/// and no repair unfinished is a plain load. A journal that belongs to
+/// another collection or another checkpoint is refused as without it. Where
+/// the index opens read only, the kept calls are replayed in memory and
+/// nothing is set aside or changed.
 ///
 /// A directory below format 5.0.0 whose manifest records `created_at` as
 /// anything but an RFC 3339 time, which a load of 5.0.0 refuses, opens with

@@ -306,7 +306,8 @@ pub trait JournalFile: Send + Sync + std::fmt::Debug {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LockMode {
     /// Beside other shared holders, and refused while anyone holds it
-    /// exclusive. A load takes it while it reads.
+    /// exclusive. A load takes it while it reads, where the file can be
+    /// locked.
     Shared,
     /// Alone. A journaled collection takes it for its life and a save for
     /// the save.

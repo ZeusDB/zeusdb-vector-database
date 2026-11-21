@@ -1,11 +1,12 @@
 """The lock that keeps a second writer off a directory, from Python.
 
 `<path>.zdblock` beside the directory. A journaled index holds it for its
-life, a save for the save, and a load while it reads. A second process is
-refused with a RuntimeError, CollectionLocked, and a process killed holding
-the lock releases it with its exit. A child forked from the process that
-opened a journal refuses every mutation with JournalForked, and closes its
-copy of the lock file just after the fork, so the lock stays with the parent.
+life, a save for the save, and a load while it reads where the file can be
+locked. A second process is refused with a RuntimeError, CollectionLocked,
+and a process killed holding the lock releases it with its exit. A child
+forked, while no call on the index runs, from the process that opened a
+journal refuses every mutation with JournalForked, and closes its copy of
+the lock file just after the fork, so the lock stays with the parent.
 A journaled directory this process cannot write opens read only, with a
 RuntimeWarning.
 """

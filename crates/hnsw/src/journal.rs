@@ -51,9 +51,10 @@
 //! reached is written onto the collection so the manifest records it; the
 //! four save phases run; and then the journal rolls onto a new segment
 //! naming the directory just committed, and every segment that directory
-//! holds is deleted. A crash anywhere in that leaves either the previous
-//! directory with segments that replay onto it, or the new directory with
-//! segments it holds every record of, which the next load deletes.
+//! holds is deleted where the system allows. A crash anywhere in that
+//! leaves either the previous directory with segments that replay onto it,
+//! or the new directory with segments it holds every record of, which the
+//! next load deletes.
 //!
 //! # A commit that fails
 //!
@@ -99,7 +100,8 @@
 //! or not and under `checkpoint_only=True` too. Its collection refuses every
 //! change, every save, a checkpoint, a journal and a backup with
 //! [`Error::FeatureReadOnly`], since a directory this build wrote would not
-//! hold the feature.
+//! hold the feature. A replay that meets a record of a kind this build does
+//! not know refuses the load with [`Error::FeatureJournalUnreadable`].
 //!
 //! # The three policies
 //!
@@ -110,7 +112,7 @@
 //! | Policy | When the call returns | A process abort | An OS crash or power loss |
 //! |---|---|---|---|
 //! | [`Durability::PerCall`] | every record of the call is on the device, or the call did not return | nothing acknowledged is lost | nothing acknowledged is lost, on a device that honours the flush |
-//! | [`Durability::PerInterval`] | every record is in the kernel, and a thread syncs the journal within the interval | nothing acknowledged is lost | up to one interval of acknowledged calls is lost |
+//! | [`Durability::PerInterval`] | every record is in the kernel, and a thread syncs the journal after the interval | nothing acknowledged is lost | the acknowledged calls not yet synced are lost |
 //! | [`Durability::NoSync`] | every record is in the kernel | nothing acknowledged is lost | everything since the kernel last wrote the journal is lost |
 //!
 //! The middle column is the same for all three because a process abort
@@ -155,19 +157,20 @@ pub use zeusdb_vector_core::JOURNAL_SUFFIX;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Durability {
     /// Every record of a call is on the device before the call returns, or
-    /// the call did not return. One flush per call. The default.
+    /// the call did not return. The default.
     #[default]
     PerCall,
     /// Every record is in the kernel when the call returns, and a thread of
-    /// the collection's own syncs the journal within this long of the first
-    /// call that dirtied it. What a caller trades is that an operating
-    /// system crash or a power loss inside the window loses the calls that
-    /// fell in it, and what they get is a single-record `add` that does not
-    /// wait on a flush.
+    /// the collection's own syncs the journal after this long has passed
+    /// since the first call that dirtied it. What a caller trades is that an
+    /// operating system crash or a power loss loses the calls not yet synced,
+    /// and what they get is a single-record `add` that does not wait on a
+    /// flush.
     PerInterval(Duration),
-    /// Every record is in the kernel when the call returns and nothing syncs
-    /// the journal until the next checkpoint. A process abort still loses
-    /// nothing. For a bulk load that will checkpoint at the end.
+    /// Every record is in the kernel when the call returns, and the journal
+    /// is synced only where a segment fills, a call is withdrawn, or a backup
+    /// or a checkpoint syncs it. A process abort still loses nothing. For a
+    /// bulk load that will checkpoint at the end.
     NoSync,
 }
 
@@ -930,8 +933,8 @@ pub struct Repair {
     pub records_discarded: u64,
     /// The bytes set aside, every later segment's included.
     pub bytes_discarded: u64,
-    /// The folder the bytes were copied into, or `None` where the medium
-    /// refused the write and nothing was set aside.
+    /// The folder the bytes were copied into, or `None` where nothing was
+    /// copied.
     pub quarantine: Option<PathBuf>,
 }
 
@@ -964,8 +967,8 @@ impl CheckpointTaken {
 pub struct Recovery {
     /// The format version the directory declared when it was read.
     pub format_version: String,
-    /// The sequence the checkpoint holds, from the manifest. Every record
-    /// above it was replayed and every record at or below it was already in
+    /// The sequence the checkpoint holds, from the manifest's journal
+    /// record, or 0 where it names none. Every record at or below it is in
     /// the directory.
     pub checkpoint_sequence: u64,
     /// The sequence the journal's first record above the checkpoint takes,
@@ -1430,8 +1433,11 @@ pub enum JournalPolicy {
     /// the journal's history is cut away rather than refused: every whole
     /// call before the damage is replayed, the damaged call and everything
     /// after it are copied into the journal's `quarantine` folder, the
-    /// journal is cut and a checkpoint seals it. Where nothing is damaged
-    /// and no repair is unfinished it is a replay and writes nothing more.
+    /// journal is cut and a checkpoint seals it. A stale segment whose header
+    /// does not read is copied there whole instead, and nothing is cut. Where
+    /// nothing is damaged and no repair is unfinished it is a replay and
+    /// writes nothing more, and on a collection opened read only it writes
+    /// nothing.
     Repair(Durability),
     /// Open the checkpoint alone. The journal is neither read nor reopened,
     /// no sink is attached, and the mutations it holds are not applied.

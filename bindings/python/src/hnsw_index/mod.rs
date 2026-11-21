@@ -102,9 +102,9 @@ pub struct AddResult {
     /// record rejected by parsing or by insertion contributes no id, because
     /// it is not in the index. So this is not positionally aligned with the
     /// input, and a caller who needs that alignment reads `errors`, which
-    /// names each rejection by its id or by its position. A record given no
-    /// id may take a generated id before its sparse half or its text is
-    /// refused, and the next generated id follows it. A generated id never
+    /// names each rejection in a batch by its id or by its position. A record
+    /// given no id may take a generated id before its sparse half or its text
+    /// is refused, and the next generated id follows it. A generated id never
     /// names a record the index holds, across a save and a load and a replay
     /// of its journal.
     ///
@@ -539,11 +539,11 @@ impl HNSWIndex {
     /// Re-encodes whatever raw vectors the index still holds through the
     /// trained quantizer and rebuilds the graph from the stored codes, being
     /// the product quantized codes or the scalar rows. It never retrains the
-    /// quantizer; training runs exactly once, on the `add` that reaches
-    /// `training_size`. A trained `quantized_only` index holds no raw
-    /// vectors, so there the rebuild proceeds from the codes alone, and under
-    /// either mode nothing is lost by calling it. Returns false when there is
-    /// no trained quantizer or nothing stored to rebuild from.
+    /// quantizer. A trained `quantized_only` index holds no raw vectors, so
+    /// there the rebuild proceeds from the codes alone, and under either mode
+    /// nothing is lost by calling it. Returns false when there is no trained
+    /// quantizer, or when a product quantized index holds nothing to rebuild
+    /// from.
     #[instrument(level = "info", skip(self, py), fields(
         vector_count = self.peek(Collection::try_vector_count),
         has_quantization = self.peek(|inner| Some(inner.has_quantization()))
@@ -578,8 +578,7 @@ impl HNSWIndex {
         )
     }
 
-    /// Add records, in any of the five shapes, each filling the sparse
-    /// space as well where the index declares one.
+    /// Add records, in any of the five shapes.
     ///
     /// A record fills the sparse space under the key the space takes.
     /// `sparse` is a mapping `{"dims": [...], "values": [...]}` of term ids
@@ -764,27 +763,16 @@ impl HNSWIndex {
     /// Enhanced search method with automatic ADC usage
     ///
     /// `rerank` controls how far a quantized search over-fetches before it
-    /// rescores the candidates against raw vectors. Omitted, the fetch is the
-    /// one training measured on the index's own data where it calibrated
-    /// one, and otherwise the largest of the live record count over 50, 250
-    /// and five times `top_k`; either is held to the live records where fewer
-    /// remain. See `default_rerank_fetch`. An integer of 1 or more pulls that
-    /// many candidates per requested result, which is a fixed multiple of the
-    /// page and does not move with the corpus. Zero turns rerank off and
-    /// restores the ADC scores and ordering. It has no effect on a raw index
-    /// or on a `quantized_only` one, both of which never rerank; see
-    /// `rerank_plan`.
+    /// rescores the candidates against raw vectors. Omitted, the index
+    /// chooses the fetch. An integer of 1 or more pulls that many candidates
+    /// per requested result. Zero turns rerank off and restores the ADC
+    /// scores and ordering. It has no effect on a raw index or on a
+    /// `quantized_only` one, both of which never rerank.
     ///
-    /// `ef_search` has no effect on a reranked quantized search. Below the
-    /// fetch it is discarded, because the traversal widens to the number of
-    /// candidates asked for and cannot return more results than its candidate
-    /// list holds. Above the fetch it buys no recall, because the candidates
-    /// a fetch returns are limited by the ADC ordering rather than by the
-    /// traversal, and quadrupling it moves recall at 10 by at most 0.008. The
-    /// default `ef_search` is the larger of twice `top_k` and 150 under `l1`
-    /// and `l2`, or 100 under `cosine` and `dot`, so on an index of 250
-    /// records or more changing `ef_search` alone changes nothing on a
-    /// reranked search at the defaults.
+    /// `ef_search` takes effect on a reranked quantized search only where it
+    /// is larger than the fetch. The default `ef_search` is the larger of
+    /// twice `top_k` and 150 under `l1` and `l2`, or 100 under `cosine` and
+    /// `dot`.
     ///
     /// `vector` is one query, as a list, a tuple or a one dimensional array,
     /// or a batch, as a list of lists or a two dimensional array. An empty
@@ -1036,9 +1024,10 @@ impl HNSWIndex {
     /// it, since that space's term ids are its dictionary's. `{"text":
     /// "..."}` asks a space with a text layer, with a string the layer
     /// splits and counts as it counted the records; a space without one
-    /// refuses it. Either takes `idf`: `"corpus"`, the default, weights a
-    /// term by its rarity over the records the filter admits, and
-    /// `"global"` over every live record. A query names one to eight arms.
+    /// refuses it. Either takes `idf`, which a space weighted by `bm25`
+    /// reads: `"corpus"`, the default, weights a term by its rarity over the
+    /// records the filter admits, and `"global"` over every live record. A
+    /// query names one to eight arms.
     ///
     /// Every arm runs under the one admit set the `filter` decides, which
     /// is the filter `search` takes and selects the same records. `top_k`
@@ -1046,8 +1035,7 @@ impl HNSWIndex {
     /// fusion, which is the page for one arm and five times it for several
     /// unless set; a record just outside one arm's page cannot be lifted by
     /// its rank on another, so a deeper fetch gives the fusion more to work
-    /// with, and the dense arm's traversal widens once the fetch passes
-    /// half its default width. `fusion` is how the arms' pages become one,
+    /// with. `fusion` is how the arms' pages become one,
     /// `"rrf"` or `{"type": "rrf", "k": 60.0}`, being reciprocal rank
     /// fusion: a record's fused score is the sum over the pages it appears
     /// on of `1 / (k + rank)`, rank counted from one, reading no score,
@@ -1060,8 +1048,7 @@ impl HNSWIndex {
     /// with the query and a filter may admit fewer records than asked for.
     /// Each carries `id`, `score`, `metadata` and `contributions`. For one
     /// arm the score is the arm's own, being the dense distance or the
-    /// sparse similarity, and a one arm dense query is `search` id for id
-    /// and score for score. For several it is the fused score, higher
+    /// sparse similarity. For several it is the fused score, higher
     /// better and comparable only with the other fused scores of the same
     /// query, and `contributions` is what it was made from: one entry per
     /// arm's page the record appeared on, in arm order, each carrying the
@@ -1070,9 +1057,8 @@ impl HNSWIndex {
     /// orders the page, so a query returns the same page from one run to
     /// the next.
     ///
-    /// Every rule is checked before any guard is taken, so a refused query
-    /// changes nothing. `explain` returns the plan the same query runs
-    /// under without running it.
+    /// `explain` returns the plan the same query runs under without
+    /// running it.
     ///
     /// # Where the interpreter lock is held
     ///
@@ -1129,22 +1115,22 @@ impl HNSWIndex {
     /// metadata, and not the search.
     ///
     /// `admit` is the shape of the admit set: `{"shape": "all"}` for no
-    /// filter or a filter admitting every live record above the dense scan
-    /// threshold, `{"shape": "bitmap", "admitted": n}` for a filter every
-    /// field of which is declared, `{"shape": "sorted", "admitted": n}` for
-    /// a metadata walk that finished, `{"shape": "bounded", "bound": n}`
-    /// for a walk that gave up inside the bound the declared fields left,
-    /// and `{"shape": "predicate"}` for one that gave up over every record.
+    /// filter or a filter on declared fields admitting every live record
+    /// above the dense scan threshold, `{"shape": "bitmap", "admitted": n}`
+    /// for a filter every field of which is declared,
+    /// `{"shape": "sorted", "admitted": n}` for a metadata walk that
+    /// finished, `{"shape": "bounded", "bound": n}` for a walk that gave up
+    /// inside the bound the declared fields left, and
+    /// `{"shape": "predicate"}` for one that gave up over every record.
     ///
     /// `arms` is one dict per arm, in arm order: `space` and `kind` name
-    /// the space the arm asks, `fetch` is the candidates it was asked for,
+    /// the space the arm asks, `fetch` is the candidates it asks the space for,
     /// `exact` says whether its page is exact by construction, being a
     /// scan rather than a graph traversal, and `cost_ns` is the arm's own
     /// estimate of its work, in nanoseconds.
     ///
     /// **`cost_ns` is an estimate of the arm's own work and nothing more.**
-    /// It is priced from unit costs the space timed on itself when it was
-    /// built or loaded, and it leaves out what the collection pays around
+    /// It leaves out what the collection pays around
     /// the arm, being the filter's evaluation over the columns and the
     /// page's assembly, which measured near seventy microseconds a query at
     /// fifty thousand records under a filter admitting every record. A
@@ -1183,15 +1169,7 @@ impl HNSWIndex {
     /// On a journaled index the directory is the journal's own and no other,
     /// and the save is a checkpoint; see `journal_to` and `checkpoint`.
     ///
-    /// The whole save runs with the interpreter lock released. `save` reaches
-    /// `save_config`, `save_mappings`, `save_metadata`,
-    /// `save_quantization_config`, `save_pq_centroids`, `save_int8_scales`
-    /// and `save_vectors`, and every one of them speaks only to `serde_json`,
-    /// the engine's frame and the storage seam. `save_hnsw_graph` reaches
-    /// `graph::dump::write_dump`, which names PyO3 nowhere, and
-    /// `save_manifest` and `Staged::commit` after it speak only to
-    /// `serde_json` and the storage seam. Nothing in the index crate names
-    /// Python at all.
+    /// The whole save runs with the interpreter lock released.
     #[instrument(level = "info", skip(self, py), fields(
         vector_count = self.peek(Collection::try_vector_count),
         has_quantization = self.peek(|inner| Some(inner.has_quantization())),
@@ -1224,22 +1202,22 @@ impl HNSWIndex {
     /// they differ in what an operating system crash or a power loss costs.
     ///
     /// - `"call"`, the default: every record of a call is on the device before
-    ///   the call returns, or the call reported or raised the failure. One
-    ///   flush per call, about a millisecond, which a caller adding in batches
-    ///   does not notice and a caller adding one record at a time pays on
-    ///   every record.
+    ///   the call returns, or the call reported or raised the failure. A call
+    ///   that records anything flushes, about a millisecond a flush, which a
+    ///   caller adding in batches does not notice and a caller adding one
+    ///   record at a time pays on every record.
     /// - `"interval"`: every record is in the kernel when the call returns, and
-    ///   a thread of the index's own flushes the file within `interval_ms`
-    ///   milliseconds, 10 by default, of the first call that dirtied it. The
-    ///   thread stops with the index. What is traded is the calls that
-    ///   returned inside the last interval, which a crash of the operating
-    ///   system loses; a stopped process loses none of them.
-    /// - `"none"`: every record is in the kernel when the call returns and
-    ///   nothing flushes the file until the next checkpoint. For a bulk load
-    ///   that calls `checkpoint()` at the end.
+    ///   a thread of the index's own flushes the file after `interval_ms`
+    ///   milliseconds, 10 by default, have passed since the first call that
+    ///   dirtied it. The thread stops with the index. What is traded is the
+    ///   calls not yet flushed, which a crash of the operating system loses; a
+    ///   stopped process loses none of them.
+    /// - `"none"`: every record is in the kernel when the call returns, and on
+    ///   the device by the next checkpoint. For a bulk load that calls
+    ///   `checkpoint()` at the end.
     ///
-    /// A call whose flush fails raises, or under `add` reports every record of
-    /// the batch in `AddResult.errors`, and installs none of them. The journal
+    /// A call whose flush fails raises, or under `add` reports every record not
+    /// yet installed in `AddResult.errors`, and installs none of them. The journal
     /// withdraws those records, by an abort record or by cutting them off, so
     /// a replay does not install them, and the message says which, or says
     /// that neither landed and the records may come back after a crash until
@@ -1256,14 +1234,16 @@ impl HNSWIndex {
     /// segment deleted or moved under a live index is one the directory can no
     /// longer replay, so drop the index before touching the journal. A record
     /// whose journal entry would exceed 65 MiB is refused on a journaled index
-    /// and accepted on one without a journal. In a child process forked from
-    /// the one that opened the journal, every mutation raises `JournalForked`.
+    /// and accepted on one without a journal. When the process that opened
+    /// the journal forks while no call on the index runs, every mutation in
+    /// the child is refused with `JournalForked`, which `add()` reports in
+    /// `errors`.
     ///
     /// Raises ValueError for a durability that is not one of the three, for
-    /// `interval_ms` under any other durability, for `interval_ms` of 0 or
-    /// below, and RuntimeError for an index that already has a journal, for a
-    /// directory another holder has locked, and for a filesystem that cannot
-    /// lock.
+    /// `interval_ms` under any other durability or of 0 or below, and for a
+    /// path with no name of its own. Raises RuntimeError for an index that
+    /// already has a journal or was opened read only, and for a path that
+    /// cannot be locked or written as an index's directory.
     #[pyo3(signature = (path, durability = "call", interval_ms = None))]
     #[instrument(level = "info", skip(self, py), fields(
         path = path,
@@ -1288,7 +1268,7 @@ impl HNSWIndex {
     /// journal again after it.
     ///
     /// What `save(path)` does on a journaled index, with the path taken from
-    /// the journal. Nothing runs it for you. An index that is never
+    /// the journal. Nothing runs it on an open index. An index that is never
     /// checkpointed opens by replaying every record in its journal, each at the
     /// cost of the `add` that wrote it, so a directory with a million records
     /// in the journal takes minutes to open where its checkpoint takes seconds.
@@ -1297,17 +1277,14 @@ impl HNSWIndex {
     /// long-running process checkpoints on a schedule of its own, since a
     /// checkpoint holds writes for the length of the save.
     ///
-    /// The journal moves onto a new segment naming the directory just written,
-    /// and every segment the directory holds the records of is deleted.
-    ///
     /// After a call whose flush failed, this is what lets the index take
     /// mutations again. The flush is tried once more and a failure is logged
     /// and passed, since the directory is written from memory and holds every
-    /// record the index holds. The segments the failure touched are deleted
-    /// once the directory is in place.
+    /// record the index holds.
     ///
-    /// Raises RuntimeError on an index with no journal, and on an index read
-    /// from a directory this process cannot write.
+    /// Raises RuntimeError on an index with no journal or opened read only, in
+    /// a child forked from the process that opened the journal, and where the
+    /// save or the journal fails.
     #[instrument(level = "info", skip(self, py), fields(
         vector_count = self.peek(Collection::try_vector_count)
     ), err)]
@@ -1320,7 +1297,8 @@ impl HNSWIndex {
     /// The journal this index records its mutations to, being the directory
     /// of its segments, `<path>.zdbjournal`, or `None` where it has no
     /// journal. `journal_to` sets it and `load` of a journaled directory finds
-    /// it. An index read from a directory this process cannot write has none.
+    /// it. An index a load opened read only or with `checkpoint_only=True` has
+    /// none.
     #[getter]
     pub fn journal_path(&self, py: Python<'_>) -> Result<Option<String>, PyEngineError> {
         let path = self.cheap(py, "journal_path", Collection::try_journal_path, |inner| {
@@ -1331,8 +1309,8 @@ impl HNSWIndex {
 
     /// Python property: `index.identity`
     ///
-    /// What this index is, as every directory it saves records it under
-    /// `identity` in `manifest.json`. A dict of six keys.
+    /// What this index is, as every directory it saves records it. A dict of
+    /// six keys.
     ///
     /// - `collection_id`: the index's id, 32 hexadecimal digits, drawn when
     ///   the index is created and kept through every save and load. The
@@ -1345,13 +1323,9 @@ impl HNSWIndex {
     /// - `parent`: the snapshot that directory was saved from, or `None`.
     /// - `saved_at`: the time, in RFC 3339, that directory's manifest
     ///   records as its save, or `None` where `snapshot` is `None`.
-    /// - `sequence`: the journal sequence that directory's state holds, or 0
-    ///   where it records none.
+    /// - `sequence`: the journal sequence that directory's manifest records
+    ///   under `identity`, or 0 where it records none.
     ///
-    /// Of two directories of one index the higher generation is the later
-    /// save, and a directory whose `parent` is another's `snapshot` was saved
-    /// from that one. Two directories naming one parent under two snapshots
-    /// were saved from one state twice, and a backup is one of them.
     /// `clear()` keeps all six.
     #[getter]
     pub fn identity(&self, py: Python<'_>) -> Result<Py<PyAny>, PyEngineError> {
@@ -1373,9 +1347,9 @@ impl HNSWIndex {
     ///   read.
     /// - `journaled`: whether a journal was read.
     /// - `checkpoint_sequence`: the sequence the directory's checkpoint
-    ///   holds.
-    /// - `first_sequence`: the first sequence above the checkpoint the
-    ///   journal holds, or 0 where none was read.
+    ///   holds, or 0 where its manifest names no journal.
+    /// - `first_sequence`: the first sequence above the checkpoint, or 0
+    ///   where no journal was read.
     /// - `records_in_journal`: the operation records above the checkpoint
     ///   the load kept.
     /// - `replayed`, `withdrawn`, `skipped`: the records applied, the records
@@ -1403,14 +1377,13 @@ impl HNSWIndex {
     ///   format 5.0.0 records, or a value the directory holds past the bound
     ///   on a vector's norm or on a sparse value with its file and the bound,
     ///   the last two in the words every save of it is refused in.
-    /// - `repair`: where a load with `repair=True` cut the journal or set a
-    ///   stale segment aside, a dict of `kept_through`, `discarded_from`,
-    ///   `records_discarded`, `bytes_discarded` and `quarantine`, being the
-    ///   last sequence kept, the first set aside past the checkpoint or
-    ///   `None` where only a stale segment was set aside, the whole records
-    ///   and the bytes set aside, and the folder they were copied into, or
-    ///   `None` where the medium refused the write. `None` where no repair set
-    ///   anything aside.
+    /// - `repair`: where a load with `repair=True` found the journal to cut or
+    ///   a stale segment to set aside, a dict of `kept_through`,
+    ///   `discarded_from`, `records_discarded`, `bytes_discarded` and
+    ///   `quarantine`, being the last sequence kept, the first left out past
+    ///   the checkpoint or `None` where only a stale segment was set aside, the
+    ///   whole records and the bytes left out, and the folder they were copied
+    ///   into, or `None` where nothing was copied. `None` otherwise.
     /// - `replaced`: each value the directory records that a load of format
     ///   5.0.0 refuses and the load took another in place of, as a dict of
     ///   `file`, `field`, `recorded`, `taken` and `detail`, being the file,
@@ -1446,14 +1419,17 @@ impl HNSWIndex {
     /// with no journal and on one a load opened read only because the medium
     /// refused writes.
     ///
-    /// Raises RuntimeError before anything is written for the directory the
-    /// index's journal sits beside or a read-only index was read from
+    /// Raises ValueError for a path with no name of its own. Raises
+    /// RuntimeError before anything is written for the directory the index's
+    /// journal sits beside or a read-only index was read from
     /// (BackupIntoOwnDirectory), for a directory with a journal beside it
     /// (BackupTargetJournaled), for a path holding a file or a folder of
     /// other files (TargetNotAnIndex), for a directory another holder locks
     /// (CollectionLocked), and for an index opened read only for a feature
-    /// this build does not know (FeatureReadOnly). A directory an earlier
-    /// save or backup wrote at that path, of any format, is replaced whole.
+    /// this build does not know (FeatureReadOnly). It raises RuntimeError as
+    /// well for a lock it cannot take and for an index it cannot save. A
+    /// directory an earlier save or backup wrote at that path, of any format,
+    /// is replaced whole.
     #[instrument(level = "info", skip(self, py), fields(
         vector_count = self.peek(Collection::try_vector_count)
     ), err)]
@@ -1571,9 +1547,7 @@ impl HNSWIndex {
     /// stops early, and a record it skipped would make the answer a lower
     /// bound rather than a count. Where every field the filter names is
     /// declared in `indexed_fields`, it counts the bits of the columns'
-    /// selection and reads no metadata. Where some are, it reads the metadata
-    /// of the records the declared fields leave, and where none are, the
-    /// metadata of every record.
+    /// selection and reads no metadata. Otherwise it reads records' metadata.
     ///
     /// It compiles the filter language `search` takes, and judges a record
     /// by the same compiled filter, so a filter counts the records a search
@@ -1612,7 +1586,7 @@ impl HNSWIndex {
     /// Empty on an index created without `indexed_fields` and on every
     /// directory saved before the declaration existed. A filter naming a field
     /// not in this list still works and still returns the same records; what it
-    /// costs is a walk of every record's metadata.
+    /// costs is a walk of records' metadata.
     #[getter]
     pub fn indexed_fields(&self, py: Python<'_>) -> Result<Vec<String>, PyEngineError> {
         self.cheap(
@@ -1633,19 +1607,15 @@ impl HNSWIndex {
     /// same index reports a smaller graph after a save and load round trip than
     /// it did when it was built.
     ///
-    /// `compact()` rebuilds the graph by inserting and shrinks the graph it
-    /// built in the same way, so a caller who runs compaction gets the
-    /// graph's slack back too. This gives it back without the rebuild.
-    ///
-    /// **No node, edge or distance is touched.** Fourteen buffers are
+    /// **No node, edge or distance is touched.** The buffers are
     /// reallocated at their current lengths and their contents copied, so the
     /// topology after the call is the topology before it and every search
     /// returns the same page with the same scores.
     ///
-    /// The id store, the per-record metadata and the declared columns give
-    /// back what they reserved past their records the same way, at their
-    /// lengths, so no record, field or value moves either. What the call
-    /// returns is exactly what `get_stats()["reserved_memory_mb"]` priced.
+    /// The id store, the per-record metadata and the declared columns shrink
+    /// the same way, at their lengths, so no record, field or value moves
+    /// either. What the call returns is exactly what
+    /// `get_stats()["reserved_memory_mb"]` priced.
     ///
     /// **The index stays writable.** Every buffer is a growable vector, so the
     /// next `add()` reallocates the per node arenas once and then proceeds as
@@ -1657,10 +1627,9 @@ impl HNSWIndex {
     /// Returns the bytes released, which is zero only when the buffers are
     /// already tight, in which case nothing is reallocated either.
     ///
-    /// **On an empty index it releases the whole creation reservation**, which
-    /// is what `expected_size` bought. Calling it before inserting is therefore
-    /// not free: it hands back the pre-allocation and every subsequent
-    /// insertion regrows the arenas from nothing. Call it on an index that
+    /// **On an empty index it releases the arenas `expected_size` reserved**,
+    /// so calling it before inserting is not free: every subsequent insertion
+    /// regrows them from nothing. Call it on an index that
     /// holds its records, not on one about to receive them.
     pub fn shrink_to_fit(&self, py: Python<'_>) -> Result<usize, PyEngineError> {
         self.released(py, "shrink_to_fit()", |inner| Ok(inner.shrink_to_fit()))
@@ -1668,20 +1637,16 @@ impl HNSWIndex {
 
     /// Get records by ID(s) with PQ reconstruction support and storage mode awareness
     ///
-    /// Looks the ids up in the union of the raw vectors and the quantized codes,
-    /// so it already saw every record before the other accessors did.
-    ///
     /// **An absent id is dropped by default and raised with `strict=True`.** The
     /// default is silence because that is what every existing caller is written
     /// against: asking for ten ids and receiving nine has always been how this
     /// reports an id the index does not hold, and changing the return shape
     /// would break every one of them. What the default cannot do is say *which*
     /// nine, since the result is not aligned with the input. `strict=True`
-    /// raises a `KeyError` naming the absent ids, which is the form a caller who
-    /// cares can act on, and it is recommended over the alternative of returning
-    /// a structure carrying the misses: a caller who passes ids it believes are
-    /// present wants the failure, and one who does not can filter with
-    /// `contains`.
+    /// raises a `KeyError`, which is the form a caller who cares can act on,
+    /// and it is recommended over the alternative of returning a structure
+    /// carrying the misses: a caller who passes ids it believes are present
+    /// wants the failure, and one who does not can filter with `contains`.
     ///
     /// `return_vector` is served from the raw vector where one exists and from a
     /// reconstruction of the code where one does not. Under `quantized_only`
@@ -1692,7 +1657,8 @@ impl HNSWIndex {
     /// subvectors and 8 bits, a reconstructed vector differed from the stored
     /// unit vector by 0.066 at the worst component and sat at cosine similarity
     /// 0.991 to it. Under `quantized_with_raw` every record keeps its raw
-    /// vector and returns exactly. `get_stats()["raw_vectors_stored"]` is what
+    /// vector and returns the stored vector exactly, at unit length under
+    /// `cosine`. `get_stats()["raw_vectors_stored"]` is what
     /// tells the two apart in aggregate.
     #[pyo3(signature = (input, return_vector = true, strict = false))]
     pub fn get_records(
@@ -2064,9 +2030,9 @@ impl HNSWIndex {
     /// mapping clears the record's metadata, which is a write and returns
     /// `true`.
     ///
-    /// **It touches `vector_metadata` and nothing else.** No graph work, no
-    /// vector work, no id allocation, no training. The record keeps its internal
-    /// id, its graph node, its stored vector and its quantized codes.
+    /// No graph work, no vector work, no id allocation, no training. The
+    /// record keeps its internal id, its graph node, its stored vector and its
+    /// quantized codes.
     ///
     /// That is the reason it exists. Re-tagging a document used to mean reading
     /// it back with `get_records` and adding it again with `overwrite=True`, and
@@ -2096,9 +2062,7 @@ impl HNSWIndex {
     /// width or the wrong metric rejects or misranks its records outright, and
     /// `ef_construction` describes work already done.
     ///
-    /// At least one of the three has to be given. Rebuilding the graph as it
-    /// stands is `compact()`, which reclaims the nodes removals and overwrites
-    /// leave behind.
+    /// At least one of the three has to be given.
     ///
     /// `expected_size` moves with `m` because the two are related. It selects
     /// the default `m`, it sizes the replacement graph's reservation, and it is
@@ -2107,15 +2071,11 @@ impl HNSWIndex {
     ///
     /// `ef_construction` moves with them because **the warning below names it as
     /// one of two remedies and a caller has to be able to take either.** Raising
-    /// `m` past half of `ef_construction` switches the neighbour selection
-    /// heuristic off, and the message says to raise `ef_construction` or lower
-    /// `m`. It is honest to report afterwards for the same reason the rebuild is
-    /// honest at all: every record really was re-inserted at the new width.
+    /// `m` to half of `ef_construction` or past it draws the warning, and the
+    /// message says to raise `ef_construction` or lower `m`.
     ///
-    /// **Everything except the graph survives untouched.** Each record is
-    /// re-inserted under the internal id it already holds, so the id store,
-    /// the metadata store and every declared field's column stay
-    /// correct without being rewritten, and the record any given id resolves to
+    /// **Every record survives unchanged.** Each record is re-inserted under
+    /// the internal id it already holds, so the record any given id resolves to
     /// is the same before and after. A quantized index is rebuilt from its
     /// stored codes rather than re-encoded, so the codebook is not retrained and
     /// no record's code changes; a `quantized_with_raw` index carries its raw
@@ -2184,8 +2144,7 @@ impl HNSWIndex {
     ///
     /// This is never automatic. Calling it is a decision a deployment can schedule.
     ///
-    /// The rebuild runs with the interpreter lock released, and every function
-    /// it reaches is in the index crate, which names nothing of Python.
+    /// The rebuild runs with the interpreter lock released.
     pub fn compact(&self, py: Python<'_>) -> Result<usize, PyEngineError> {
         self.released(py, "compact()", |inner| inner.compact())
     }

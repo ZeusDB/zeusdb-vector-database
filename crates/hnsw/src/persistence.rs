@@ -39,10 +39,9 @@
 //! only copy of each record's row. A 5.x directory holds no `pq_codes.bin`
 //! and no `int8_rows.zdbint8`, and holds `vectors.bin` only beside a trained
 //! product quantized graph under `quantized_with_raw`. A release reading 1.x
-//! to 4.x alone refuses such a directory at its version check, with a
-//! message naming the newer release. Every field of a 5.x manifest is held
-//! to what a save writes, and `metadata.json` names only the records that
-//! hold a field, in increasing internal id.
+//! to 4.x alone refuses such a directory at its version check. Every field
+//! of a 5.x manifest is held to what a save writes, and `metadata.json`
+//! names only the records that hold a field, in increasing internal id.
 //! A 5.x manifest lists its features and records its identity with the
 //! journal sequence its state holds, and one missing either is refused.
 //!
@@ -107,7 +106,7 @@
 //! declaration is validated on load under the rules `Declaration` applies.
 //! A tokenizer the engine cannot write down is recorded as `external`, and
 //! a directory recording one opens only through `Collection::load_with`
-//! with the same implementation handed to it.
+//! with an implementation handed to it.
 //!
 //! ## How a save lands
 //!

@@ -5,12 +5,12 @@
 //!
 //! One or more arms, each naming a space by the kind of query it carries,
 //! a filter the arms share, the page size `k`, how many candidates each arm
-//! contributes, and how the arms' pages are fused. A one arm query is that
-//! arm's search and returns its page, so the single space search methods on
-//! the collection are one arm queries. A query over several arms runs each
-//! under the same admit set and fuses the pages by rank; see the fusion
-//! module in the engine's floor for what a fused page is and what it is
-//! not.
+//! contributes, and how the arms' pages are fused. A one arm query at the
+//! default fetch is that arm's search and returns its page, so the single
+//! space search methods on the collection are one arm queries. A query over
+//! several arms runs each under the same admit set and fuses the pages by
+//! rank; see the fusion module in the engine's floor for what a fused page
+//! is and what it is not.
 //!
 //! # What the planner decides
 //!
@@ -23,7 +23,8 @@
 //! the planner does not choose between fusing the arms and chaining them,
 //! and it drops none. What it decides is the admit set, once, for every
 //! arm, including the one thing it can vary there without moving a page: a
-//! filter admitting every live record is handed on as no filter at all,
+//! filter on declared fields admitting every live record, above the dense
+//! scan threshold, is handed on as no filter at all,
 //! which spares a term weighted sparse arm the walk over the whole live set
 //! it would otherwise make, a fifth of such a query, and a dot product arm
 //! the bit test per posting, an eighth, while a dense traversal measures
@@ -79,7 +80,8 @@ pub const MAX_ARMS: usize = 8;
 /// the better arm alone to 0.842 fused at a fetch of `k`, 0.892 at five
 /// times `k` and 0.919 at ten. Five is the largest multiple the dense arm
 /// pays nothing measurable for at a page of ten, since the traversal's
-/// default width is the larger of twice the fetch and one hundred, so
+/// default width under `cosine` and `dot` is the larger of twice the fetch
+/// and one hundred, so
 /// fetching fifty runs the traversal a single search runs and fetching a
 /// hundred doubles its width: a fused query at fetch fifty measured 1.06 to
 /// 1.13 of one at fetch ten with every interval including 1.0, and at a
@@ -198,8 +200,8 @@ pub struct Plan {
 /// The shape of the admit set every arm ran under.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AdmitShape {
-    /// Every live record, for no filter or for a filter that admits every
-    /// live record above the dense scan threshold.
+    /// Every live record, for no filter or for a filter on declared fields
+    /// that admits every live record above the dense scan threshold.
     All,
     /// A filter's bitmap, of this many records.
     Bitmap { admitted: usize },
@@ -273,14 +275,15 @@ pub struct ArmPlan {
     /// evaluation over the columns and the page's assembly, which together
     /// measured near forty microseconds a query at fifty thousand records
     /// whatever the filter admitted, and it is as good as the units the
-    /// index timed on itself: a graph of a hundred dimensions priced its
+    /// index timed on itself, or took as fixed where it was too small to
+    /// time: a graph of a hundred dimensions priced its
     /// searches at a third to a half of their measured time at every
     /// selectivity, and one of fifteen hundred within a fifth at the broad
     /// ones.
     pub cost: Cost,
 }
 
-/// An arm held to its rules before any guard is taken: the dense vector
+/// An arm held to its rules before the search runs: the dense vector
 /// checked and processed for its space with its parameters resolved, the
 /// sparse vector owned, or a text arm's terms as the tokenizer split them,
 /// which carry no id until the search holds the dictionary's guard. The
@@ -371,8 +374,8 @@ impl Collection {
 
     /// Run a query and return its page with the plan that produced it.
     ///
-    /// Every rule a query has to satisfy is checked before any guard is
-    /// taken, so a bad query changes nothing and costs nothing. The page is
+    /// Every rule a query has to satisfy is checked before the search runs,
+    /// so a bad query changes nothing and runs no search. The page is
     /// best first, cut to `k`, and may be shorter, since an arm returns no
     /// record that scored nothing and a filter may admit fewer records than
     /// were asked for. Among equal fused scores the external id orders the
@@ -387,7 +390,7 @@ impl Collection {
     }
 
     /// Hold a query to its rules and settle every arm's query, taking no
-    /// guard at all. A text arm is settled to its terms, which are counted
+    /// write guard. A text arm is settled to its terms, which are counted
     /// into ids once the search holds the dictionary's guard.
     fn settle_arms<'a>(&self, query: &Query<'a>) -> Result<(Vec<Settled<'a>>, usize), Error> {
         if query.arms.is_empty() {

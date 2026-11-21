@@ -833,7 +833,8 @@ impl IdStore {
     /// Bytes of that request no record has been written into: the arena
     /// past its text, the entries past the positions assigned and the live
     /// set's words past them, which [`IdStore::shrink_to_fit`] gives back.
-    /// The table gives nothing, since it is sized from the records it holds.
+    /// The table gives nothing, since it keeps the size it was reserved or
+    /// grew to.
     pub fn reserved_bytes(&self) -> usize {
         (self.text.capacity() - self.text.len())
             + (self.entries.capacity() - self.entries.len()) * std::mem::size_of::<u64>()

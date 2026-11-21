@@ -847,7 +847,7 @@ impl Collection {
 
         // Of the sum below, the bytes no record has been written into.
         //
-        // The graph's fifteen buffers and the vector stores are growable
+        // The graph's buffers and the vector stores are growable
         // blocks. They start at the creation-time reservation, which is
         // `expected_size` records or as many as `RESERVE_BYTES` holds,
         // whichever is smaller, and a build past that grows them geometrically,
@@ -864,15 +864,17 @@ impl Collection {
         // block, which no arithmetic here can see.
         //
         // It is exactly the figure `shrink_to_fit()` returns, in bytes, since
-        // both are the same fifteen buffers, the same vector stores, the
+        // both are the same buffers, the same vector stores, the
         // dense index's node for each position, the id store, the metadata
         // store and the columns, priced at the gap between their capacity and
         // their length, and the live sets' words past the last position
         // written. A caller who reads a
         // large figure here and is finished inserting can call that and get it
-        // back. The hash tables contribute nothing, because hashbrown sizes a
-        // table at a power of two from its length and shrinking recomputes the
-        // same power of two. The sparse space's slack sits outside both.
+        // back. The id store's table and the hash tables contribute nothing:
+        // the id store keeps its table at the size it was reserved or grew to,
+        // and hashbrown sizes a table at a power of two from its length and
+        // shrinking recomputes the same power of two. The sparse space's slack
+        // sits outside both.
         let reserved_bytes = reserved_bytes + ids_reserved + metadata_reserved + columns_reserved;
         let reserved_memory_mb = reserved_bytes as f64 / (1024.0 * 1024.0);
         stats.insert(

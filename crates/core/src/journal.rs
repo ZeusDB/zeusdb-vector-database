@@ -176,14 +176,15 @@
 //! withdraws a call whose commit failed. Rolls onto a new segment when the
 //! active one passes [`SEGMENT_ROLL_BYTES`] at a commit, and onto a segment
 //! naming a new checkpoint when a checkpoint asks, deleting every segment
-//! that checkpoint holds. A segment's own sync does not make its name
-//! durable, so the journal's directory is synced before a segment takes a
-//! record and after segments are deleted, and a sync that fails stops the
-//! writer until a checkpoint's roll lands. It refuses every operation in a
-//! process other than the one that opened it, which is a child forked from
-//! it, since the child shares the parent's open file. It takes no index
-//! type, holds no index lock and knows nothing of a collection, and it
-//! reaches its directory through the [`JournalDir`] it is handed.
+//! that checkpoint holds where the system allows. A segment's own sync does
+//! not make its name durable, so the journal's directory is synced before a
+//! segment takes a record and after segments are deleted, and a sync that
+//! fails stops the writer until a checkpoint's roll lands. It refuses every
+//! operation in a process other than the one that opened it, which is a
+//! child forked from it, since the child shares the parent's open file. It
+//! takes no index type, holds no index lock and knows nothing of a
+//! collection, and it reaches its directory through the [`JournalDir`] it
+//! is handed.
 
 use crate::checksum::checksum_of;
 use crate::error::Error;
@@ -1912,8 +1913,8 @@ fn stale_header(
 ///
 /// The durability policies are the caller's. A per-call policy commits with
 /// `Sync`; an interval policy commits with `Deferred` and syncs from its own
-/// thread through a [`JournalSyncHandle`]; a policy that never syncs commits
-/// with `Deferred` and nothing else.
+/// thread through a [`JournalSyncHandle`]; a policy with no sync of its own
+/// commits with `Deferred` and nothing else.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CommitMode {
     /// The file's data is on the device before the call returns.

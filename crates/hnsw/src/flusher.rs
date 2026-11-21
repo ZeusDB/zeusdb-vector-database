@@ -13,9 +13,10 @@
 //! for an hour wakes it not once. The first commit after a clean stretch
 //! wakes it; it then waits one interval, so the records of the calls that
 //! follow gather behind the first, clears the mark and syncs once. A record
-//! is therefore on the device within one interval of the call that wrote
-//! it returning, and a burst of calls costs one sync an interval rather than
-//! one a call. The wait for the interval ends when the interval has passed
+//! is therefore on the device within one interval and two syncs of the call
+//! that wrote it returning, the sync under way when it was written and its
+//! own, and a burst of calls costs one sync an interval rather than one a
+//! call. The wait for the interval ends when the interval has passed
 //! or the stop is set, and a wakeup for any other reason, a spurious one
 //! among them, does not end it.
 //!

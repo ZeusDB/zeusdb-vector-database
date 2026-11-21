@@ -527,12 +527,12 @@ impl Collection {
     /// the sequence it names.
     ///
     /// Then the journal rolls onto a segment naming the directory just
-    /// committed and deletes every segment that directory holds. A crash
-    /// before the roll leaves segments naming the previous directory, every
-    /// record of which the new one holds, so a load finds them stale,
-    /// creates the segment the roll would have and deletes them. A crash in
-    /// the deletion leaves some of them, which a load deletes. The commit of
-    /// the roll clears a fault a failed commit left.
+    /// committed and deletes every segment that directory holds where the
+    /// system allows. A crash before the roll leaves segments naming the
+    /// previous directory, every record of which the new one holds, so a load
+    /// finds them stale, creates the segment the roll would have and deletes
+    /// them. A crash in the deletion leaves some of them, which a load
+    /// deletes. The commit of the roll clears a fault a failed commit left.
     pub(crate) fn save_locked(&self, path: &str) -> Result<(), Error> {
         self.save_locked_as(path, CheckpointKind::Save)
     }
@@ -763,8 +763,9 @@ impl Collection {
     /// sits beside or a read-only collection was read from, a directory with
     /// a journal of either version beside it, a path that is not an index
     /// directory, and a directory another holder locks. The journal is
-    /// synced as a checkpoint syncs it, and a sync that fails is logged and
-    /// leaves the fault, since the copy is written from memory and holds
+    /// synced as a checkpoint syncs it. A child forked from the process that
+    /// opened the journal is refused there, and any other failure is logged
+    /// and leaves the fault, since the copy is written from memory and holds
     /// every record the collection holds whatever the journal lost. Then
     /// the save's four phases under the target's lock.
     ///
@@ -908,11 +909,11 @@ impl Collection {
     /// `config.json` records the tokenizer by value. The built-in one is
     /// recorded as `simple` and needs nothing handed. A caller's own
     /// implementation is recorded as `external`, and a directory recording
-    /// that opens only when the same implementation is handed here, because
-    /// a query tokenized any other way would not find the terms the records
-    /// were counted into. A tokenizer whose declaration is not the one
-    /// recorded is refused, and so is one handed to a directory that takes
-    /// no text.
+    /// that opens only when an implementation is handed here, which the caller
+    /// keeps the same, because a query tokenized any other way would not find
+    /// the terms the records were counted into. A tokenizer whose declaration
+    /// is not the one recorded is refused, and so is one handed to a directory
+    /// that takes no text.
     pub fn load_with(path: &str, tokenizer: Option<Arc<dyn Tokenizer>>) -> Result<Self, Error> {
         crate::persistence::load_index(
             path,
@@ -1065,7 +1066,8 @@ impl Collection {
     /// past it, which is [`Collection::save`] with the path taken from the
     /// journal rather than named again.
     ///
-    /// Nothing runs this on its own. A checkpoint holds the mutation guard
+    /// Nothing runs this on its own but a load, which takes one for an upgrade,
+    /// an abort or a repair. A checkpoint holds the mutation guard
     /// for the whole of a save, which is seconds at scale, and an engine
     /// that ran one inside an `add` would make one call in some thousands
     /// stall for that long at a moment the caller did not choose. The
