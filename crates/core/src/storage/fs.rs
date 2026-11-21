@@ -315,6 +315,34 @@ fn sibling(target: &Path, suffix: &str) -> Result<PathBuf, Error> {
     Ok(target.parent().unwrap_or_else(|| Path::new("")).join(name))
 }
 
+/// The most of a folder's `manifest.json` [`written_by_a_save`] reads,
+/// being far above any manifest a save writes.
+const MANIFEST_READ_LIMIT: usize = 1 << 20;
+
+/// Whether the file at `path` is a manifest a save writes: a JSON object
+/// whose `index_type` is `HNSW` and whose `format_version` is a string,
+/// which every manifest from format 1.0.0 to 5.0.0 holds. A file longer
+/// than [`MANIFEST_READ_LIMIT`] or holding anything else is one of the
+/// caller's own, which a save must not replace.
+fn written_by_a_save(path: &Path) -> io::Result<bool> {
+    let mut bytes = Vec::new();
+    File::open(path)?
+        .take(MANIFEST_READ_LIMIT as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MANIFEST_READ_LIMIT {
+        return Ok(false);
+    }
+    let Ok(serde_json::Value::Object(fields)) = serde_json::from_slice(&bytes) else {
+        return Ok(false);
+    };
+    Ok(
+        fields.get("index_type").and_then(serde_json::Value::as_str) == Some("HNSW")
+            && fields
+                .get("format_version")
+                .is_some_and(serde_json::Value::is_string),
+    )
+}
+
 impl Storage for FsStorage {
     /// `<name>.zdbold` present with no target is the one case that holds
     /// data: a save died between its two renames and that directory is the
@@ -396,21 +424,29 @@ impl Storage for FsStorage {
     }
 
     /// The target is read through its link where it is one, so a link to an
-    /// index directory is an index directory.
+    /// index directory is an index directory. A folder is an index directory
+    /// where its `manifest.json` is one a save writes; see
+    /// [`written_by_a_save`].
     fn foreign_target(&self) -> Option<String> {
         let metadata = fs::metadata(&self.target).ok()?;
         if !metadata.is_dir() {
             return Some("a file".to_string());
         }
-        if self.target.join("manifest.json").is_file() {
-            return None;
-        }
+        let manifest = self.target.join("manifest.json");
+        // What the folder's manifest.json is, where it holds one.
+        let held = manifest.is_file().then(|| written_by_a_save(&manifest));
+        let manifest_words = match &held {
+            None => "no manifest.json".to_string(),
+            Some(Ok(true)) => return None,
+            Some(Ok(false)) => "a manifest.json that no save wrote".to_string(),
+            Some(Err(error)) => format!("a manifest.json this process cannot read ({error})"),
+        };
         match fs::read_dir(&self.target).map(Iterator::count) {
             Ok(0) => None,
-            Ok(1) => Some("a folder holding 1 entry and no manifest.json".to_string()),
-            Ok(n) => Some(format!("a folder holding {n} entries and no manifest.json")),
+            Ok(1) => Some(format!("a folder holding 1 entry and {manifest_words}")),
+            Ok(n) => Some(format!("a folder holding {n} entries and {manifest_words}")),
             Err(error) => Some(format!(
-                "a folder this process cannot list ({error}) and no manifest.json"
+                "a folder this process cannot list ({error}) and {manifest_words}"
             )),
         }
     }
@@ -1511,8 +1547,9 @@ mod tests {
     }
 
     /// Nothing at the target, an empty folder and a folder holding a manifest
-    /// are each a target a save may replace. A file and a folder of other
-    /// entries are not, and each is named as what it is.
+    /// a save writes are each a target a save may replace. A file, a folder
+    /// of other entries and a folder whose manifest.json no save wrote are
+    /// not, and each is named as what it is.
     #[test]
     fn a_target_that_is_not_an_index_directory_is_named() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1532,6 +1569,15 @@ mod tests {
             Some("a folder holding 2 entries and no manifest.json")
         );
         fs::write(target.join("manifest.json"), b"{}").unwrap();
+        assert_eq!(
+            storage.foreign_target().as_deref(),
+            Some("a folder holding 3 entries and a manifest.json that no save wrote")
+        );
+        fs::write(
+            target.join("manifest.json"),
+            br#"{"index_type": "HNSW", "format_version": "5.0.0"}"#,
+        )
+        .unwrap();
         assert_eq!(storage.foreign_target(), None);
         let file = tmp.path().join("file.zdb");
         fs::write(&file, b"a file").unwrap();

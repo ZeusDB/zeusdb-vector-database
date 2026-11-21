@@ -13,7 +13,7 @@
 
 use pyo3::intern;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyString};
+use pyo3::types::{PyDict, PyFloat, PyList, PyString};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use zeusdb_vector_core::Error;
@@ -59,7 +59,11 @@ pub(crate) fn count_if_given(
 /// same function.
 pub(crate) const MAX_VALUE_DEPTH: usize = 128;
 
-/// A Python mapping as a metadata map.
+/// A Python mapping as a metadata map, held to the metadata rule.
+///
+/// A record's metadata, the metadata `update_metadata` replaces and every
+/// filter come through here. Each value is a metadata value, by
+/// [`metadata_value`]'s rule, and a refusal names the key it sits under.
 pub(crate) fn python_dict_to_value_map(
     py_dict: &Bound<PyDict>,
 ) -> PyResult<HashMap<String, Value>> {
@@ -68,62 +72,225 @@ pub(crate) fn python_dict_to_value_map(
     for (key, value) in py_dict.iter() {
         let string_key = key.extract::<String>()?;
         // The mapping itself is level one, so its values start at two.
-        let json_value = convert_value(&value, 2)?;
+        let json_value = convert_value(&value, 2, Rule::Metadata)
+            .map_err(|refused| refused.under(Step::Key(string_key.clone())).into_error())?;
         map.insert(string_key, json_value);
     }
 
     Ok(map)
 }
 
-/// One Python object as a `Value`.
+/// One metadata value as a `Value`, a record's metadata entry that is not
+/// a mapping being one.
+///
+/// A metadata value is `None`, a `bool`, an integer from -2^63 to 2^63 - 1,
+/// a finite float, a `str`, a list of metadata values or a mapping of `str`
+/// keys to metadata values, nested at most [`MAX_VALUE_DEPTH`] levels. Each
+/// comes back as the value it was, so any other value is refused, naming
+/// where it sits: a type JSON does not hold with `TypeError`, and a float
+/// that is not finite or an integer outside that range with `ValueError`.
+/// A `numpy` integer, float or bool and a `str` subclass are read by their
+/// value, which comes back exact.
+pub(crate) fn metadata_value(py_obj: &Bound<PyAny>) -> PyResult<Value> {
+    convert_value(py_obj, 1, Rule::Metadata).map_err(Refused::into_error)
+}
+
+/// One field of a declaration as a `Value`, for the parser of the
+/// declaration to hold to its own rules.
 ///
 /// The order the arms are tried in is the behaviour. `bool` comes before the
 /// integer arm because Python's `bool` extracts as an integer, and the integer
 /// arm comes before the float arm so a whole number stays exact rather than
-/// becoming an f64. Anything that matches none of them keeps its `str()`.
+/// becoming an f64. Anything that matches none of them keeps its `str()`,
+/// which the declaration's parser then refuses in its own words.
 pub(crate) fn python_object_to_value(py_obj: &Bound<PyAny>) -> PyResult<Value> {
-    convert_value(py_obj, 1)
+    convert_value(py_obj, 1, Rule::Declaration).map_err(Refused::into_error)
 }
 
-/// The recursion the two entry points above share, carrying the level it is at.
-fn convert_value(py_obj: &Bound<PyAny>, depth: usize) -> PyResult<Value> {
+/// Which values a conversion keeps: the metadata rule of [`metadata_value`],
+/// or a declaration's, which keeps every value as the arms of
+/// [`python_object_to_value`] read it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rule {
+    Metadata,
+    Declaration,
+}
+
+/// One step into what the caller handed over, from the outside in.
+enum Step {
+    Key(String),
+    Item(usize),
+}
+
+/// A value the metadata rule refuses, and why.
+enum Kind {
+    /// A type JSON does not hold, by its Python name.
+    Type(String),
+    /// A float that is not finite, as Python writes it.
+    NotFinite(String),
+    /// An integer outside -2^63 to 2^63 - 1, as Python writes it.
+    OutOfRange(String),
+}
+
+/// Why a conversion stopped: an error whose words are settled, or a value
+/// the metadata rule refuses, with the steps to it gathered on the way out.
+enum Refused {
+    Settled(PyErr),
+    Value { kind: Kind, steps: Vec<Step> },
+}
+
+impl From<PyErr> for Refused {
+    fn from(error: PyErr) -> Self {
+        Refused::Settled(error)
+    }
+}
+
+impl Refused {
+    /// The refusal one step further out.
+    fn under(mut self, step: Step) -> Self {
+        if let Refused::Value { steps, .. } = &mut self {
+            steps.push(step);
+        }
+        self
+    }
+
+    /// The exception a caller reads, naming where the value sits.
+    fn into_error(self) -> PyErr {
+        let (kind, steps) = match self {
+            Refused::Settled(error) => return error,
+            Refused::Value { kind, steps } => (kind, steps),
+        };
+        let place = if steps.is_empty() {
+            "the entry".to_string()
+        } else {
+            steps
+                .iter()
+                .rev()
+                .map(|step| match step {
+                    Step::Key(key) => format!("key '{}'", key),
+                    Step::Item(item) => format!("item {}", item),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        match kind {
+            Kind::Type(name) => PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
+                "the value at {} is a {}, and a metadata value is None, a bool, an int, a \
+                 float, a str, a list or a dict, so convert it to one of those.",
+                place, name
+            )),
+            Kind::NotFinite(value) => PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "the value at {} is {}, a float that is not finite, and a metadata value is a \
+                 finite float, so give None or a string in its place.",
+                place, value
+            )),
+            Kind::OutOfRange(value) => PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "the value at {} is {}, outside the integers from -2^63 to 2^63 - 1 that a \
+                 metadata value holds, so give it as a string.",
+                place, value
+            )),
+        }
+    }
+}
+
+/// A value the metadata rule refuses, of `kind`, with no step taken yet.
+fn refused(kind: Kind) -> Refused {
+    Refused::Value {
+        kind,
+        steps: Vec::new(),
+    }
+}
+
+/// Whether `py_obj` is a float of a type other than Python's own, being one
+/// `numbers.Real` holds and `numbers.Rational` does not, which is how
+/// `numpy`'s float types register, and which leaves out `Fraction`.
+fn is_other_float(py_obj: &Bound<PyAny>) -> PyResult<bool> {
+    let numbers = py_obj.py().import(intern!(py_obj.py(), "numbers"))?;
+    Ok(
+        py_obj.is_instance(&numbers.getattr(intern!(py_obj.py(), "Real"))?)?
+            && !py_obj.is_instance(&numbers.getattr(intern!(py_obj.py(), "Rational"))?)?,
+    )
+}
+
+/// A float as a `Value` under `rule`. A float that is not finite is
+/// refused under the metadata rule, and kept as its text under a
+/// declaration's.
+fn float_value(py_obj: &Bound<PyAny>, f: f64, rule: Rule) -> Result<Value, Refused> {
+    match serde_json::Number::from_f64(f) {
+        Some(num) => Ok(Value::Number(num)),
+        None if rule == Rule::Metadata => Err(refused(Kind::NotFinite(py_obj.str()?.to_string()))),
+        None => Ok(Value::String(f.to_string())),
+    }
+}
+
+/// The recursion the entry points above share, carrying the level it is at
+/// and the rule it keeps.
+fn convert_value(py_obj: &Bound<PyAny>, depth: usize, rule: Rule) -> Result<Value, Refused> {
     if depth > MAX_VALUE_DEPTH {
         return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
             "Nested value is deeper than {} levels, which is as far as mappings and lists nest.",
             MAX_VALUE_DEPTH
-        )));
+        ))
+        .into());
     }
 
     if py_obj.is_none() {
-        Ok(Value::Null)
-    } else if let Ok(b) = py_obj.extract::<bool>() {
-        Ok(Value::Bool(b))
-    } else if let Ok(i) = py_obj.extract::<i64>() {
-        Ok(Value::Number(serde_json::Number::from(i)))
-    } else if let Ok(f) = py_obj.extract::<f64>() {
-        if let Some(num) = serde_json::Number::from_f64(f) {
-            Ok(Value::Number(num))
-        } else {
-            Ok(Value::String(f.to_string()))
+        return Ok(Value::Null);
+    }
+    if let Ok(b) = py_obj.extract::<bool>() {
+        return Ok(Value::Bool(b));
+    }
+    match py_obj.extract::<i64>() {
+        Ok(i) => return Ok(Value::Number(serde_json::Number::from(i))),
+        // An integer past 64 bits, which the metadata rule refuses.
+        Err(error)
+            if rule == Rule::Metadata
+                && error.is_instance_of::<pyo3::exceptions::PyOverflowError>(py_obj.py()) =>
+        {
+            return Err(refused(Kind::OutOfRange(py_obj.str()?.to_string())));
         }
-    } else if let Ok(s) = py_obj.extract::<String>() {
-        Ok(Value::String(s))
-    } else if let Ok(py_list) = py_obj.cast::<PyList>() {
+        Err(_) => {}
+    }
+    match rule {
+        Rule::Metadata => {
+            if py_obj.is_instance_of::<PyFloat>() {
+                return float_value(py_obj, py_obj.extract::<f64>()?, rule);
+            }
+        }
+        Rule::Declaration => {
+            if let Ok(f) = py_obj.extract::<f64>() {
+                return float_value(py_obj, f, rule);
+            }
+        }
+    }
+    if let Ok(s) = py_obj.extract::<String>() {
+        return Ok(Value::String(s));
+    }
+    if let Ok(py_list) = py_obj.cast::<PyList>() {
         let mut vec = Vec::new();
-        for item in py_list.iter() {
-            vec.push(convert_value(&item, depth + 1)?);
+        for (item, value) in py_list.iter().enumerate() {
+            vec.push(
+                convert_value(&value, depth + 1, rule).map_err(|r| r.under(Step::Item(item)))?,
+            );
         }
-        Ok(Value::Array(vec))
-    } else if let Ok(py_dict) = py_obj.cast::<PyDict>() {
+        return Ok(Value::Array(vec));
+    }
+    if let Ok(py_dict) = py_obj.cast::<PyDict>() {
         let mut map = serde_json::Map::new();
         for (key, value) in py_dict.iter() {
             let string_key = key.extract::<String>()?;
-            let json_value = convert_value(&value, depth + 1)?;
+            let json_value = convert_value(&value, depth + 1, rule)
+                .map_err(|r| r.under(Step::Key(string_key.clone())))?;
             map.insert(string_key, json_value);
         }
-        Ok(Value::Object(map))
-    } else {
-        Ok(Value::String(py_obj.to_string()))
+        return Ok(Value::Object(map));
+    }
+    match rule {
+        Rule::Metadata if is_other_float(py_obj)? => {
+            float_value(py_obj, py_obj.extract::<f64>()?, rule)
+        }
+        Rule::Metadata => Err(refused(Kind::Type(py_obj.get_type().name()?.to_string()))),
+        Rule::Declaration => Ok(Value::String(py_obj.to_string())),
     }
 }
 

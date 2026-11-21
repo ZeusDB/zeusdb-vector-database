@@ -672,3 +672,64 @@ index.search([0.1, 0.2], filter={"cat": 1, "other": 2})
         ZEUSDB_LOG_TARGET="stderr",
     )
     assert any(entry.get("level") == "WARN" for entry in _json_lines(err)), err
+
+
+# ------------------------------------------------------------
+# err runs both layers at error
+# ------------------------------------------------------------
+@pytest.mark.parametrize("level", ["err", "ERR", " Err "])
+def test_err_runs_both_layers_at_error(level):
+    """Both halves of the level table read `err` as error, so the Python
+    layer runs at ERROR and the engine writes no warning."""
+    script = r"""
+import logging
+import zeusdb_vector_database as zdb
+print("python", logging.getLevelName(logging.getLogger("zeusdb.vector").getEffectiveLevel()))
+index = zdb.VectorDatabase().create("hnsw", dim=2, indexed_fields=["cat"])
+index.add({"ids": ["a"], "vectors": [[0.1, 0.2]], "metadatas": [{"cat": 1, "other": 2}]})
+# A filter naming a field the index did not declare, which the engine warns
+# of once.
+index.search([0.1, 0.2], filter={"cat": 1, "other": 2})
+"""
+    out, err = _run_script_with_logging_env(
+        script,
+        ENVIRONMENT="development",
+        ZEUSDB_LOG_LEVEL=level,
+        ZEUSDB_LOG_FORMAT="json",
+        ZEUSDB_LOG_TARGET="stderr",
+    )
+    assert "python ERROR" in out, out
+    warnings = [entry for entry in _json_lines(err) if entry.get("level") == "WARN"]
+    assert warnings == [], warnings
+
+
+# ------------------------------------------------------------
+# A level that does not parse
+# ------------------------------------------------------------
+@pytest.mark.parametrize("call", ["init_logging", "init_file_logging"])
+def test_a_level_that_does_not_parse_raises_value_error_and_logging_still_starts(tmp_path, call):
+    """A level neither function can read raises ValueError naming it, before
+    logging is set up, so a later call with a level it reads still sets it
+    up."""
+    script = rf"""
+import zeusdb_vector_database as z
+call = z.{call}
+args = ({str(tmp_path / "logs")!r},) if "{call}" == "init_file_logging" else ()
+try:
+    call(*args, level="a=b=c")
+except ValueError as error:
+    print("refused", error)
+print("then", call(*args, level="info"))
+"""
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("ZEUSDB_") and k not in ("PYTEST_CURRENT_TEST", "RUST_LOG")}
+    env["ZEUSDB_DISABLE_AUTO_LOGGING"] = "1"
+    proc = subprocess.run([sys.executable, "-c", script], env=env, check=True,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    lines = proc.stdout.decode("utf-8", errors="ignore").splitlines()
+    assert len(lines) == 2, lines
+    assert lines[0].startswith(
+        f"refused {call}() takes a level such as 'info' or a filter such as "
+        f"'zeusdb_vector_database=debug', and cannot read 'a=b=c': "), lines
+    assert lines[0].endswith("."), lines
+    assert lines[1] == "then True", lines

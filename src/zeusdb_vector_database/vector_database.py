@@ -4,6 +4,7 @@ vector_database.py
 Factory for creating vector indexes with support for multiple types and quantization.
 Currently supports HNSW (Hierarchical Navigable Small World) with extensible design.
 """
+import operator
 from typing import Dict, Any, Optional
 from ._engine import _create_hnsw_index
 # Index types are registered in _index_types and dispatched in _build_index.
@@ -34,6 +35,27 @@ class VectorDatabase:
     _index_types: Dict[str, str] = {
         "hnsw": "Hierarchical Navigable Small World graph",
     }
+
+    # The largest dim and expected_size the engine takes, being MAX_DIM and
+    # MAX_EXPECTED_SIZE in crates/hnsw/src/collection/construct.rs. Read by
+    # _engine_takes alone, so a rule here that derives from either value
+    # stands aside for a value the engine refuses.
+    _ENGINE_MAX_DIM = 65_536
+    _ENGINE_MAX_EXPECTED_SIZE = 100_000_000
+
+    @staticmethod
+    def _engine_takes(value: Any, ceiling: int) -> bool:
+        """Whether the engine takes `value` for an argument from 1 to `ceiling`.
+
+        The engine reads the argument through `__index__`, as
+        `operator.index` does, and refuses a value below zero, zero and one
+        above `ceiling`, before it reads the quantization config.
+        """
+        try:
+            number = operator.index(value)
+        except TypeError:
+            return False
+        return 1 <= number <= ceiling
 
     @staticmethod
     def _build_index(index_type: str, **kwargs) -> Any:
@@ -408,7 +430,13 @@ class VectorDatabase:
                 rules above, or the quantization config is invalid.
             RuntimeError: If the call fails inside the engine.
         """
-        index_type = (index_type or "").strip().lower()
+        # A wrong type is a TypeError, as the docstring says, before the
+        # name is read. None is not a str either.
+        if not isinstance(index_type, str):
+            raise TypeError(
+                f"index_type must be a str such as 'hnsw', got {type(index_type).__name__}."
+            )
+        index_type = index_type.strip().lower()
 
         if index_type not in self._index_types:
             available = ', '.join(sorted(self._index_types.keys()))
@@ -613,11 +641,14 @@ class VectorDatabase:
 
         Args:
             config: Raw quantization configuration
-            dim: Vector dimension for validation
+            dim: Vector dimension for validation. A dim the engine refuses
+                skips every rule that derives from it and leaves the Rust
+                layer to report the real validation error.
             expected_size: The declared record count, used only to decide
                 whether the fixed memory quantization costs can be repaid.
-                None or a non-integer skips that check and leaves the Rust
-                layer to report the real validation error.
+                None, a non-integer or a value the engine refuses skips that
+                check and leaves the Rust layer to report the real validation
+                error.
 
         Returns:
             Validated and normalized configuration
@@ -648,6 +679,12 @@ class VectorDatabase:
                 "quantization_config names 'scale' under type 'pq', and 'scale' is read "
                 "under type 'int8' alone. Drop it, or change type."
             )
+
+        # Every rule below derives from dim, and the engine refuses a dim it
+        # does not take before it reads this config, so for such a dim the
+        # rules stand aside and the engine's refusal names dim.
+        if not self._engine_takes(dim, self._ENGINE_MAX_DIM):
+            return validated_config
 
         # Validate subvectors
         #
@@ -881,9 +918,12 @@ class VectorDatabase:
         # its scales, holds every record raw exactly as an unquantized index
         # does, and gains nothing; the same warning the product quantized
         # scheme gives, from the same frame.
+        # A value the engine refuses declares no size, so the warnings that
+        # derive from it stand aside and the engine's refusal names it.
         declared_size = (
             expected_size
             if isinstance(expected_size, int) and not isinstance(expected_size, bool)
+            and self._engine_takes(expected_size, self._ENGINE_MAX_EXPECTED_SIZE)
             else None
         )
         if declared_size is not None and declared_size < training_size:
@@ -1168,9 +1208,12 @@ class VectorDatabase:
         # gains nothing. The memory warnings below describe the trained state,
         # which this configuration never reaches at its declared size, so this
         # one replaces them.
+        # A value the engine refuses declares no size, so the warnings that
+        # derive from it stand aside and the engine's refusal names it.
         declared_size = (
             expected_size
             if isinstance(expected_size, int) and not isinstance(expected_size, bool)
+            and self._engine_takes(expected_size, self._ENGINE_MAX_EXPECTED_SIZE)
             else None
         )
         never_trains = declared_size is not None and declared_size < training_size

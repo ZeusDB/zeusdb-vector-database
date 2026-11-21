@@ -9,8 +9,8 @@
 //! with the interpreter lock released.
 
 use super::{
-    Collection, DenseIndex, DenseOpen, DenseRestored, Identity, IdentityRecord, QuantizationConfig,
-    StorageMode, MAX_LAYER,
+    generated_number, Collection, DenseIndex, DenseOpen, DenseRestored, Identity, IdentityRecord,
+    QuantizationConfig, StorageMode, GENERATED_ID_CEILING, MAX_LAYER,
 };
 use crate::journal::{Durability, JournalPolicy, PastBound, Recovery};
 use crate::locks::ReadGuard;
@@ -590,7 +590,7 @@ impl Collection {
         // this process or another is refused before anything is written.
         let _lock = match journal {
             Some(_) => None,
-            None => crate::journal::lock_for_save(&storage, path)?,
+            None => Some(crate::journal::lock_for_save(&storage, path)?),
         };
         // Every record handed over is synced before the directory that will
         // claim them is written, where the device allows.
@@ -1711,24 +1711,23 @@ impl Collection {
     /// actually holds. A directory written before this field existed carries a
     /// zero and would otherwise reissue every generated id it holds, so the
     /// records themselves supply the floor. A directory that carries the field
-    /// is at or above its own floor already and the max changes nothing.
+    /// is at or above its own floor already and the max changes nothing. The
+    /// saved value is held to [`GENERATED_ID_CEILING`] as the floor is, so a
+    /// counter a load restores never wraps.
     pub(crate) fn set_generated_ids(&mut self, saved: usize, floor: usize) {
-        *self.generated_ids.lock().unwrap() = saved.max(floor);
+        *self.generated_ids.lock().unwrap() = saved.min(GENERATED_ID_CEILING).max(floor);
     }
 
     /// The highest N among ids of the form `vec_N`, or zero where there is none
     ///
     /// A user is free to add a record called `vec_9` by hand, and this counts
     /// it, so the next generated id is above it. That is the point: the counter
-    /// exists to stop an id being handed out twice.
+    /// exists to stop an id being handed out twice. An N past
+    /// [`GENERATED_ID_CEILING`] is not counted; see [`generated_number`].
     pub(crate) fn highest_generated_id(ids: impl Iterator<Item = impl AsRef<str>>) -> usize {
-        ids.filter_map(|id| {
-            id.as_ref()
-                .strip_prefix("vec_")
-                .and_then(|rest| rest.parse::<usize>().ok())
-        })
-        .max()
-        .unwrap_or(0)
+        ids.filter_map(|id| generated_number(id.as_ref()))
+            .max()
+            .unwrap_or(0)
     }
 
     /// Get the current ID counter value (thread-safe)

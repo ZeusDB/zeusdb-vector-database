@@ -332,15 +332,19 @@ pub(crate) fn lock_refusal(storage: &dyn Storage, directory: &str, failure: Lock
 }
 
 /// The lock a save into `storage`'s directory holds for the save, taken
-/// exclusive. `None` where the medium refuses writes, since the save then
-/// meets that refusal at its first write and fails with it as it always has.
+/// exclusive. A lock file this process cannot open to write refuses the
+/// save with [`Error::LockFileReadOnly`], since the lock is then held shared
+/// at most and a second such save could write the directory beside it.
 pub(crate) fn lock_for_save(
     storage: &dyn Storage,
     directory: &str,
-) -> Result<Option<Box<dyn LockGuard>>, Error> {
+) -> Result<Box<dyn LockGuard>, Error> {
     match storage.lock(LockMode::Exclusive, &holder_record(LockMode::Exclusive)) {
-        Ok(Locked::Writable(guard)) => Ok(Some(guard)),
-        Ok(Locked::ReadOnly { guard, .. }) => Ok(guard),
+        Ok(Locked::Writable(guard)) => Ok(guard),
+        Ok(Locked::ReadOnly { reason, .. }) => Err(Error::LockFileReadOnly {
+            path: storage.lock_path().display().to_string(),
+            error: reason.to_string(),
+        }),
         Err(failure) => Err(lock_refusal(storage, directory, failure)),
     }
 }
@@ -1343,8 +1347,10 @@ impl Recovery {
 
     /// What a caller who loaded the directory with a repair is told where
     /// the repair cut the journal, being the warning the binding raises.
-    /// Where the medium refused the repair's first write, it names that
-    /// refusal as well, and nothing was set aside.
+    /// Where the index opened read only, for the largest generation, a value
+    /// past a bound, a `read_only` feature or a medium that refused the
+    /// repair's first write, it names that cause as well, and nothing was set
+    /// aside.
     pub fn repair_warning(&self, directory: &str) -> Option<String> {
         let repair = self.repair.as_ref()?;
         let damage = self.damage.as_ref()?;
@@ -1385,6 +1391,16 @@ impl Recovery {
                 "{found} {kept} {verb} set aside in {}. {done}",
                 folder.display()
             ),
+            (None, Some(reason))
+                if self.read_only_generation().is_some() || self.read_only_bound() =>
+            {
+                format!(
+                    "{found} {kept} {verb} left out of the replay. The directory was opened read \
+                     only. {} Nothing on the medium changed, and every change, checkpoint and \
+                     save is refused.",
+                    reason
+                )
+            }
             (None, Some(reason)) if !self.read_only_features().is_empty() => format!(
                 "{found} {kept} {verb} left out of the replay. The directory was opened read \
                  only, since {}. Nothing on the medium changed, and every change, save, \

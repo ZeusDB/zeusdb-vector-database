@@ -20,16 +20,19 @@ const LOG_TARGET: &str = "zeusdb_vector_database::hnsw_index::input";
 impl DenseSpace {
     /// The unit vector of a finite vector, and an all-zero vector unchanged.
     ///
-    /// The norm is taken in `f32` and divides every value. Where that norm is
-    /// not finite, its squares having overflowed, or is zero for a vector that
-    /// is not all zeros, its squares having underflowed, the norm and the
-    /// division are taken in `f64` instead, where the square of every `f32` is
-    /// exact, so the vector is stored at unit length rather than as the zero
-    /// vector or unchanged. Every other vector takes the `f32` norm and
-    /// division alone.
+    /// The sum of squares is taken in `f32`, and where it is a normal `f32`
+    /// its square root is the norm that divides every value. There a square
+    /// lost to underflow is at most half the smallest subnormal step, which
+    /// is at most one rounding step of the sum, so the `f32` norm is as exact
+    /// as for any other vector. Where the sum is not normal, having
+    /// overflowed to infinity or fallen to zero or below the smallest normal
+    /// `f32`, for a vector that is not all zeros, the norm and the division
+    /// are taken in `f64` instead, where the square of every `f32` is exact,
+    /// so the vector is stored at unit length.
     fn normalize_vector(&self, vector: Vec<f32>) -> Vec<f32> {
-        let norm: f32 = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
-        if norm > 0.0 && norm.is_finite() {
+        let squares: f32 = vector.iter().map(|x| x * x).sum();
+        if squares.is_normal() {
+            let norm = squares.sqrt();
             vector.iter().map(|x| x / norm).collect()
         } else if vector.iter().all(|&x| x == 0.0) {
             vector // Return unchanged for zero vectors

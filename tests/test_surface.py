@@ -1269,3 +1269,29 @@ def test_a_docstring_says_what_the_code_does(name, says, no_longer_says):
     doc = " ".join(_doc(name).split())
     assert " ".join(says.split()) in doc
     assert " ".join(no_longer_says.replace("///", "").split()) not in doc
+
+
+def test_a_generated_id_skips_a_hand_named_one_the_index_holds():
+    """A record given the id `vec_2` by hand moves the counter behind
+    generated ids, as a load does, so the next generated id follows it and
+    the record is not replaced."""
+    index = VectorDatabase().create("hnsw", dim=4, space="l2", expected_size=50)
+    assert index.add({"ids": ["vec_2"], "vectors": [[1.0, 0, 0, 0]],
+                      "metadatas": [{"by": "hand"}]}).is_success()
+    assert index.add({"vectors": [[0, 1.0, 0, 0]]}).ids == ["vec_3"]
+    assert len(index) == 2
+    assert index.get_records(["vec_2"], return_vector=False)[0]["metadata"] == {"by": "hand"}
+
+
+def test_a_hand_named_id_past_the_counters_ceiling_moves_nothing(tmp_path):
+    """An id `vec_N` with N past 2^63 - 1, the largest the counter follows,
+    is held as any other id and moves the counter nowhere, live or after a
+    save and a load, so the counter never wraps."""
+    index = VectorDatabase().create("hnsw", dim=2, space="l2", expected_size=10)
+    assert index.add({"ids": [f"vec_{2 ** 64 - 1}"], "vectors": [[1.0, 0.0]]}).is_success()
+    assert index.add({"vectors": [[0.0, 1.0]]}).ids == ["vec_1"]
+    path = tmp_path / "ceiling.zdb"
+    index.save(str(path))
+    loaded = VectorDatabase().load(str(path))
+    assert loaded.add({"vectors": [[1.0, 1.0]]}).ids == ["vec_2"]
+    assert len(loaded) == 3

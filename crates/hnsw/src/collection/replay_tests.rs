@@ -2641,3 +2641,60 @@ fn replay_reproduces_a_sparse_collection() {
         assert!(kinds.contains(&kind), "{kind:?} was replayed");
     }
 }
+
+/// A replay moves the generated id counter past every `vec_N` the records
+/// it applies hold, through `apply`, `apply_legacy` and `apply_withdrawn`,
+/// so the next id a collection generates after a replay is one no record it
+/// replayed held.
+#[test]
+fn a_replay_moves_the_generated_id_counter_past_every_id_it_applies() {
+    let declaration = || Declaration::validate(2, "l2", 4, 50, 100, vec![]).unwrap();
+    let script = Collection::build(declaration(), None);
+    let sink = Recording::default();
+    script.attach_sink(Box::new(sink.clone()));
+    let ids: Vec<String> = (0..3).map(|_| script.generate_id()).collect();
+    assert_eq!(ids, ["vec_1", "vec_2", "vec_3"]);
+    let records: Vec<ParsedRecord> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| ParsedRecord {
+            id: id.clone(),
+            vector: vec![i as f32, 1.0],
+            sparse: None,
+            metadata: HashMap::new(),
+        })
+        .collect();
+    add(&script, records);
+    let recorded: Vec<Operation> = sink
+        .records()
+        .into_iter()
+        .enumerate()
+        .map(|(i, (kind, payload))| decode(i, kind, &payload, 2))
+        .collect();
+    assert_eq!(recorded.len(), 3);
+
+    type Apply = fn(&Collection, Operation) -> Result<(), Error>;
+    let paths: [(&str, Apply); 3] = [
+        ("apply", Collection::apply),
+        ("apply_legacy", Collection::apply_legacy),
+        ("apply_withdrawn", Collection::apply_withdrawn),
+    ];
+    let next: Vec<(&str, String)> = paths
+        .into_iter()
+        .map(|(path, apply)| {
+            let replayed = Collection::build(declaration(), None);
+            for operation in recorded.clone() {
+                apply(&replayed, operation).unwrap();
+            }
+            (path, replayed.generate_id())
+        })
+        .collect();
+    assert_eq!(
+        next,
+        [
+            ("apply", "vec_4".to_string()),
+            ("apply_legacy", "vec_4".to_string()),
+            ("apply_withdrawn", "vec_4".to_string()),
+        ]
+    );
+}

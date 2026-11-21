@@ -33,8 +33,9 @@
 //! An admit set the index can enumerate whose count is at or under
 //! [`FULL_SCAN_THRESHOLD`] is scored exactly, record by record, from the
 //! graph's own store. So is a set admitting every record where a node is
-//! stranded and the index holds fewer records than the search's width, which
-//! a traversal could never fill its heap from; see
+//! stranded and the index holds fewer records than the search's width, the
+//! larger of its `ef` and its `k`, which a traversal could never fill its
+//! heap from; see
 //! [`DenseIndex::scans_every_record`]. The scan scores the raw vector, the
 //! scalar row, or the product quantized codes through the kernel and the
 //! query table a traversal uses. A graph that keeps raw vectors beside its
@@ -799,17 +800,19 @@ impl DenseIndex {
         }
     }
 
-    /// Whether a search admitting every record at width `ef` scores the
-    /// records the index holds rather than traversing, which it does where a
-    /// node is stranded and fewer records are held than the width.
+    /// Whether a search admitting every record, at width `ef` for `k`
+    /// results, scores the records the index holds rather than traversing,
+    /// which it does where a node is stranded and fewer records are held than
+    /// the width its traversal runs at, being the larger of `ef` and `k` by
+    /// the core graph's `search`.
     ///
-    /// A traversal there can never fill its heap of `ef`, so it visits every
-    /// node it reaches, the stranded ones among them, and it misses a record
-    /// whose node no traversal from the entry point reaches. The scan scores
-    /// each record the index holds once, on the exact path a small admit set
+    /// A traversal there can never fill its heap, so it visits every node it
+    /// reaches, the stranded ones among them, and it misses a record whose
+    /// node no traversal from the entry point reaches. The scan scores each
+    /// record the index holds once, on the exact path a small admit set
     /// takes.
-    pub(crate) fn scans_every_record(&self, ef: usize) -> bool {
-        !self.every_node_live && self.live_count < ef
+    pub(crate) fn scans_every_record(&self, ef: usize, k: usize) -> bool {
+        !self.every_node_live && self.live_count < ef.max(k)
     }
 
     /// Every position the index holds a record at, in increasing order.
@@ -835,7 +838,7 @@ impl DenseIndex {
         budget: &Budget,
     ) -> Cost {
         let ef = budget.ef.unwrap_or_else(|| self.default_ef(k));
-        if matches!(shape, AdmitShape::All) && self.scans_every_record(ef) {
+        if matches!(shape, AdmitShape::All) && self.scans_every_record(ef, k) {
             return Cost {
                 work_ns: self.live_count as f64 * self.units.distance_ns,
                 exact: true,
@@ -1360,7 +1363,7 @@ impl VectorIndex<Dense> for DenseIndex {
                 }
             }
         }
-        if admit.admits_all() && self.scans_every_record(ef) {
+        if admit.admits_all() && self.scans_every_record(ef, k) {
             return Ok(self.score_exact(
                 query,
                 &self.held_positions(),
@@ -3107,6 +3110,89 @@ mod tests {
                 page.exact,
                 "record {id}: the {} records held under a width of 150 are scored",
                 index.len()
+            );
+            assert_eq!(
+                (page.items[0].position.0, page.items[0].score),
+                (id, 0.0),
+                "record {id}, which no traversal reaches, is returned first"
+            );
+        }
+    }
+
+    /// A search admitting every record whose `ef` is below the record count
+    /// and whose `k` is above it, on an index with a node stranded, scores
+    /// every record held, since its traversal runs at the larger of the two
+    /// and could not fill its heap. It returns a record whose node no
+    /// traversal from the entry point reaches.
+    #[test]
+    fn a_search_whose_k_is_above_the_records_held_scans_whatever_its_ef() {
+        let phi = (1.0 + 5f32.sqrt()) / 2.0;
+        let unit = |v: [f32; 3]| {
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            vec![v[0] / norm, v[1] / norm, v[2] / norm]
+        };
+        let top = unit([0.0, 1.0, phi]);
+        let mut vectors: Vec<Vec<f32>> = (0..8)
+            .map(|k| {
+                vec![
+                    -100.0 * top[0] + k as f32 * 0.5,
+                    -100.0 * top[1],
+                    -100.0 * top[2],
+                ]
+            })
+            .collect();
+        vectors.push(vec![0.0, 0.0, 0.0]);
+        for v in [
+            [0.0, 1.0, phi],
+            [0.0, -1.0, phi],
+            [1.0, phi, 0.0],
+            [-1.0, phi, 0.0],
+            [phi, 0.0, 1.0],
+            [-phi, 0.0, 1.0],
+        ] {
+            vectors.push(unit(v));
+        }
+        let graph = VectorGraph::new_raw("l2", 3, 2, 16, NB_LAYER_MAX as usize, 16);
+        let mut index = DenseIndex::new(graph, "l2", 3, None, false);
+        for (i, v) in vectors.iter().enumerate() {
+            put(&mut index, i as u32 + 1, v);
+        }
+        let nodes = index.graph().nb_points();
+        let unreached: Vec<u32> = (1..=vectors.len() as u32)
+            .filter(|&id| {
+                index
+                    .graph()
+                    .search(
+                        &vectors[id as usize - 1],
+                        nodes,
+                        nodes,
+                        None::<&fn(&usize) -> bool>,
+                    )
+                    .unwrap()
+                    .iter()
+                    .all(|hit| hit.position != id as usize)
+            })
+            .collect();
+        assert!(
+            !unreached.is_empty(),
+            "every record is reached from the entry point"
+        );
+
+        index.remove(Position(1)).unwrap();
+        assert!(!index.every_node_live);
+        let held = index.len();
+        let budget = Budget {
+            ef: Some(5),
+            ..Budget::default()
+        };
+        assert!(5 < held && held < 20, "ef below the records held, k above");
+        for &id in &unreached {
+            let page = index
+                .search(&vectors[id as usize - 1], 20, &Candidates::All, &budget)
+                .unwrap();
+            assert!(
+                page.exact,
+                "record {id}: the {held} records held under an ef of 5 and a k of 20 are scored"
             );
             assert_eq!(
                 (page.items[0].position.0, page.items[0].score),

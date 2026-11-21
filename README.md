@@ -2609,7 +2609,7 @@ python your_app.py
 
 | Variable | Options | Default | Description |
 |----------|---------|---------|-------------|
-| `ZEUSDB_LOG_LEVEL` | `trace`, `debug`, `info`, `warn`, `error` | `warn` (dev), `error` (prod) | Controls log verbosity. `warning` and `warn` are the same level, as are `critical`, `fatal` and `error`. An unrecognised name falls back to the default. |
+| `ZEUSDB_LOG_LEVEL` | `trace`, `debug`, `info`, `warn`, `error` | `warn` (dev), `error` (prod) | Controls log verbosity. `warning` and `warn` are the same level, as are `critical`, `fatal`, `err` and `error`. An unrecognised name falls back to the default. |
 | `ZEUSDB_LOG_FORMAT` | `human`, `json` | `human` (dev), `json` (prod) | Output format |
 | `ZEUSDB_LOG_TARGET` | `stdout`, `stderr`, `file` | `stderr` | Where logs go |
 | `ZEUSDB_LOG_FILE` | `/path/to/file.log` | `zeusdb.log` | Log file path, written exactly as given (if target=file) |

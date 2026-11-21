@@ -301,3 +301,31 @@ def test_the_checksum_helper_reads_a_dump_as_the_crate_wrote_it(tmp_path):
     assert struct.unpack_from("<Q", blob, 96)[0] == checksum(blob[topology:trailer])
     repair_manifest(path)
     assert VectorDatabase().load(str(path)).get_vector_count() == 20
+
+
+# ============================================================================
+# A FOLDER WHOSE MANIFEST.JSON NO SAVE WROTE
+# ============================================================================
+
+@pytest.mark.parametrize("held", [b'{"name": "an application"}', b"\x00 not JSON",
+                                  b'{"index_type": "HNSW"}'],
+                         ids=["another program's", "not JSON", "no format_version"])
+def test_a_save_into_a_folder_whose_manifest_json_no_save_wrote_writes_nothing(tmp_path, held):
+    """A folder is an index directory where its manifest.json is one a save
+    writes. Any other folder of entries is refused by a save and a backup
+    before anything is written, so its files stay."""
+    folder = tmp_path / "app"
+    folder.mkdir()
+    (folder / "manifest.json").write_bytes(held)
+    (folder / "notes.txt").write_text("kept", encoding="utf-8")
+    index = build(3)
+    for write in (index.save, index.backup):
+        with pytest.raises(RuntimeError) as refusal:
+            write(str(folder))
+        assert str(refusal.value) == (
+            f"{folder} holds a folder holding 2 entries and a manifest.json that no save wrote, "
+            f"so it is not an index directory, and a save replaces the directory at its path "
+            f"whole, which would delete what it holds. Nothing was written. Save into a new or "
+            f"empty path, or into a directory an earlier save wrote.")
+    assert sorted(p.name for p in folder.iterdir()) == ["manifest.json", "notes.txt"]
+    assert (folder / "manifest.json").read_bytes() == held

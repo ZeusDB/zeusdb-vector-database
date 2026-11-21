@@ -111,7 +111,7 @@ def _detect_environment() -> str:
 # `ignoring zeusdb_vector_database=warning` line on stderr and no filtering.
 #
 # This is the Python half of the table. `canonical_level` in bindings/python/src/
-# logging.rs is the Rust half, and it accepts the same spellings.
+# logging.rs is the Rust half, and it reads every spelling here as the same level.
 _LEVEL_ALIASES = {
     'WARN': 'WARNING',
     'WARNING': 'WARNING',

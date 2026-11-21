@@ -35,13 +35,16 @@
 //! Every shape reads a record's metadata entry by one rule, `metadata_entry`.
 //! A mapping is converted key by key, a string is kept under `text`, any
 //! other value is kept under `value`, and `None` or an absent entry is no
-//! metadata. A record whose entry does not convert, through a key that is not
-//! a string or a value nested past `conversion::MAX_VALUE_DEPTH` levels, is
-//! that record's error, named `Metadata error` with the conversion's own
-//! words, and is found before the record takes a generated id.
+//! metadata. Every value is a metadata value by `conversion::metadata_value`,
+//! being what JSON holds, so it comes back as the value it was. A record
+//! whose entry does not convert, through a key that is not a string, a value
+//! nested past `conversion::MAX_VALUE_DEPTH` levels or a value of any other
+//! kind, is that record's error, named `Metadata error` with the
+//! conversion's own words, and is found before the record takes a generated
+//! id.
 
 use super::HNSWIndex;
-use crate::conversion::{python_dict_to_value_map, python_object_to_value};
+use crate::conversion::{metadata_value, python_dict_to_value_map};
 use crate::PyEngineError;
 use numpy::{
     PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray2, PyUntypedArray, PyUntypedArrayMethods,
@@ -229,9 +232,10 @@ impl<'py> Rows<'py> {
         }
     }
 
-    /// Every value, row after row, refusing an array whose rows are not
-    /// `dim` wide with `BatchArrayShape`, and one not contiguous in memory
-    /// with the `TypeError` `search` raises for it.
+    /// Every value, row after row, whatever the array's layout in memory,
+    /// refusing an array whose rows are not `dim` wide with
+    /// `BatchArrayShape`. A C-ordered array is read in place, and any other
+    /// through NumPy's own C-ordered copy; see [`c_ordered`].
     fn flat(&self, dim: usize) -> Result<Cow<'_, [f32]>, PyEngineError> {
         let shape = self.shape();
         if shape.len() != 2 || shape[1] != dim {
@@ -249,20 +253,40 @@ impl<'py> Rows<'py> {
             .into());
         }
         Ok(match self {
-            Rows::F32(array) => Cow::Borrowed(array.as_slice()?),
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "a value narrowed to the f32 the index stores, not an offset, a count, an index or an id"
-            )]
-            Rows::F64(array) => Cow::Owned(
-                array
-                    .as_slice()?
-                    .iter()
-                    .map(|&value| value as f32)
-                    .collect(),
-            ),
+            Rows::F32(array) if array.is_c_contiguous() => Cow::Borrowed(array.as_slice()?),
+            Rows::F32(array) => Cow::Owned(c_ordered(array)?.readonly().as_slice()?.to_vec()),
+            Rows::F64(array) if array.is_c_contiguous() => Cow::Owned(narrowed(array.as_slice()?)),
+            Rows::F64(array) => Cow::Owned(narrowed(c_ordered(array)?.readonly().as_slice()?)),
         })
     }
+}
+
+/// `array` as a C-ordered array of the same values: `array` itself where it
+/// is one, and NumPy's `ascontiguousarray` of it otherwise, so its slice
+/// holds its rows one after another whatever its layout in memory, a
+/// Fortran-ordered or a strided array among them. `add` and `search` read a
+/// two dimensional array through this.
+pub(super) fn c_ordered<'py, T: numpy::Element>(
+    array: &Bound<'py, PyArray2<T>>,
+) -> PyResult<Bound<'py, PyArray2<T>>> {
+    if array.is_c_contiguous() {
+        return Ok(array.clone());
+    }
+    let py = array.py();
+    let copy = py
+        .import(pyo3::intern!(py, "numpy"))?
+        .call_method1(pyo3::intern!(py, "ascontiguousarray"), (array,))?;
+    Ok(copy.cast_into::<PyArray2<T>>()?)
+}
+
+/// Every value of `values` narrowed to `f32`, the rounding `extract::<f32>`
+/// applies to each element.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "a value narrowed to the f32 the index stores, not an offset, a count, an index or an id"
+)]
+fn narrowed(values: &[f64]) -> Vec<f32> {
+    values.iter().map(|&value| value as f32).collect()
 }
 
 /// Whether `value` is shaped as one vector: a sequence other than a string,
@@ -293,16 +317,19 @@ fn metadata_error(e: PyErr) -> String {
 
 /// A record's metadata entry, read by the one rule every shape keeps: a
 /// mapping converted key by key, a string kept under `text`, any other value
-/// kept under `value`, and `None` as no metadata. An entry that does not
-/// convert, through a key that is not a string or a value nested past
-/// `conversion::MAX_VALUE_DEPTH` levels, is the record's error.
+/// kept under `value`, and `None` as no metadata. Every value is held to
+/// `conversion::metadata_value`'s rule, so the converted value is a string
+/// exactly where the entry is one. An entry that does not convert, through a
+/// key that is not a string, a value nested past
+/// `conversion::MAX_VALUE_DEPTH` levels or a value the rule refuses, is the
+/// record's error.
 fn metadata_entry(entry: &Bound<PyAny>) -> Result<HashMap<String, Value>, String> {
     if entry.is_none() {
         return Ok(HashMap::new());
     }
     let converted = match entry.cast::<PyDict>() {
         Ok(mapping) => python_dict_to_value_map(mapping),
-        Err(_) => python_object_to_value(entry).map(|value| {
+        Err(_) => metadata_value(entry).map(|value| {
             let key = if value.is_string() { "text" } else { "value" };
             HashMap::from([(key.to_string(), value)])
         }),

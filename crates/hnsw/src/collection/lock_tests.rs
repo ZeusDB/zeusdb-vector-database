@@ -524,3 +524,52 @@ fn a_refusal_beside_a_load_quotes_an_ended_savers_record_as_the_last_record() {
         "{words}"
     );
 }
+
+/// The refusal a lock taken for a save gave, where it gave one.
+fn lock_refused<T>(lock: &Result<T, Error>) -> Option<String> {
+    lock.as_ref().err().map(ToString::to_string)
+}
+
+/// Two saves into a directory whose lock file this process cannot open to
+/// write never hold the save's lock at once, so they never write the
+/// directory at once: each is refused, naming the lock file.
+#[test]
+fn two_saves_never_hold_the_lock_at_once_where_its_file_refuses_writes() {
+    let temp = TempDir::new("lock-tests");
+    let path = temp.at("unwritable.zdb");
+    let storage = FsStorage::at(&path).unwrap();
+    std::fs::write(storage.lock_path(), b"").unwrap();
+    let set_readonly = |readonly: bool| {
+        let mut permissions = std::fs::metadata(storage.lock_path())
+            .unwrap()
+            .permissions();
+        permissions.set_readonly(readonly);
+        std::fs::set_permissions(storage.lock_path(), permissions).unwrap();
+    };
+    set_readonly(true);
+    if std::fs::OpenOptions::new()
+        .write(true)
+        .open(storage.lock_path())
+        .is_ok()
+    {
+        set_readonly(false);
+        eprintln!("this process writes through a read-only permission, so nothing is held here");
+        return;
+    }
+    let directory = path.to_str().unwrap();
+    let first = crate::journal::lock_for_save(&storage, directory);
+    let second = crate::journal::lock_for_save(&storage, directory);
+    set_readonly(false);
+    assert!(
+        !(first.is_ok() && second.is_ok()),
+        "both saves hold the lock: {first:?} and {second:?}"
+    );
+    let opening = format!(
+        "The lock file {} cannot be opened to write: ",
+        storage.lock_path().display()
+    );
+    for refused in [lock_refused(&first), lock_refused(&second)] {
+        let words = refused.expect("a save whose lock file refuses writes is refused");
+        assert!(words.starts_with(&opening), "{words}");
+    }
+}

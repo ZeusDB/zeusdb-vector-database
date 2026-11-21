@@ -1624,3 +1624,31 @@ def test_a_text_query_never_returns_a_record_that_never_held_the_term_under_conc
     settled = generation[0]
     assert len(index) == 1
     assert ids(index.query(arms=[{"text": f"only{settled}"}], top_k=5)) == [f"r{settled}"]
+
+
+# ------------------------------------------------------------
+# A cosine vector whose squares underflow
+# ------------------------------------------------------------
+def norm(values):
+    return math.sqrt(sum(float(value) * float(value) for value in values))
+
+
+@pytest.mark.parametrize("values", [[3e-23, 0, 0, 0], [3e-23, 3e-23, 0, 0], [1e-21, 2e-22, 0, 0],
+                                    [1e-30, 0, 0, 0]])
+def test_a_cosine_vector_whose_sum_of_squares_underflows_is_stored_at_unit_length(values):
+    """A vector whose float32 sum of squares falls below the smallest normal
+    float32 is normalized in float64, so it is stored at unit length whether
+    its squares underflow in full or in part."""
+    index = VectorDatabase().create("hnsw", dim=DIM, space="cosine", expected_size=10)
+    added = index.add({"ids": ["tiny"], "embeddings": np.array([values], dtype=np.float32)})
+    assert added.is_success(), added.errors
+    stored = index.get_records(["tiny"], return_vector=True)[0]["vector"]
+    assert abs(norm(stored) - 1.0) < 1e-6, stored
+
+
+def test_a_cosine_query_whose_sum_of_squares_underflows_scores_as_its_direction():
+    index = VectorDatabase().create("hnsw", dim=DIM, space="cosine", expected_size=10)
+    assert index.add({"ids": ["x"], "embeddings": np.array([[1.0, 0, 0, 0]], dtype=np.float32)}
+                     ).is_success()
+    [hit] = index.search([3e-23, 0.0, 0.0, 0.0], top_k=1)
+    assert hit["id"] == "x" and abs(hit["score"]) < 1e-6, hit

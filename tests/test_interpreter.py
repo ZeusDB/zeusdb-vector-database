@@ -23,6 +23,8 @@ feature,
 and on any other build every check here fails with words that say so.
 """
 
+import os
+import signal
 import threading
 from types import SimpleNamespace
 
@@ -449,3 +451,47 @@ def test_a_call_with_nothing_writing_keeps_the_interpreter(still_index, name, ca
         f"{name} reached the released part of its call, as {pause.reached!r}, "
         f"with nothing writing"
     )
+
+
+# ============================================================================
+# A fork while a call holds the mutation guard
+# ============================================================================
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="os.fork exists on POSIX alone")
+def test_a_child_forked_while_a_call_holds_the_mutation_guard_waits_on_it(tmp_path):
+    """A child forked while another thread's `add()` holds the mutation
+    guard of a journaled index inherits that guard held, by a thread that
+    does not exist in the child, so the child's own `add()` waits on it
+    until the child's alarm ends the child. The refusal of every mutation
+    in a forked child holds where the fork is made while no call on the
+    index runs, which `tests/test_lock.py` holds. The parent's call goes on
+    once the pause lets it go."""
+    held = new_pause()
+    index = VectorDatabase().create("hnsw", dim=DIM, expected_size=50)
+    index.journal_to(str(tmp_path / "forked.zdb"))
+
+    def paused_add():
+        held.arm_at("add:before_installs")
+        return index.add({"ids": ["held"], "embeddings": np.zeros((1, DIM), dtype=np.float32)})
+
+    worker = Worker(paused_add).start()
+    try:
+        assert held.wait_reached() == "add:before_installs"
+        pid = os.fork()
+        if pid == 0:
+            # The child ends here whatever its call does, and the alarm
+            # ends it at the default action whatever handler it inherited.
+            code = 1
+            try:
+                signal.signal(signal.SIGALRM, signal.SIG_DFL)
+                signal.alarm(5)
+                index.add({"ids": ["child"], "embeddings": np.zeros((1, DIM), dtype=np.float32)})
+                code = 0
+            finally:
+                os._exit(code)
+        _, status = os.waitpid(pid, 0)
+    finally:
+        held.release()
+        worker.finish()
+    assert os.WIFSIGNALED(status) and os.WTERMSIG(status) == signal.SIGALRM, status
+    assert worker.result().is_success()

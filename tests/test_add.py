@@ -1,9 +1,15 @@
 """Vector insertion across the five input formats, overwrite, and add error handling."""
 
+import datetime
+import decimal
+import fractions
+import gc
+import math
+
 import numpy as np
 import pytest
 from zeusdb_vector_database import VectorDatabase
-from helpers import assert_vectors_close
+from helpers import assert_vectors_close, layouts
 
 # ------------------------------------------------------------
 # Test 3: Format 1 - Single Object
@@ -1078,3 +1084,156 @@ def test_a_cosine_vector_whose_squares_leave_the_float32_range_is_stored_at_unit
     vector = np.asarray(stored["vector"], dtype=np.float64)
     assert abs(np.linalg.norm(vector) - 1.0) < 1e-6
     assert (np.sign(vector) == np.sign(np.asarray(values, dtype=np.float64))).all()
+
+
+# ------------------------------------------------------------
+# A two dimensional array is read by rows whatever its layout
+# ------------------------------------------------------------
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_a_two_dimensional_array_is_read_by_rows_whatever_its_layout(dtype):
+    """add() stores each row of a two dimensional array as NumPy defines it,
+    bare and under a batch dict, whether the array is C-ordered,
+    Fortran-ordered or strided."""
+    rows = (np.arange(12).reshape(3, 4) + 1).astype(dtype)
+    for name, array in layouts(rows).items():
+        for shape in ("bare", "batch dict"):
+            index = VectorDatabase().create("hnsw", dim=4, space="l2", expected_size=10)
+            added = (index.add(array) if shape == "bare"
+                     else index.add({"ids": ["vec_1", "vec_2", "vec_3"], "embeddings": array}))
+            assert added.ids == ["vec_1", "vec_2", "vec_3"], (name, shape, added.errors)
+            stored = [index.get_records([i], return_vector=True)[0]["vector"] for i in added.ids]
+            assert stored == rows.astype(np.float32).tolist(), (name, shape)
+
+
+# ------------------------------------------------------------
+# A metadata value comes back as the value it was, or is refused
+# ------------------------------------------------------------
+METADATA_SHAPES = ("single object", "list of records", "list batch", "array batch")
+
+
+def add_with_metadata(index, shape, record_id, entry):
+    """Add one record of id `record_id` carrying `entry` in the shape named."""
+    vector = [0.1, 0.2]
+    if shape == "single object":
+        return index.add({"id": record_id, "values": vector, "metadata": entry})
+    if shape == "list of records":
+        return index.add([{"id": record_id, "values": vector, "metadata": entry}])
+    if shape == "list batch":
+        return index.add({"ids": [record_id], "vectors": [vector], "metadatas": [entry]})
+    return index.add({"ids": [record_id], "vectors": np.array([vector], dtype=np.float32),
+                      "metadatas": [entry]})
+
+
+def same(given, back):
+    """Whether `back` is `given`, of the same type at every level, a float's
+    sign among it."""
+    if type(given) is not type(back):
+        return False
+    if isinstance(given, float):
+        return given == back and math.copysign(1, given) == math.copysign(1, back)
+    if isinstance(given, dict):
+        return given.keys() == back.keys() and all(same(given[k], back[k]) for k in given)
+    if isinstance(given, list):
+        return len(given) == len(back) and all(same(a, b) for a, b in zip(given, back))
+    return given == back
+
+
+# Each value JSON holds, beside the value it comes back as, which is itself
+# but for a NumPy scalar and a str subclass, read by their value.
+KEPT = [
+    (None, None), (True, True), (False, False), (0, 0), (-(2 ** 63), -(2 ** 63)),
+    (2 ** 63 - 1, 2 ** 63 - 1), (0.1, 0.1), (-0.0, -0.0), (1e300, 1e300), ("text", "text"),
+    ("", ""), ([1, "a", None, [2.5]], [1, "a", None, [2.5]]),
+    ({"nested": {"deep": [True]}}, {"nested": {"deep": [True]}}),
+    (np.int64(5), 5), (np.float32(0.5), 0.5), (np.float64(0.25), 0.25), (np.bool_(True), True),
+    (type("Sub", (str,), {})("sub"), "sub"),
+]
+
+
+def entry_form(value):
+    """The metadata a record whose entry is `value` holds."""
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    return {"text" if isinstance(value, str) else "value": value}
+
+
+@pytest.mark.parametrize("given, back", KEPT, ids=[repr(given)[:30] for given, _ in KEPT])
+def test_a_metadata_value_json_holds_comes_back_as_it_was(tmp_path, given, back):
+    """A metadata value comes back as the value it was, as the whole entry
+    and inside a mapping, in every shape, live, after a replay of the journal
+    and after a save and a load."""
+    index = VectorDatabase().create("hnsw", dim=2, expected_size=50)
+    path = tmp_path / "kept.zdb"
+    index.journal_to(str(path))
+    expected = {}
+    for number, shape in enumerate(METADATA_SHAPES):
+        for entry, held in ((given, entry_form(back)), ({"v": given}, {"v": back})):
+            record_id = f"r{len(expected)}"
+            added = add_with_metadata(index, shape, record_id, entry)
+            assert added.is_success(), (shape, added.errors)
+            expected[record_id] = held
+
+    def holds(target, when):
+        records = target.get_records(sorted(expected), return_vector=False)
+        for record in records:
+            assert same(expected[record["id"]], record["metadata"]), (when, record)
+
+    holds(index, "live")
+    del index
+    gc.collect()
+    replayed = VectorDatabase().load(str(path))
+    holds(replayed, "after a replay")
+    replayed.checkpoint()
+    del replayed
+    gc.collect()
+    holds(VectorDatabase().load(str(path)), "after a save and a load")
+
+
+def metadata_refusal(kind, place, shown):
+    """The words `errors` names a refused metadata value with, after
+    `Metadata error: `."""
+    if kind == "type":
+        return (f"TypeError: the value at {place} is a {shown}, and a metadata value is None, "
+                f"a bool, an int, a float, a str, a list or a dict, so convert it to one of "
+                f"those.")
+    if kind == "not finite":
+        return (f"ValueError: the value at {place} is {shown}, a float that is not finite, and "
+                f"a metadata value is a finite float, so give None or a string in its place.")
+    return (f"ValueError: the value at {place} is {shown}, outside the integers from -2^63 to "
+            f"2^63 - 1 that a metadata value holds, so give it as a string.")
+
+
+REFUSED = [
+    ((1, "a"), "type", "tuple"), ({3}, "type", "set"), (frozenset({3}), "type", "frozenset"),
+    (b"ab", "type", "bytes"), (bytearray(b"ab"), "type", "bytearray"),
+    (datetime.date(2026, 11, 21), "type", "date"),
+    (datetime.datetime(2026, 11, 21, 10, 30), "type", "datetime"),
+    (decimal.Decimal("0.1"), "type", "Decimal"), (fractions.Fraction(1, 3), "type", "Fraction"),
+    (complex(1, 2), "type", "complex"), (np.array([1, 2]), "type", "ndarray"),
+    (object(), "type", "object"),
+    (float("nan"), "not finite", "nan"), (float("inf"), "not finite", "inf"),
+    (float("-inf"), "not finite", "-inf"), (np.float32("nan"), "not finite", "nan"),
+    (2 ** 63, "range", "9223372036854775808"),
+    (-(2 ** 63) - 1, "range", "-9223372036854775809"),
+    (2 ** 70, "range", str(2 ** 70)),
+]
+
+
+@pytest.mark.parametrize("value, kind, shown", REFUSED,
+                         ids=[f"{kind} {shown}"[:30] for _, kind, shown in REFUSED])
+def test_a_metadata_value_json_does_not_hold_refuses_its_record(value, kind, shown):
+    """A value that would not come back as it was refuses its record, named
+    in `errors` after `Metadata error` with the words that say where the
+    value sits, in every shape, and the records around it go in."""
+    for shape in METADATA_SHAPES:
+        for entry, place in ((value, "the entry"), ({"v": value}, "key 'v'"),
+                             ({"outer": {"tags": [1, 2, value]}},
+                              "key 'outer', key 'tags', item 2")):
+            index = VectorDatabase().create("hnsw", dim=2, expected_size=50)
+            assert add_with_metadata(index, shape, "a", {"k": 1}).is_success()
+            added = add_with_metadata(index, shape, "b", entry)
+            assert added.errors == [f"Vector b: Metadata error: "
+                                    f"{metadata_refusal(kind, place, shown)}"], (shape, place)
+            assert "b" not in index and "a" in index, (shape, place)

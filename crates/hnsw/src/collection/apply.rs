@@ -8,7 +8,10 @@
 //! carries three values the mutation would otherwise issue, being the
 //! internal id, the graph level and a term's id, and `apply` installs at
 //! them rather than issuing its own, checking each against what the
-//! collection would have issued.
+//! collection would have issued. An insert's id moves the counter behind
+//! generated ids past its `vec_N`, through the install the live collection
+//! runs, so the next generated id after a replay follows every id the
+//! replay applied.
 //!
 //! A check that fails means the records and the collection do not belong
 //! together: a checkpoint and a journal from different histories, a journal
@@ -24,8 +27,10 @@
 //! `apply_withdrawn` takes a record of a call whose commit failed, which the
 //! live collection refused, and does what the live collection kept of it:
 //! an insert's internal id stays issued, since admission issued it before
-//! the commit, and a term stays interned, since the dictionary kept it.
-//! Nothing else of such a call is applied.
+//! the commit, its id moves the counter behind generated ids, since the
+//! live collection generated it before the commit, and a term stays
+//! interned, since the dictionary kept it. Nothing else of such a call is
+//! applied.
 //!
 //! `apply` is for a record of a journal of format version 2, and
 //! `apply_legacy` for one of version 1, which releases from 0.11.0 to 0.13.0
@@ -268,9 +273,10 @@ impl Collection {
     ///
     /// Under the mutation guard, as `apply` is. An `Insert` issues the
     /// internal id it names, which must be the one the counter would issue
-    /// next, and installs nothing. An `Intern` interns its term, held as
-    /// `apply` holds it. Every other kind is passed over. A framing record is
-    /// refused, as `apply` refuses one.
+    /// next, moves the counter behind generated ids past its id, and installs
+    /// nothing. An `Intern` interns its term, held as `apply` holds it. Every
+    /// other kind is passed over. A framing record is refused, as `apply`
+    /// refuses one.
     pub fn apply_withdrawn(&self, operation: Operation) -> Result<(), Error> {
         let _writers = self.hold_writers();
         if self.sink_attached() {
@@ -295,7 +301,9 @@ impl Collection {
                             internal_id, id
                         ))
                     })?;
-                self.issue_expected_id(expected).map(|_| ())
+                self.issue_expected_id(expected)?;
+                self.follow_generated_id(&id);
+                Ok(())
             }
             Operation::Intern { term_id, term } => self.intern_recorded(term_id, &term),
             Operation::Commit { first } | Operation::Abort { first, .. } => Err(mismatch(format!(

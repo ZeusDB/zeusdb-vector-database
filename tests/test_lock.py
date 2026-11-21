@@ -10,6 +10,7 @@ A journaled directory this process cannot write opens read only, with a
 RuntimeWarning.
 """
 
+import contextlib
 import gc
 import json
 import os
@@ -277,3 +278,92 @@ def test_a_forked_child_that_lives_on_holds_no_lock(tmp_path):
                 time.sleep(0.01)
             if not gone.exists() and alive(child):
                 os.kill(child, signal.SIGKILL)
+
+
+# ------------------------------------------------------------
+# A save whose lock file this process cannot write
+# ------------------------------------------------------------
+@contextlib.contextmanager
+def read_only_lock(lock):
+    """`lock` made read only, and made writable again after."""
+    if not lock.exists():
+        lock.write_bytes(b"")
+    os.chmod(lock, stat.S_IREAD)
+    try:
+        if os.access(lock, os.W_OK):
+            pytest.skip("this process writes through a read-only permission")
+        yield
+    finally:
+        os.chmod(lock, stat.S_IREAD | stat.S_IWRITE)
+
+
+@contextlib.contextmanager
+def held_shared(lock):
+    """Another holder of `lock`, holding it shared through the system's own
+    call: LockFileEx over every byte on Windows, and flock on Linux and
+    macOS, which are the calls the engine's lock makes."""
+    handle = open(lock, "rb")
+    try:
+        if os.name == "nt":
+            import ctypes
+            import msvcrt
+            from ctypes import wintypes
+
+            class OVERLAPPED(ctypes.Structure):
+                _fields_ = [("Internal", ctypes.c_void_p), ("InternalHigh", ctypes.c_void_p),
+                            ("Offset", wintypes.DWORD), ("OffsetHigh", wintypes.DWORD),
+                            ("hEvent", wintypes.HANDLE)]
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.LockFileEx.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD,
+                                            wintypes.DWORD, wintypes.DWORD,
+                                            ctypes.POINTER(OVERLAPPED)]
+            kernel32.LockFileEx.restype = wintypes.BOOL
+            fail_immediately = 0x1
+            assert kernel32.LockFileEx(msvcrt.get_osfhandle(handle.fileno()), fail_immediately,
+                                       0, 0xFFFFFFFF, 0xFFFFFFFF,
+                                       ctypes.byref(OVERLAPPED())), ctypes.get_last_error()
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+        yield
+    finally:
+        handle.close()
+
+
+# What every refusal of a save into a directory whose lock file this process
+# cannot write ends with, after the system's own words.
+UNWRITABLE_LOCK = (". A save or a backup writes a directory only while it holds this lock "
+                   "exclusive, so nothing was written. Make the lock file writable, or save "
+                   "into another directory.")
+
+
+def test_a_save_or_backup_whose_lock_file_this_process_cannot_write_writes_nothing(tmp_path):
+    """A lock file this process cannot open to write refuses a save and a
+    backup into its directory, as it refuses a journal and makes a replaying
+    load open read only, so no save writes the directory without holding the
+    lock exclusive."""
+    path = tmp_path / "unwritable.zdb"
+    lock = tmp_path / "unwritable.zdb.zdblock"
+    with read_only_lock(lock):
+        index = build(3)
+        for write in (index.save, index.backup):
+            with pytest.raises(RuntimeError) as refusal:
+                write(str(path))
+            words = str(refusal.value)
+            assert words.startswith(f"The lock file {lock} cannot be opened to write: "), words
+            assert words.endswith(UNWRITABLE_LOCK), words
+    assert not path.exists()
+
+
+def test_a_save_writes_nothing_while_another_holder_holds_the_lock(tmp_path):
+    """A save writes nothing while another holder holds the directory's lock
+    shared, where this process cannot write the lock file. The other holder
+    stands for a second such save, which held the lock shared beside the
+    first."""
+    path = tmp_path / "held.zdb"
+    lock = tmp_path / "held.zdb.zdblock"
+    with read_only_lock(lock), held_shared(lock):
+        with pytest.raises(RuntimeError):
+            build(3).save(str(path))
+    assert not path.exists()

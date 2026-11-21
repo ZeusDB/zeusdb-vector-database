@@ -104,8 +104,9 @@ pub struct AddResult {
     /// input, and a caller who needs that alignment reads `errors`, which
     /// names each rejection by its id or by its position. A record given no
     /// id may take a generated id before its sparse half or its text is
-    /// refused, and a generated id is never issued again, so the next one
-    /// then skips it.
+    /// refused, and the next generated id follows it. A generated id never
+    /// names a record the index holds, across a save and a load and a replay
+    /// of its journal.
     ///
     /// Why it exists. An `add` that is given no ids generates them, as
     /// `vec_{counter}`, and until this field the generated ids were
@@ -609,16 +610,19 @@ impl HNSWIndex {
     /// Under `l2`, `dot` or `l1` a record whose vector has a Euclidean norm
     /// past 2^62 is counted and named the same way, with its norm and the
     /// bound, so no distance the index takes overflows. Under `cosine` no
-    /// vector is held to that bound, and one whose squares overflow or
-    /// underflow a float32 is normalized in float64 and stored at unit
+    /// vector is held to that bound, and one whose sum of squares overflows
+    /// or underflows a float32 is normalized in float64 and stored at unit
     /// length.
     ///
     /// Every shape reads a record's metadata entry the same way. A mapping
     /// is the record's metadata, a string is kept under `text`, any other
-    /// value is kept under `value`, and `None` is no metadata. A record
-    /// whose metadata does not convert, through a key that is not a string
-    /// or a value nested more than 128 levels deep, is counted and named the
-    /// same way as a malformed vector, after the words `Metadata error`.
+    /// value is kept under `value`, and `None` is no metadata. A value is
+    /// None, a bool, an integer from -2^63 to 2^63 - 1, a finite float, a
+    /// string, a list of values or a mapping with string keys, nested at
+    /// most 128 levels deep, and comes back as the value it was. A record
+    /// whose metadata holds anything else, or a key that is not a string, is
+    /// counted and named the same way as a malformed vector, after the words
+    /// `Metadata error`, which say where the value sits.
     ///
     /// # Where the interpreter lock is held
     ///
@@ -863,8 +867,9 @@ impl HNSWIndex {
             // one Python float at a time. The conversion is the same rounding
             // `extract::<f32>` performs per element, so the values are identical.
             let queries = if let Ok(np_array) = vector.cast::<PyArray2<f32>>() {
-                // Format: NumPy 2-D array (N, dims), read without copying.
-                let readonly = np_array.readonly();
+                // Format: NumPy 2-D array (N, dims), read by rows, in place
+                // where it is C-ordered; see `input::c_ordered`.
+                let readonly = input::c_ordered(np_array)?.readonly();
                 let shape = readonly.shape();
 
                 Self::validate_batch_array_shape(shape, dim)?;
@@ -878,8 +883,9 @@ impl HNSWIndex {
                 );
                 Queries::Batch(batch)
             } else if let Ok(np_array) = vector.cast::<PyArray2<f64>>() {
-                // Format: NumPy 2-D array of f64, narrowed in one pass.
-                let readonly = np_array.readonly();
+                // Format: NumPy 2-D array of f64, read by rows and narrowed in
+                // one pass.
+                let readonly = input::c_ordered(np_array)?.readonly();
                 let shape = readonly.shape();
 
                 Self::validate_batch_array_shape(shape, dim)?;

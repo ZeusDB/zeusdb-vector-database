@@ -716,3 +716,60 @@ def test_the_factory_docstrings_say_what_it_raises():
     from zeusdb_vector_database import _engine
     assert "load(path, tokenizer=None)" not in _engine._load_index.__doc__
     assert "ZEUSDB_DISABLE_AUTO_LOGGING" in _engine.is_logging_initialized.__doc__
+
+
+# ------------------------------------------------------------
+# An index_type that is not a string
+# ------------------------------------------------------------
+@pytest.mark.parametrize("index_type", [1, 1.5, b"hnsw", ["hnsw"], None, False, object()],
+                         ids=["int", "float", "bytes", "list", "None", "False", "object"])
+def test_an_index_type_that_is_not_a_string_raises_type_error(index_type):
+    """A parameter of the wrong type raises TypeError, as the docstring says,
+    and an index_type that is not a str is one, None among them."""
+    with pytest.raises(TypeError) as refusal:
+        VectorDatabase().create(index_type, dim=4)
+    assert str(refusal.value) == (
+        f"index_type must be a str such as 'hnsw', got {type(index_type).__name__}.")
+
+
+# ------------------------------------------------------------
+# A value the engine refuses, beside a quantization config
+# ------------------------------------------------------------
+def engine_refusal(**arguments):
+    """What create() raises for `arguments` with no quantization config,
+    being the engine's own refusal."""
+    with pytest.raises((ValueError, TypeError)) as refusal:
+        VectorDatabase().create("hnsw", **arguments)
+    return refusal.type, str(refusal.value)
+
+
+@pytest.mark.parametrize("config", [{"type": "pq"}, {"type": "pq", "subvectors": 8}],
+                         ids=["derived", "given"])
+@pytest.mark.parametrize("dim", [-3, 0, 65_537, "4"], ids=["negative", "zero", "above", "str"])
+def test_a_dim_the_engine_refuses_raises_its_refusal_alone_beside_a_pq_config(dim, config):
+    """The rules a product quantized config derives from dim stand aside for
+    a dim the engine refuses, so the caller reads the engine's refusal of
+    dim, and no warning, whatever the config."""
+    expected = engine_refusal(dim=dim)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises((ValueError, TypeError)) as refusal:
+            VectorDatabase().create("hnsw", dim=dim, quantization_config=dict(config))
+    assert (refusal.type, str(refusal.value)) == expected
+    assert [str(w.message) for w in caught] == []
+
+
+@pytest.mark.parametrize("config", [{"type": "pq", "subvectors": 4}, {"type": "int8"}],
+                         ids=["pq", "int8"])
+@pytest.mark.parametrize("expected_size", [-5, 0], ids=["negative", "zero"])
+def test_an_expected_size_the_engine_refuses_raises_its_refusal_alone(expected_size, config):
+    """A training size warning stands aside for an expected_size the engine
+    refuses, so the caller reads the engine's refusal of it and no warning."""
+    expected = engine_refusal(dim=8, expected_size=expected_size)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises(ValueError) as refusal:
+            VectorDatabase().create("hnsw", dim=8, expected_size=expected_size,
+                                    quantization_config=dict(config))
+    assert (refusal.type, str(refusal.value)) == expected
+    assert [str(w.message) for w in caught] == []

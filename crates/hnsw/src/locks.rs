@@ -162,7 +162,8 @@ pub mod order {
     const AFTER_LEAVES: u8 = LEAF_BASE + (MAX_SPACES as u8) * 2;
     /// A leaf.
     pub const CREATED_AT: u8 = AFTER_LEAVES;
-    /// A leaf, taken by `generate_id` alone and held across nothing.
+    /// A leaf, taken by `generate_id` and `follow_generated_id` and held
+    /// across nothing.
     pub const GENERATED_IDS: u8 = AFTER_LEAVES + 1;
     /// A leaf below every other rank. The sink a mutation hands its record
     /// to, taken with `writers` held and nothing else on the mutation paths

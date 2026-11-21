@@ -1331,9 +1331,11 @@ pub struct Collection {
     /// nothing said so.
     ///
     /// Splitting them lets each keep the property it needs. `id_counter` still
-    /// resets, so the internal ids start again. This one never goes backwards,
-    /// so a generated id is issued once in the life of an index and survives a
-    /// save and load. See `config.json`'s `generated_ids`.
+    /// resets, so the internal ids start again. This one never goes backwards
+    /// and follows every `vec_N` a record takes, by `follow_generated_id`, so
+    /// a generated id never names a record the index holds, across a save and
+    /// a load and a replay of its journal. See `config.json`'s
+    /// `generated_ids`.
     ///
     /// It also stops a generated id burning an internal one. `generate_id` used
     /// to call `get_next_id`, so a batch of three records with no ids of their
@@ -1671,6 +1673,14 @@ impl Collection {
     pub(crate) fn text_layer(&self) -> Result<&TextLayer, Error> {
         let space = self.sparse().ok_or(Error::NoSparseSpace)?;
         space.text.as_ref().ok_or(Error::NoTextLayer)
+    }
+
+    /// The terms the text layer's dictionary holds, and zero where the
+    /// collection has no text layer. A segment of `add` reads it before and
+    /// after its admission, to know whether it interned a term.
+    pub(crate) fn interned_terms(&self) -> usize {
+        self.text_layer()
+            .map_or(0, |layer| layer.dictionary.read().unwrap().len())
     }
 
     /// Every term of `text` as the sparse space's tokenizer hands them over,
@@ -2730,6 +2740,35 @@ impl Collection {
         *counter += 1;
         format!("vec_{}", *counter)
     }
+
+    /// Raise the counter behind generated ids to the N of `id` where `id`
+    /// is `vec_N` and N is one [`generated_number`] counts, so the next
+    /// generated id follows every id a record of the collection has held.
+    ///
+    /// Called by every install, the live one and a replayed one, and by a
+    /// withdrawn insert, whose id the live collection issued before its
+    /// commit failed. A load raises the counter the same way over the ids
+    /// its checkpoint holds, so the rule is one rule on every path.
+    pub(crate) fn follow_generated_id(&self, id: &str) {
+        if let Some(held) = generated_number(id) {
+            let mut counter = self.generated_ids.lock().unwrap();
+            *counter = (*counter).max(held);
+        }
+    }
+}
+
+/// The largest N the counter behind generated ids follows, being half of
+/// `usize`'s range, so a counter raised to it still issues that many ids
+/// before it could wrap. An id `vec_N` above it is one the counter reaches
+/// only after that many ids.
+pub(crate) const GENERATED_ID_CEILING: usize = usize::MAX >> 1;
+
+/// The N of an id of the form `vec_N`, where N parses as a `usize` at or
+/// below [`GENERATED_ID_CEILING`], and `None` for every other id.
+pub(crate) fn generated_number(id: &str) -> Option<usize> {
+    id.strip_prefix("vec_")
+        .and_then(|rest| rest.parse::<usize>().ok())
+        .filter(|&n| n <= GENERATED_ID_CEILING)
 }
 
 #[cfg(test)]
@@ -3118,5 +3157,65 @@ mod tests {
             fill(&active, TRAINING_SIZE, false);
             names(&active, "quantized_active", &format!("{kind}, active"));
         }
+    }
+
+    /// Under `cosine`, a vector whose `f32` sum of squares falls below the
+    /// smallest normal `f32` is stored at unit length, as a record and as a
+    /// query, whether its squares underflow in full or in part.
+    #[test]
+    fn a_cosine_vector_whose_squares_underflow_part_way_is_stored_at_unit_length() {
+        let collection = Collection::build(
+            Declaration::validate(2, "cosine", 4, 50, 100, vec![]).unwrap(),
+            None,
+        );
+        for vector in [
+            vec![3e-23_f32, 0.0],
+            vec![3e-23, 3e-23],
+            vec![1e-21, 2e-22],
+            vec![1e-30, 0.0],
+        ] {
+            for (what, processed) in [
+                (
+                    "record",
+                    collection.process_vector_for_space(vector.clone()),
+                ),
+                ("query", collection.validate_query(vector.clone()).unwrap()),
+            ] {
+                let norm = processed
+                    .iter()
+                    .map(|&x| f64::from(x) * f64::from(x))
+                    .sum::<f64>()
+                    .sqrt();
+                assert!(
+                    (norm - 1.0).abs() < 1e-6,
+                    "{what} {vector:?} is stored as {processed:?}, of norm {norm}"
+                );
+            }
+        }
+    }
+
+    /// The counter behind generated ids follows an id `vec_N` with N at or
+    /// below `GENERATED_ID_CEILING` and no other id, so it never wraps.
+    #[test]
+    fn the_counter_follows_a_generated_number_up_to_its_ceiling() {
+        use super::{generated_number, GENERATED_ID_CEILING};
+        assert_eq!(generated_number("vec_7"), Some(7));
+        assert_eq!(generated_number("vec_0012"), Some(12));
+        let ceiling = format!("vec_{GENERATED_ID_CEILING}");
+        assert_eq!(generated_number(&ceiling), Some(GENERATED_ID_CEILING));
+        let past = format!("vec_{}", GENERATED_ID_CEILING as u128 + 1);
+        assert_eq!(generated_number(&past), None);
+        assert_eq!(generated_number(&format!("vec_{}", u64::MAX)), None);
+        for id in ["vec_", "vec_x", "vec_-1", "vector_3", "Vec_3", "vec_1.5"] {
+            assert_eq!(generated_number(id), None, "{id}");
+        }
+        let collection = Collection::build(
+            Declaration::validate(2, "l2", 4, 50, 100, vec![]).unwrap(),
+            None,
+        );
+        collection.follow_generated_id(&past);
+        assert_eq!(collection.generate_id(), "vec_1");
+        collection.follow_generated_id(&ceiling);
+        assert_eq!(collection.generate_id(), past);
     }
 }

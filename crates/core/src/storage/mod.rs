@@ -128,14 +128,15 @@ pub trait Storage {
     fn stage(&self) -> Result<Box<dyn Staged>, Error>;
 
     /// What stands at the target that a save must not replace, being a
-    /// file, a folder holding entries and no `manifest.json`, or a folder
+    /// file, a folder holding entries and no `manifest.json`, a folder whose
+    /// `manifest.json` no save wrote or this process cannot read, or a folder
     /// this process cannot list, as a phrase a refusal quotes. `None` where
     /// nothing stands there, where an empty folder does, and where a folder
-    /// holding a manifest does, which is an index directory an earlier save
-    /// wrote. A save replaces the directory at its target whole, so it asks
-    /// this before anything is written. A target the system will not
-    /// describe at all is `None`, and the save's own first write meets the
-    /// same refusal.
+    /// holding a manifest a save writes does, which is an index directory an
+    /// earlier save wrote. A save replaces the directory at its target whole,
+    /// so it asks this before anything is written. A target the system will
+    /// not describe at all is `None`, and the save's own first write meets
+    /// the same refusal.
     fn foreign_target(&self) -> Option<String>;
 
     /// Whether the folder the directory sits in takes a new entry, found by

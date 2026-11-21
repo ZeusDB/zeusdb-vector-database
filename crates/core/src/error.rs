@@ -639,7 +639,7 @@ pub enum Error {
     /// A backup was asked of a directory with a journal beside it
     BackupTargetJournaled { path: String, journal: String },
     /// A save was asked of a path holding a file, or a folder of entries and
-    /// no `manifest.json`
+    /// no `manifest.json` a save writes
     TargetNotAnIndex { path: String, holds: String },
 
     // ------------------------------------------------------------------
@@ -743,6 +743,14 @@ pub enum Error {
     /// arm of `query()`, whose magnitude passes
     /// [`SPARSE_BOUND`](crate::SPARSE_BOUND)
     SparseValuePastBound { index: usize, value: f32 },
+
+    // ------------------------------------------------------------------
+    // The lock a save takes. Appended after every variant above, and none
+    // wider than the widest above.
+    // ------------------------------------------------------------------
+    /// A save or a backup into a directory whose lock file this process
+    /// cannot open to write, so it cannot hold the lock exclusive
+    LockFileReadOnly { path: String, error: String },
 }
 
 impl Error {
@@ -914,6 +922,7 @@ impl Error {
             | CollectionLocked { .. }
             | LockUnavailable { .. }
             | CollectionReadOnly { .. }
+            | LockFileReadOnly { .. }
             | BackupIntoOwnDirectory { .. }
             | BackupTargetJournaled { .. }
             | TargetNotAnIndex { .. }
@@ -2071,6 +2080,13 @@ impl fmt::Display for Error {
                  since a change it could not journal would be lost. Save it into another \
                  directory to copy it somewhere writable.",
                 directory, reason
+            ),
+            LockFileReadOnly { path, error } => write!(
+                f,
+                "The lock file {} cannot be opened to write: {}. A save or a backup writes a \
+                 directory only while it holds this lock exclusive, so nothing was written. \
+                 Make the lock file writable, or save into another directory.",
+                path, error
             ),
             BackupIntoOwnDirectory { path } => write!(
                 f,

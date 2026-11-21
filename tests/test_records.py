@@ -1,6 +1,11 @@
 """Record retrieval, removal, listing and index level metadata."""
 
+import datetime
+import gc
+import struct
+
 import numpy as np
+import pytest
 from zeusdb_vector_database import VectorDatabase
 
 # ------------------------------------------------------------
@@ -341,3 +346,59 @@ print(json.dumps({
         assert all(order == expected for order in seen[call]), call
     index, _ = _order_index(5)
     assert seen["stats"] == list(index.get_stats())[:6]
+
+
+# ------------------------------------------------------------
+# update_metadata() holds a value to the metadata rule
+# ------------------------------------------------------------
+def test_update_metadata_refuses_a_value_metadata_does_not_hold():
+    """update_metadata() raises for a value that would not come back as it
+    was, naming where it sits, and leaves the record's metadata as it was."""
+    index = VectorDatabase().create("hnsw", dim=2, expected_size=10)
+    assert index.add({"ids": ["a"], "vectors": [[0.1, 0.2]], "metadatas": [{"k": 1}]}).is_success()
+    with pytest.raises(TypeError) as refusal:
+        index.update_metadata("a", {"when": datetime.date(2026, 11, 21)})
+    assert str(refusal.value) == (
+        "the value at key 'when' is a date, and a metadata value is None, a bool, an int, a "
+        "float, a str, a list or a dict, so convert it to one of those.")
+    with pytest.raises(ValueError) as refusal:
+        index.update_metadata("a", {"scores": [0.5, float("nan")]})
+    assert str(refusal.value) == (
+        "the value at key 'scores', item 1 is nan, a float that is not finite, and a metadata "
+        "value is a finite float, so give None or a string in its place.")
+    assert index.get_records(["a"], return_vector=False)[0]["metadata"] == {"k": 1}
+
+
+# ------------------------------------------------------------
+# A float in metadata comes back bit for bit
+# ------------------------------------------------------------
+def test_a_float_in_metadata_comes_back_bit_for_bit_after_a_replay_and_a_load(tmp_path):
+    """Every float a record's metadata holds is read back as the float
+    written, from the journal by a replay and from metadata.json by a load,
+    over floats across twelve decades."""
+    rng = np.random.default_rng(230)
+    values = [float(x) for x in rng.random(2000) * 10.0 ** rng.integers(-6, 22, 2000)]
+    ids = [f"f{i}" for i in range(len(values))]
+    index = VectorDatabase().create("hnsw", dim=2, expected_size=5000)
+    path = tmp_path / "floats.zdb"
+    index.journal_to(str(path))
+    added = index.add({"ids": ids, "vectors": [[1.0, float(i)] for i in range(len(values))],
+                       "metadatas": [{"x": value} for value in values]})
+    assert added.is_success(), added.errors[:3]
+    del index
+    gc.collect()
+
+    def bits(target):
+        return [struct.pack("<d", record["metadata"]["x"])
+                for record in target.get_records(ids, return_vector=False)]
+
+    written = [struct.pack("<d", value) for value in values]
+    replayed = VectorDatabase().load(str(path))
+    assert replayed.recovery["replayed"] > 0
+    assert bits(replayed) == written
+    replayed.checkpoint()
+    del replayed
+    gc.collect()
+    loaded = VectorDatabase().load(str(path))
+    assert loaded.recovery["replayed"] == 0
+    assert bits(loaded) == written

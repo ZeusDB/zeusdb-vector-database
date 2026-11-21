@@ -2320,8 +2320,8 @@ fn load_pq_codes(
 /// a code is one byte a subvector. `subvectors` must be positive, must divide
 /// `dim` and must not exceed it, because `sub_dim` is `dim / subvectors` and a
 /// subvector of no values encodes nothing. `training_size` is at least 1,000
-/// and `max_training_vectors`, where given, at or above it, at every format
-/// version.
+/// and `max_training_vectors`, where given, at or above it, and
+/// `storage_mode` is one `create()` takes, at every format version.
 fn validate_quantization_fields(
     file: &str,
     config: &QuantizationPersistence,
@@ -2363,6 +2363,12 @@ fn validate_quantization_fields(
                 max_training, config.training_size
             )));
         }
+    }
+    if StorageMode::from_string(&config.storage_mode).is_err() {
+        return Err(invalid(format!(
+            "storage_mode is '{}', and create() takes quantized_only or quantized_with_raw",
+            config.storage_mode
+        )));
     }
     Ok(())
 }
@@ -2511,7 +2517,12 @@ fn load_int8_quantization(
             )));
         }
     }
-    let storage_mode = StorageMode::from_string(&config.storage_mode).map_err(Error::Engine)?;
+    let storage_mode = StorageMode::from_string(&config.storage_mode).map_err(|_| {
+        invalid(format!(
+            "storage_mode is '{}', and a scalar quantized index takes quantized_only alone",
+            config.storage_mode
+        ))
+    })?;
     if storage_mode == StorageMode::QuantizedWithRaw {
         return Err(invalid(
             "storage_mode is 'quantized_with_raw', which a scalar quantized index never takes"
@@ -2868,7 +2879,18 @@ fn reconstruct_index_simple(
     )? {
         DumpOutcome::Read(nodes) => {
             debug!(target: LOG_TARGET, "HNSW graph restored from the saved dump ({} nodes)", nodes);
-            (false, "Every record came from the graph dump.".to_string())
+            // Below 5.x the codes come from pq_codes.bin and not from the
+            // dump, and the count of step 6 reads them too.
+            let source = if major < DUMP_V2_FORMAT_MAJOR && !pq_codes.is_empty() {
+                format!(
+                    "The graph came from the graph dump, and the records were counted from it \
+                     and from the {} codes pq_codes.bin holds.",
+                    pq_codes.len()
+                )
+            } else {
+                "Every record came from the graph dump.".to_string()
+            };
+            (false, source)
         }
         DumpOutcome::Rows {
             rows,
@@ -4123,7 +4145,8 @@ fn restored_created_at(manifest: &IndexManifest, loaded_at: &str) -> (String, Op
         )
     };
     let detail = format!(
-        "manifest.json records created_at as '{}', which is not an RFC 3339 time and which a \n         load of format 5.0.0 refuses, so the load took '{}', {}, in its place",
+        "manifest.json records created_at as '{}', which is not an RFC 3339 time and which a \
+         load of format 5.0.0 refuses, so the load took '{}', {}, in its place",
         manifest.created_at, taken, source
     );
     let replaced = Replaced {
@@ -4380,6 +4403,22 @@ impl Opened<'_> {
         self.lock.read_only.clone().map(ReadOnlyCause::Medium)
     }
 
+    /// [`Opened::read_only_cause`] for the collection `index` the replay
+    /// built, where a value past a bound takes the medium's place. A value
+    /// past a bound refuses a save into every directory, and the medium a
+    /// save into its own alone, so the collection opens read only for the
+    /// value. A `read_only` feature keeps its place, since it refuses every
+    /// save already.
+    fn read_only_cause_of(&self, index: &Collection, journal: &str) -> Option<ReadOnlyCause> {
+        match self.read_only_cause()? {
+            ReadOnlyCause::Medium(reason) => Some(
+                self.past_bound(index, journal)
+                    .map_or(ReadOnlyCause::Medium(reason), ReadOnlyCause::Bound),
+            ),
+            cause => Some(cause),
+        }
+    }
+
     /// No save writes the identity and the journal record apart, so a
     /// manifest whose two name two collections was assembled by hand, and
     /// replaying would be choosing one of them. Held once the journal itself
@@ -4559,7 +4598,7 @@ impl Opened<'_> {
             Vec::new()
         };
 
-        if let Some(cause) = self.read_only_cause() {
+        if let Some(cause) = self.read_only_cause_of(&index, &file_name_of(journal)) {
             recovery.repair = plan.as_ref().map(|plan| plan.report(None));
             return Ok(read_only(index, self.path, cause, reached, recovery));
         }
@@ -4812,7 +4851,7 @@ impl Opened<'_> {
             Vec::new()
         };
 
-        if let Some(cause) = self.read_only_cause() {
+        if let Some(cause) = self.read_only_cause_of(&index, &file_name_of(wal)) {
             recovery.repair = plan.as_ref().map(|plan| plan.report(None));
             return Ok(read_only(index, self.path, cause, reached, recovery));
         }

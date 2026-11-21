@@ -6,7 +6,7 @@ import pytest
 import struct
 
 import numpy as np
-from helpers import artefact_digest
+from helpers import artefact_digest, layouts
 from zeusdb_vector_database import VectorDatabase
 
 # ------------------------------------------------------------
@@ -1358,3 +1358,37 @@ def test_a_cosine_query_past_the_bound_is_normalized_and_searched():
     assert scaled[0]["id"] == "r5" == plain[0]["id"]
     assert [hit["id"] for hit in scaled] == [hit["id"] for hit in plain]
     assert all(np.isfinite(hit["score"]) for hit in scaled)
+
+
+# ------------------------------------------------------------
+# An unfiltered search wider than the index, with a node stranded
+# ------------------------------------------------------------
+def test_an_unfiltered_arm_wider_than_the_index_is_priced_as_a_scan():
+    """With a node stranded, a search whose traversal runs at the larger of
+    ef_search and top_k, above the record count, scans every record, so
+    explain() prices its arm as exact, at the default width and with an
+    ef_search below the record count alike."""
+    rng = np.random.default_rng(15)
+    index = VectorDatabase().create("hnsw", dim=3, space="l2", expected_size=50)
+    assert index.add({"ids": [f"r{i}" for i in range(15)],
+                      "embeddings": rng.standard_normal((15, 3)).astype(np.float32)}).is_success()
+    assert index.remove_point("r0")
+    for arm in ({"vector": [0.1, 0.2, 0.3]}, {"vector": [0.1, 0.2, 0.3], "ef_search": 5}):
+        plan = index.explain([arm], top_k=20)
+        assert plan["arms"][0]["exact"] is True, (arm, plan)
+
+
+# ------------------------------------------------------------
+# A query batch is read by rows whatever its layout
+# ------------------------------------------------------------
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_a_query_batch_is_read_by_rows_whatever_its_layout(dtype):
+    """A two dimensional query batch is its rows, as NumPy defines them,
+    whether it is C-ordered, Fortran-ordered or strided."""
+    rows = np.arange(12, dtype=np.float32).reshape(3, 4) + 1
+    index = VectorDatabase().create("hnsw", dim=4, space="l2", expected_size=10)
+    assert index.add({"ids": ["a", "b", "c"], "embeddings": rows}).is_success()
+    for name, batch in layouts(rows.astype(dtype)).items():
+        pages = index.search(batch, top_k=1)
+        assert [page[0]["id"] for page in pages] == ["a", "b", "c"], name
+        assert [page[0]["score"] for page in pages] == [0.0, 0.0, 0.0], name

@@ -427,3 +427,17 @@ def as_old_wire(directory, version):
         manifest["file_digests"][name] = {"bytes": len(data), "checksum": artefact_digest(data)}
     manifest["format_version"] = version
     (directory / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+
+def layouts(rows):
+    """`rows` C-ordered, Fortran-ordered and as a strided view, every one of
+    them holding the same rows."""
+    import numpy as np
+    wide = np.zeros((rows.shape[0], 2 * rows.shape[1]), dtype=rows.dtype)
+    wide[:, ::2] = rows
+    held = {"C order": np.ascontiguousarray(rows), "Fortran order": np.asfortranarray(rows),
+            "a strided view": wide[:, ::2]}
+    assert not held["Fortran order"].flags["C_CONTIGUOUS"]
+    assert not held["a strided view"].flags["C_CONTIGUOUS"]
+    assert not held["a strided view"].flags["F_CONTIGUOUS"]
+    return held

@@ -531,3 +531,73 @@ def test_an_index_at_its_last_internal_id_refuses_an_add_and_still_opens(tmp_pat
     gc.collect()
     again = VectorDatabase().load(str(path))
     assert sorted(id for id, _ in again.list(number=10)) == ["r10", "r11"]
+
+
+# ------------------------------------------------------------
+# A generated id after a replay
+# ------------------------------------------------------------
+def test_a_generated_id_a_replay_restores_is_not_generated_again(tmp_path):
+    """The records a load replays hold the ids generated before the process
+    let the index go, so the next generated id follows them, and no replayed
+    record is replaced."""
+    index = VectorDatabase().create("hnsw", dim=4, space="l2", expected_size=50)
+    path = tmp_path / "generated.zdb"
+    index.journal_to(str(path))
+    added = index.add({"vectors": [[1.0, 0, 0, 0], [0, 1.0, 0, 0], [0, 0, 1.0, 0]]})
+    assert added.ids == ["vec_1", "vec_2", "vec_3"]
+    del index
+    gc.collect()
+
+    loaded = VectorDatabase().load(str(path))
+    held = loaded.get_records(["vec_1", "vec_2", "vec_3"], return_vector=True)
+    assert loaded.add({"vectors": [[0, 0, 0, 1.0]]}).ids == ["vec_4"]
+    assert len(loaded) == 4
+    assert loaded.get_records(["vec_1", "vec_2", "vec_3"], return_vector=True) == held
+
+
+def test_a_removed_or_cleared_generated_id_is_not_generated_again_after_a_replay(tmp_path):
+    """A record the journal inserted and then removed, or that a clear
+    dropped, held its generated id, so a replay does not issue it again."""
+    index = VectorDatabase().create("hnsw", dim=4, space="l2", expected_size=50)
+    path = tmp_path / "removed.zdb"
+    index.journal_to(str(path))
+    assert index.add({"vectors": [[1.0, 0, 0, 0], [0, 1.0, 0, 0]]}).ids == ["vec_1", "vec_2"]
+    assert index.remove_point("vec_2")
+    assert index.add({"vectors": [[0, 0, 1.0, 0]]}).ids == ["vec_3"]
+    index.clear()
+    del index
+    gc.collect()
+
+    loaded = VectorDatabase().load(str(path))
+    assert len(loaded) == 0
+    assert loaded.add({"vectors": [[0, 0, 0, 1.0]]}).ids == ["vec_4"]
+
+
+# ------------------------------------------------------------
+# A text record refused once its terms are counted
+# ------------------------------------------------------------
+def test_a_text_record_refused_after_its_terms_are_counted_is_recovered_whole(tmp_path):
+    """A text record whose journal entry passes the ceiling is refused once
+    its terms are counted, and its call admits nothing. The call still
+    commits the terms the dictionary kept, so the index that recovers the
+    directory holds the dictionary the live index held, and the recovery
+    finds no damage after the index was let go."""
+    index = VectorDatabase().create("hnsw", dim=4, expected_size=50,
+                                    sparse={"tokenizer": "simple"})
+    path = tmp_path / "text.zdb"
+    index.journal_to(str(path))
+    assert index.add({"ids": ["a"], "embeddings": [[0.1, 0.2, 0.3, 0.4]],
+                      "texts": ["alpha bravo"]}).is_success()
+    refused = index.add({"ids": ["b"], "embeddings": [[0.2, 0.1, 0.3, 0.4]],
+                         "texts": ["charlie delta"],
+                         "metadatas": [{"blob": "x" * (66 << 20)}]})
+    assert refused.total_errors == 1 and "b" not in index, refused.errors
+    live_terms = index.get_stats()["term_count"]
+    assert live_terms == "4"
+    del index
+    gc.collect()
+
+    loaded = VectorDatabase().load(str(path))
+    assert loaded.recovery["damage"] is None, loaded.recovery["damage"]
+    assert loaded.get_stats()["term_count"] == live_terms
+    assert len(loaded) == 1

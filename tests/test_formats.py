@@ -28,8 +28,10 @@ their version message rather than a parse error.
 import gc
 import hashlib
 import json
+import os
 import re
 import shutil
+import stat
 import struct
 import warnings
 from pathlib import Path
@@ -669,3 +671,158 @@ def test_a_directory_holding_a_sparse_value_past_the_bound_opens_read_only(tmp_p
     gc.collect()
     assert not copy.exists()
     assert files_of(path.parent) == before
+
+
+# ============================================================================
+# THE WORDS OF A REPLACED CREATED_AT AND OF A REPAIR READ ONLY
+# ============================================================================
+
+@pytest.mark.parametrize("name", ["v4.0.0-raw-l2", "v3.0.0-journaled"])
+def test_the_detail_of_a_replaced_created_at_is_one_sentence(tmp_path, name):
+    """The detail `recovery["replaced"]` and the warning carry reads as one
+    sentence."""
+    path = opened_copy(name, tmp_path)
+    original = manifest(path)
+    (path / "manifest.json").write_text(json.dumps(dict(original, created_at=NOT_A_TIME),
+                                                   indent=2), encoding="utf-8", newline="\n")
+    index, messages = loaded_with_warnings(path)
+    [entry] = index.recovery["replaced"]
+    assert entry["detail"] == (
+        f"manifest.json records created_at as '{NOT_A_TIME}', which is not an RFC 3339 time "
+        f"and which a load of format 5.0.0 refuses, so the load took '{original['saved_at']}', "
+        f"its saved_at, in its place")
+    [message] = messages
+    assert entry["detail"] in message
+
+
+def damage_version_1_journal(path):
+    """Flip one byte a third of the way into the version 1 journal beside
+    `path`, inside a record with whole records after it."""
+    wal = path.parent / (path.name + ".zdbwal")
+    data = bytearray(wal.read_bytes())
+    data[64 + (len(data) - 64) // 3] ^= 0x40
+    wal.write_bytes(bytes(data))
+
+
+def at_the_largest_generation(path):
+    m = manifest(path)
+    m["identity"]["generation"] = 2 ** 64 - 1
+    (path / "manifest.json").write_text(json.dumps(m, indent=2), encoding="utf-8", newline="\n")
+
+
+@pytest.mark.parametrize("edit", [at_the_largest_generation, a_dump_row_of_norm_1e19],
+                         ids=["generation", "bound"])
+def test_a_repair_read_only_for_its_generation_or_a_bound_names_that_reason(tmp_path, edit):
+    """A repair that opens the index read only, for the largest generation
+    or for a value past a bound, sets nothing aside, and its warning gives
+    that reason and says every change, checkpoint and save is refused."""
+    path = opened_copy("v4.0.0-journaled-text", tmp_path)
+    edit(path)
+    damage_version_1_journal(path)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        index = VectorDatabase().load(str(path), repair=True)
+    recovery = index.recovery
+    assert recovery["read_only"] is True
+    assert recovery["damage"] is not None and recovery["repair"]["quarantine"] is None
+    reason = recovery["read_only_reason"]
+    if edit is at_the_largest_generation:
+        assert reason == AT_THE_LARGEST
+    else:
+        assert reason.endswith(PAST_THE_BOUND), reason
+    [message] = [str(w.message) for w in caught if issubclass(w.category, RuntimeWarning)]
+    assert message.endswith(
+        f" left out of the replay. The directory was opened read only. {reason} Nothing on "
+        f"the medium changed, and every change, checkpoint and save is refused."), message
+
+
+# ============================================================================
+# A DIRECTORY READ ONLY FOR ITS MEDIUM THAT HOLDS A VALUE PAST THE BOUND
+# ============================================================================
+
+def test_a_directory_read_only_for_its_medium_and_past_the_bound_refuses_a_save_elsewhere(
+        tmp_path):
+    """A journaled directory whose lock file this process cannot write and
+    that holds a value past the bound opens read only for the value, so a
+    save into another directory is refused in the value's words, as one
+    into its own is."""
+    path = opened_copy("v4.0.0-journaled-text", tmp_path)
+    a_dump_row_of_norm_1e19(path)
+    lock = path.parent / (path.name + ".zdblock")
+    lock.write_bytes(b"")
+    os.chmod(lock, stat.S_IREAD)
+    copy = tmp_path / "copy.zdb"
+    try:
+        if os.access(lock, os.W_OK):
+            pytest.skip("this process writes through a read-only permission")
+        index, messages = loaded_with_warnings(path)
+        assert index.recovery["read_only"] is True
+        reason = index.recovery["read_only_reason"]
+        assert reason.endswith(PAST_THE_BOUND), reason
+        [message] = messages
+        assert reason in message
+        for write in (lambda: index.save(str(copy)), lambda: index.backup(str(copy))):
+            with pytest.raises(RuntimeError) as refusal:
+                write()
+            assert reason in str(refusal.value)
+        del index
+        gc.collect()
+    finally:
+        os.chmod(lock, stat.S_IREAD | stat.S_IWRITE)
+    assert not copy.exists()
+
+
+# ============================================================================
+# AN INVALID STORAGE_MODE IN QUANTIZATION.JSON
+# ============================================================================
+
+@pytest.mark.parametrize("config, cls, words", [
+    ({"type": "pq", "subvectors": 2, "bits": 4, "training_size": 1000}, ValueError,
+     ": storage_mode is 'bogus', and create() takes quantized_only or quantized_with_raw, so "
+     "this file does not describe an index this build can rebuild."),
+    ({"type": "int8"}, RuntimeError,
+     ": storage_mode is 'bogus', and a scalar quantized index takes quantized_only alone"),
+], ids=["pq", "int8"])
+def test_an_invalid_storage_mode_in_quantization_json_names_the_file(tmp_path, config, cls,
+                                                                     words):
+    """A storage_mode create() refuses raises at load, naming the file, with
+    the class every other rule of that file raises at load: ValueError under
+    pq, as create() raises, and RuntimeError under int8."""
+    index = VectorDatabase().create("hnsw", dim=8, expected_size=2000, quantization_config=config)
+    path = tmp_path / "quantized.zdb"
+    index.save(str(path))
+    del index
+    gc.collect()
+    quant = json.loads((path / "quantization.json").read_text(encoding="utf-8"))
+    quant["storage_mode"] = "bogus"
+    (path / "quantization.json").write_text(json.dumps(quant, indent=2), encoding="utf-8",
+                                           newline="\n")
+    repair_manifest(path, "quantization.json")
+    with pytest.raises(Exception) as refusal:
+        VectorDatabase().load(str(path))
+    assert type(refusal.value) is cls, type(refusal.value)
+    text = str(refusal.value)
+    assert text.endswith(words) and "quantization.json" in text, text
+
+
+# ============================================================================
+# THE COUNT REFUSAL BELOW 5.0.0 OF A SHORT PQ_CODES.BIN
+# ============================================================================
+
+def test_the_count_refusal_of_a_short_pq_codes_bin_says_the_count_read_it(tmp_path):
+    """Below 5.0.0 a trained quantized_only directory takes its graph from
+    the dump and counts its records from pq_codes.bin as well, and the
+    refusal of a count that differs from config.json says so."""
+    path = index_copy("v4.0.0-pq-cosine", tmp_path)
+    codes = path / "pq_codes.bin"
+    _, entries, payload = unframe(codes.read_bytes())
+    width = int.from_bytes(payload[:4], "little")
+    reframe(codes, payload=payload[:-(4 + width)], entries=entries - 1)
+    repair_manifest(path, "pq_codes.bin")
+    with pytest.raises(RuntimeError) as refusal:
+        VectorDatabase().load(str(path))
+    text = str(refusal.value)
+    assert text.startswith("Restored record count does not match config.json: the directory "
+                           "yields 998 records while config.json reports 999. "), text
+    assert ("The graph came from the graph dump, and the records were counted from it and "
+            "from the 998 codes pq_codes.bin holds.") in text, text

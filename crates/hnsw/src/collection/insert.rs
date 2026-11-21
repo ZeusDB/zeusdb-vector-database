@@ -2185,6 +2185,10 @@ impl Collection {
             let limit = self.segment_limit();
             let mut segment: Vec<Result<Admitted, InsertError>> = Vec::new();
             let mut admitted = 0usize;
+            // The dictionary's length as the segment starts, so a segment that
+            // interned a term and admitted no record still commits the
+            // records of that interning.
+            let terms_before = self.interned_terms();
             // What the records this segment admits take once they are
             // installed, being their ids' text, their nonzeros and their room
             // in the graph, which each next record is held to.
@@ -2243,9 +2247,13 @@ impl Collection {
             // and the rest of the batch with them, installing none, since
             // the call's contract is that what it returns is on the device.
             // The ids issued stay issued, because the records may have
-            // reached the sink.
+            // reached the sink. A segment that admitted nothing commits where
+            // it interned a term, since the dictionary keeps the term and a
+            // recovery must hold what the live dictionary holds; the commit
+            // covers every record after the journal's last boundary.
+            let interned = self.interned_terms() > terms_before;
             let committed = recorded.and_then(|()| {
-                if admitted > 0 {
+                if admitted > 0 || interned {
                     self.commit_records()
                 } else {
                     Ok(())
@@ -2618,9 +2626,10 @@ impl Collection {
     /// graph at the level admission drew, the record named at the next
     /// position with its metadata and columns written there, and the sparse
     /// half into its space at the same position, all under the internal id
-    /// admission issued. Routed by the storage state as `add` has always
-    /// routed, being raw storage, raw storage while collecting for training,
-    /// or quantized storage.
+    /// admission issued, and then the counter behind generated ids raised to
+    /// the record's id where it is `vec_N`. Routed by the storage state as
+    /// `add` has always routed, being raw storage, raw storage while
+    /// collecting for training, or quantized storage.
     pub(super) fn install(&self, admitted: Admitted) -> Result<(), Error> {
         let Admitted {
             id,
@@ -2660,6 +2669,9 @@ impl Collection {
             self.insert_sparse(at, internal_id, &sparse)?;
         }
 
+        // The record is held, so the next generated id follows its id; see
+        // `follow_generated_id`.
+        self.follow_generated_id(&id);
         Ok(())
     }
 

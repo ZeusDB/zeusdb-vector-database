@@ -1165,3 +1165,29 @@ def test_every_filter_valid_before_composition_selects_the_same_records(operator
     for filter, expected in legacy:
         assert filtered_ids(index, filter) == expected, filter
         assert index.count(filter) == len(expected), filter
+
+
+# ------------------------------------------------------------
+# A filter value metadata does not hold
+# ------------------------------------------------------------
+def test_a_filter_value_metadata_does_not_hold_raises_from_every_call():
+    """A filter is held to the metadata rule, so a value that no record's
+    metadata can hold raises, naming where it sits, from every call that
+    takes a filter, and nothing is removed."""
+    index = VectorDatabase().create("hnsw", dim=2, expected_size=10)
+    assert index.add({"ids": ["a"], "vectors": [[0.1, 0.2]],
+                      "metadatas": [{"tag": "x"}]}).is_success()
+    calls = {
+        "search": lambda f: index.search([0.1, 0.2], filter=f),
+        "query": lambda f: index.query([{"vector": [0.1, 0.2]}], filter=f),
+        "explain": lambda f: index.explain([{"vector": [0.1, 0.2]}], filter=f),
+        "count": lambda f: index.count(f),
+        "remove_where": lambda f: index.remove_where(f),
+    }
+    for name, call in calls.items():
+        with pytest.raises(TypeError) as refusal:
+            call({"tag": {"in": ("x", "y")}})
+        assert str(refusal.value) == (
+            "the value at key 'tag', key 'in' is a tuple, and a metadata value is None, a bool, "
+            "an int, a float, a str, a list or a dict, so convert it to one of those."), name
+    assert len(index) == 1

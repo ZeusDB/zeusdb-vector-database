@@ -313,6 +313,25 @@ pub fn init_logging() {
     init_from_env_if_unset()
 }
 
+/// The filter `call` installs: `RUST_LOG` where it parses, and `level`
+/// otherwise, `info` where it is left out. A `level` that does not parse
+/// raises `ValueError` naming it, before the one initialization runs, so a
+/// call that raises leaves logging as it was and a later call can still
+/// initialize it.
+fn requested_filter(call: &str, level: Option<&str>) -> PyResult<EnvFilter> {
+    if let Ok(filter) = EnvFilter::try_from_default_env() {
+        return Ok(filter);
+    }
+    let level = level.unwrap_or("info");
+    EnvFilter::try_new(level).map_err(|error| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "{} takes a level such as 'info' or a filter such as \
+             'zeusdb_vector_database=debug', and cannot read '{}': {}.",
+            call, level, error
+        ))
+    })
+}
+
 /// Python-exposed logging initialization (JSON to console)
 ///
 /// Returns true if initialization occurred, false if already initialized.
@@ -321,13 +340,10 @@ pub fn init_logging() {
 #[pyfunction(name = "init_logging")]
 #[pyo3(signature = (level = None))]
 pub fn py_init_logging(level: Option<String>) -> PyResult<bool> {
+    let filter = requested_filter("init_logging()", level.as_deref())?;
     let mut took_init = false;
     INIT.call_once(|| {
         took_init = true;
-        let filter = EnvFilter::try_from_default_env()
-            .or_else(|_| EnvFilter::try_new(level.as_deref().unwrap_or("info")))
-            .unwrap();
-
         let registry = Registry::default().with(filter).with(
             fmt::layer()
                 .json()
@@ -365,14 +381,11 @@ pub fn py_init_file_logging(
     if log_dir.trim().is_empty() {
         return Err(Error::LogDirEmpty.into());
     }
+    let filter = requested_filter("init_file_logging()", level.as_deref())?;
 
     let mut took_init = false;
     INIT.call_once(|| {
         took_init = true;
-
-        let filter = EnvFilter::try_from_default_env()
-            .or_else(|_| EnvFilter::try_new(level.as_deref().unwrap_or("info")))
-            .unwrap();
 
         // Try to create log directory
         if let Err(e) = std::fs::create_dir_all(&log_dir) {
@@ -465,7 +478,7 @@ fn canonical_level(log_level: &str) -> &'static str {
         "debug" => "debug",
         "info" => "info",
         "warn" | "warning" => "warn",
-        "error" | "critical" | "fatal" => "error",
+        "error" | "err" | "critical" | "fatal" => "error",
         "off" | "none" | "silent" => "off",
         _ => "warn",
     }
