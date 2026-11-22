@@ -172,10 +172,10 @@ use zeusdb_vector_core::{
     refuse_unnamable, refuses_writes, unframe, unknown_kind_at, validate_indexed_fields,
     ArtefactRecord, Bounds, Cut, Dir, DumpRows, Error, Expected, FrameEncoding, FrameKind,
     FsStorage, IdStore, Int8Codec, Inventory, JournalDamage, JournalRecord, JournalWriter,
-    LiveRecord, LockFailure, LockGuard, LockMode, Locked, MetadataStore, Operation, Position,
-    PositionWalk, RecordFields, RecordState, Restore, RowValues, SegmentBase, SegmentBytes,
-    SpaceName, Storage, VectorIndex, DUMP_FILENAME as GRAPH_DUMP_FILENAME, FRAME_OVERHEAD_BYTES,
-    LEGACY_DUMP_FILENAMES, MAX_INTERNAL_ID, PQ,
+    LiveRecord, LockFailure, LockGuard, LockMode, Locked, MetadataStore, MetadataValue, Operation,
+    Position, PositionWalk, RecordFields, RecordState, Restore, RowValues, SegmentBase,
+    SegmentBytes, SpaceName, Storage, VectorIndex, DUMP_FILENAME as GRAPH_DUMP_FILENAME,
+    FRAME_OVERHEAD_BYTES, LEGACY_DUMP_FILENAMES, MAX_INTERNAL_ID, PQ,
 };
 use zeusdb_vector_sparse::{PostingsIndex, SparseConfig};
 use zeusdb_vector_text::{SimpleTokenizer, TermDictionary, Tokenizer, TokenizerConfig};
@@ -1573,6 +1573,12 @@ fn bincode_ids(bytes: &[u8], config: &IndexConfig) -> Result<MappedIds, Error> {
 /// `expected_size`, whichever is more, whatever order the file names them
 /// in. Text that is not the shape a metadata file takes is refused before
 /// any record the file names.
+///
+/// `serde_json`'s own nesting limit is off for this read, and every field's
+/// value, kept or let go, is read through [`MetadataValue`], which holds it
+/// to the depth the binding takes. The file's object and a record's
+/// mapping are read by the two visitors below, and nothing else of the
+/// file nests.
 fn load_metadata(
     dir: &dyn Dir,
     manifest: &IndexManifest,
@@ -1598,6 +1604,7 @@ fn load_metadata(
         unmapped: 0,
     };
     let mut deserializer = serde_json::Deserializer::from_str(&metadata_data);
+    deserializer.disable_recursion_limit();
     serde::de::DeserializeSeed::deserialize(&mut reader, &mut deserializer)
         .and_then(|()| deserializer.end())
         .map_err(|e| Error::ArtefactParseFailed {
@@ -1720,7 +1727,7 @@ impl<'de> serde::de::Visitor<'de> for &mut MetadataReader<'_> {
 }
 
 /// One record's fields, read into `pairs` where `keep` is set and read and
-/// let go otherwise.
+/// let go otherwise, each value through [`MetadataValue`] either way.
 struct RecordFieldsSeed<'p, 'de> {
     pairs: &'p mut Vec<(Cow<'de, str>, Value)>,
     keep: bool,
@@ -1744,11 +1751,9 @@ impl<'de> serde::de::Visitor<'de> for RecordFieldsSeed<'_, 'de> {
 
     fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
         while let Some(JsonKey(name)) = map.next_key::<JsonKey<'de>>()? {
+            let value = map.next_value_seed(MetadataValue::field(self.keep))?;
             if self.keep {
-                let value: Value = map.next_value()?;
                 self.pairs.push((name, value));
-            } else {
-                map.next_value::<serde::de::IgnoredAny>()?;
             }
         }
         Ok(())
@@ -4503,7 +4508,9 @@ impl Opened<'_> {
         let contents = if self.repairing {
             read_segments_for_repair(&segments, &expected, &journal_name)?
         } else {
-            read_segments(&segments, &expected, &journal_name)?
+            read_segments(&segments, &expected, &journal_name).map_err(|refusal| {
+                repairable_segments(refusal, &segments, &expected, &journal_name)
+            })?
         };
         // A record of a read-only feature is the feature's, so it is named
         // as that before it is taken for damage.
@@ -4536,11 +4543,12 @@ impl Opened<'_> {
         let mut cut = contents.cut.clone();
         let mut kept = contents.records.len();
         if let Err((place, unapplied)) = replay_live(&index, &contents.records, &numbers, &files) {
-            if !self.repairing {
-                return Err(unapplied.error);
-            }
             let start = contents.calls[contents.calls.partition_point(|&c| c <= place) - 1];
-            cut = Some(unapplied.cut_before(&contents.records, start, place, &numbers));
+            let made = unapplied.cut_before(&contents.records, start, place, &numbers);
+            if !self.repairing {
+                return Err(Error::repairable(unapplied.error, made.sequence, made.at));
+            }
+            cut = Some(made);
             kept = start;
             index = self.reopened()?;
             replay_live(&index, &contents.records[..kept], &numbers, &files)
@@ -4758,7 +4766,47 @@ impl Opened<'_> {
                 what: "read",
                 error: error.to_string(),
             })?;
-        let contents = read_legacy_journal(&bytes, &file)?;
+        let checkpoint = self.record.sequence;
+        let contents = match read_legacy_journal(&bytes, &file) {
+            Ok(contents) => contents,
+            Err(Error::JournalHeaderInvalid {
+                file: named,
+                detail,
+            }) => {
+                // A header that does not read names no collection and no
+                // first sequence, so no record of the file is replayed. A
+                // repair sets the whole file aside and the upgrade's
+                // checkpoint seals it, and any other load names the repair.
+                let first = checkpoint.saturating_add(1);
+                if !self.repairing {
+                    return Err(Error::repairable(
+                        Error::JournalHeaderInvalid {
+                            file: named,
+                            detail,
+                        },
+                        first,
+                        0,
+                    ));
+                }
+                self.journal_record_names_the_directory()?;
+                let cut = Cut {
+                    segment: 0,
+                    at: 0,
+                    sequence: first,
+                    kind: "header",
+                    damage_segment: 0,
+                    damage_at: 0,
+                    damage_sequence: first,
+                    detail,
+                };
+                let plan = repair::plan_legacy(&cut, &file, &bytes, self.snapshot, checkpoint);
+                recovery.first_sequence = first;
+                recovery.damage = Some(plan.damage.clone());
+                recovery.good_bytes = 0;
+                return self.finish_legacy(index, recovery, Some(plan), checkpoint, &file);
+            }
+            Err(other) => return Err(other),
+        };
         if let Some(
             JournalDamage::Corrupt { at, sequence, .. } | JournalDamage::TornTail { at, sequence },
         ) = &contents.damage
@@ -4797,14 +4845,17 @@ impl Opened<'_> {
         };
         let mut index = index;
         let mut kept = contents.records.len();
-        let checkpoint = self.record.sequence;
         if let Err((place, unapplied)) =
             replay_legacy_records(&index, &contents.records, checkpoint, &file)
         {
-            if !self.repairing {
-                return Err(unapplied.error);
-            }
             let record = &contents.records[place];
+            if !self.repairing {
+                return Err(Error::repairable(
+                    unapplied.error,
+                    record.sequence,
+                    record.offset,
+                ));
+            }
             cut = Some(Cut {
                 segment: 0,
                 at: record.offset,
@@ -4823,8 +4874,11 @@ impl Opened<'_> {
         let records = &contents.records[..kept];
         recovery.skipped = records.iter().filter(|r| r.sequence <= checkpoint).count();
         recovery.replayed = records.len() - recovery.skipped;
-        recovery.first_sequence = contents.header.first_sequence;
-        recovery.records_in_journal = kept;
+        // The first sequence above the checkpoint and the records above it
+        // the load kept, as a journal of segments reports them. A journal
+        // starting past the sequence after the checkpoint is refused above.
+        recovery.first_sequence = checkpoint.saturating_add(1);
+        recovery.records_in_journal = recovery.replayed;
         recovery.damage = contents
             .damage
             .as_ref()
@@ -4844,24 +4898,51 @@ impl Opened<'_> {
             }
             reached = plan.kept_through.max(self.record.sequence);
         }
+        self.finish_legacy(index, recovery, plan, reached, &file)
+    }
+
+    /// The end of a replay of a journal of format version 1, from the
+    /// collection the replay built, the repair's plan where there is one and
+    /// the last sequence kept: open read only where a cause allows no write,
+    /// or set aside what the plan names, cut the file, and upgrade.
+    fn finish_legacy(
+        self,
+        index: Collection,
+        mut recovery: Recovery,
+        plan: Option<repair::Plan<'_>>,
+        reached: u64,
+        file: &str,
+    ) -> Result<(Collection, Recovery), Error> {
+        let storage = self.storage;
+        let wal = storage.legacy_journal_path();
         let unfinished = if self.repairing {
             repair::unfinished(&*storage.journal_dir())
         } else {
             Vec::new()
         };
 
-        if let Some(cause) = self.read_only_cause_of(&index, &file_name_of(wal)) {
-            recovery.repair = plan.as_ref().map(|plan| plan.report(None));
-            return Ok(read_only(index, self.path, cause, reached, recovery));
-        }
         // The upgrade below is a save, and a save records the generation after
         // the directory's. A directory at the largest generation opens read only
         // here, before anything is written, as one on a medium that refuses
-        // writes does.
+        // writes does. The generation refuses a save into every directory, so
+        // it is the cause named ahead of the medium, which refuses a save into
+        // its own directory alone, and ahead of a value past a bound, as on a
+        // medium that takes writes.
         let identity = index.identity();
-        if identity.next(0).is_none() {
+        let largest = identity.next(0).is_none().then_some(identity.generation);
+        if let Some(cause) = self.read_only_cause_of(&index, &file_name_of(wal)) {
+            let cause = match (cause, largest) {
+                (ReadOnlyCause::Medium(_) | ReadOnlyCause::Bound(_), Some(generation)) => {
+                    ReadOnlyCause::Generation(generation)
+                }
+                (cause, _) => cause,
+            };
             recovery.repair = plan.as_ref().map(|plan| plan.report(None));
-            let cause = ReadOnlyCause::Generation(identity.generation);
+            return Ok(read_only(index, self.path, cause, reached, recovery));
+        }
+        if let Some(generation) = largest {
+            recovery.repair = plan.as_ref().map(|plan| plan.report(None));
+            let cause = ReadOnlyCause::Generation(generation);
             return Ok(read_only(index, self.path, cause, reached, recovery));
         }
         // A collection holding a value past the bound on a vector's norm or
@@ -4937,7 +5018,7 @@ impl Opened<'_> {
         match storage.remove_legacy_journal() {
             Ok(()) => crate::journal::sync_in_place(storage)?,
             Err(error) => warn!(target: LOG_TARGET, operation = "upgrade_old_journal_kept",
-                journal = file.as_str(),
+                journal = file,
                 error = %error,
                 "The directory was upgraded and its journal of format version 1 could not be \
                  deleted; the directory holds every record in it, and the next load deletes it"
@@ -4987,6 +5068,36 @@ fn read_segment_files(dir: &dyn zeusdb_vector_core::JournalDir) -> Result<Segmen
         bytes.push(dir.read_segment(number).map_err(io("read"))?);
     }
     Ok((numbers, files, bytes))
+}
+
+/// The refusal a plain load gives for a journal of segments `read_segments`
+/// refused, carrying the cut a repair makes where `read_segments_for_repair`
+/// reads the same segments with a cut, so the refusal names `repair=True`
+/// wherever a repair handles the damage. A refusal the reading for a repair
+/// gives as well is returned as it is, and so is the refusal of a stale
+/// segment's header, whose own words name the repair.
+fn repairable_segments(
+    refusal: Error,
+    segments: &[SegmentBytes<'_>],
+    expected: &Expected,
+    journal: &str,
+) -> Error {
+    let Ok(contents) = read_segments_for_repair(segments, expected, journal) else {
+        return refusal;
+    };
+    if let Error::JournalHeaderInvalid { file, .. } = &refusal {
+        if contents
+            .stale_set_aside
+            .iter()
+            .any(|stale| &stale.file == file)
+        {
+            return refusal;
+        }
+    }
+    match &contents.cut {
+        Some(cut) => Error::repairable(refusal, cut.sequence, cut.at),
+        None => refusal,
+    }
 }
 
 /// The segments `read_segment_files` read, as the reader borrows them.

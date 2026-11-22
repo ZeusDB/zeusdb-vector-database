@@ -40,7 +40,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 use zeusdb_vector_core::{
-    whole_records_from, Cut, Error, JournalDir, StaleSegment, SEGMENT_HEADER_BYTES,
+    whole_records_from, Cut, Error, JournalDir, StaleSegment, LEGACY_HEADER_BYTES,
+    SEGMENT_HEADER_BYTES,
 };
 
 use crate::journal::{id_from_hex, id_hex, Damage, Repair};
@@ -264,7 +265,10 @@ pub(super) fn plan_segments<'a>(
 
 /// The plan for a journal of format version 1 cut at `cut`, being the file
 /// `file` from the cut on. Version 1 frames no call, so the cut is at the
-/// damaged record itself.
+/// damaged record itself, or at the file's first byte where its header does
+/// not read. Then the whole file goes, and the records counted are the whole
+/// records after the header above the checkpoint `base_sequence`, read from
+/// the sequence the first of them carries.
 pub(super) fn plan_legacy<'a>(
     cut: &Cut,
     file: &str,
@@ -278,6 +282,24 @@ pub(super) fn plan_legacy<'a>(
         reason = "a byte offset held to the file's length on the same line, so lossless on every 64-bit target"
     )]
     let from = (cut.at as usize).min(bytes.len());
+    let records_discarded = if from < LEGACY_HEADER_BYTES {
+        let first = bytes
+            .get(LEGACY_HEADER_BYTES..LEGACY_HEADER_BYTES + 8)
+            .map_or(0, |raw| {
+                let mut word = [0u8; 8];
+                word.copy_from_slice(raw);
+                u64::from_le_bytes(word)
+            });
+        let whole = whole_records_from(bytes, LEGACY_HEADER_BYTES.min(bytes.len()), first, false);
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "records at or below the checkpoint among a file's records, at most their count"
+        )]
+        let held = (base_sequence.saturating_add(1).saturating_sub(first) as usize).min(whole);
+        whole - held
+    } else {
+        whole_records_from(bytes, from, cut.sequence, false)
+    };
     Plan {
         damage: damage_of(cut, file),
         cut: Some(PlanCut {
@@ -295,7 +317,7 @@ pub(super) fn plan_legacy<'a>(
             at: from as u64,
             bytes: &bytes[from..],
         }],
-        records_discarded: whole_records_from(bytes, from, cut.sequence, false) as u64,
+        records_discarded: records_discarded as u64,
     }
 }
 

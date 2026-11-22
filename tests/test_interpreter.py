@@ -495,3 +495,47 @@ def test_a_child_forked_while_a_call_holds_the_mutation_guard_waits_on_it(tmp_pa
         worker.finish()
     assert os.WIFSIGNALED(status) and os.WTERMSIG(status) == signal.SIGALRM, status
     assert worker.result().is_success()
+
+
+# ------------------------------------------------------------
+# A generated id against a record installed while its add waits
+# ------------------------------------------------------------
+
+
+def test_a_generated_id_moves_past_a_vec_id_installed_while_its_add_waited():
+    """`add()` issues a generated id while it parses and takes the mutation
+    guard after, with the interpreter released. Stopped before the guard, it
+    lets this thread install a record under that id, and the stopped add's
+    record then takes the next generated id, so the record installed here
+    keeps its metadata."""
+    pause = new_pause()
+    index = VectorDatabase().create("hnsw", dim=2, space="l2", expected_size=10)
+
+    def add():
+        pause.arm_at("add:before_guard")
+        try:
+            return index.add([{"values": [1.0, 0.0], "metadata": {"who": "generated"}}])
+        finally:
+            Pause.disarm()
+
+    adder = Worker(add).start()
+    named = None
+    try:
+        reached = pause.wait_reached()
+        if reached is not None:
+            named = index.add({"id": "vec_1", "values": [0.0, 1.0],
+                               "metadata": {"who": "named"}})
+    finally:
+        pause.release()
+        adder.finish()
+    added = adder.result()
+    assert reached == "add:before_guard", (
+        f"add() never reached add:before_guard, and the pause saw {reached!r}"
+    )
+    assert named.ids == ["vec_1"], named.errors
+    assert added.errors == []
+    assert added.ids == ["vec_2"], "the generated id was not moved past vec_1"
+    held = {r["id"]: r["metadata"] for r in index.get_records(["vec_1", "vec_2"],
+                                                              return_vector=False)}
+    assert held == {"vec_1": {"who": "named"}, "vec_2": {"who": "generated"}}, held
+    assert len(index) == 2

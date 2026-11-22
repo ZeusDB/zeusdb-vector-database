@@ -66,23 +66,49 @@ pub(super) enum SparseInput {
 }
 
 /// One record out of Python, with the vector processed for the space and
-/// the sparse half not yet counted.
+/// the sparse half not yet counted. `generated` is set where the id is one
+/// this call generated, which the insert moves past a held or a named id
+/// under the mutation guard; see `Collection::add_generated_records`.
 pub(super) struct Parsed {
     pub(super) id: String,
     pub(super) vector: Vec<f32>,
     pub(super) metadata: HashMap<String, Value>,
     pub(super) sparse: SparseInput,
+    pub(super) generated: bool,
 }
 
 impl Parsed {
-    fn dense(id: String, vector: Vec<f32>, metadata: HashMap<String, Value>) -> Self {
+    /// A record of the dense space alone, with no metadata, under the id
+    /// `id` this call generated.
+    fn generated_dense(id: String, vector: Vec<f32>) -> Self {
         Parsed {
             id,
             vector,
-            metadata,
+            metadata: HashMap::new(),
             sparse: SparseInput::None,
+            generated: true,
         }
     }
+}
+
+/// The id a record carries as `item`: none where it carries none or `None`,
+/// the string where it is one, and the words of its refusal where it is not a
+/// `str` or is one holding a lone surrogate, which no id can hold.
+fn record_id(item: Option<Bound<PyAny>>) -> Result<Option<String>, String> {
+    let Some(item) = item.filter(|item| !item.is_none()) else {
+        return Ok(None);
+    };
+    if !item.is_instance_of::<PyString>() {
+        return Err(format!(
+            "TypeError: the id is of type {}, and an id is a str, so convert it to one.",
+            type_name(&item)
+        ));
+    }
+    item.extract::<String>().map(Some).map_err(|_| {
+        "ValueError: the id is a str holding a lone surrogate, which an id cannot hold, so \
+         remove it."
+            .to_string()
+    })
 }
 
 /// The two keys a sparse vector mapping carries.
@@ -395,7 +421,7 @@ impl HNSWIndex {
             match self.extract_single_vector_safe(data) {
                 Ok(vector) => {
                     let id = self.inner.generate_id();
-                    parsed_vectors.push(Parsed::dense(id, vector, HashMap::new()));
+                    parsed_vectors.push(Parsed::generated_dense(id, vector));
                 }
                 Err(e) => {
                     errors.push(format!("Single vector error: {}", e));
@@ -445,11 +471,13 @@ impl HNSWIndex {
 
             match vector_result {
                 Ok(vector) => {
-                    let provided = dict
-                        .get_item("id")
-                        .ok()
-                        .flatten()
-                        .and_then(|id_item| id_item.extract::<String>().ok());
+                    let provided = match record_id(dict.get_item("id").ok().flatten()) {
+                        Ok(provided) => provided,
+                        Err(e) => {
+                            errors.push(format!("Vector single_object: {}", e));
+                            return Ok(());
+                        }
+                    };
 
                     // Read before the record takes a generated id, so a record
                     // refused for its metadata takes none.
@@ -462,6 +490,7 @@ impl HNSWIndex {
                         }
                     };
 
+                    let generated = provided.is_none();
                     let id = provided.unwrap_or_else(|| self.inner.generate_id());
 
                     match sparse_input_of_record(dict) {
@@ -470,6 +499,7 @@ impl HNSWIndex {
                             vector,
                             metadata,
                             sparse,
+                            generated,
                         }),
                         Err(e) => errors.push(format!("Vector {}: {}", id, e)),
                     }
@@ -634,13 +664,17 @@ impl HNSWIndex {
         Ok(())
     }
 
-    /// The id a batch's `ids` give the record at position `i`, where they hold
-    /// a string there. A record whose entry is not a string takes a
-    /// generated id, as a record dict whose `id` is not a string does.
-    fn provided_id(ids: Option<&Bound<PyList>>, i: usize) -> PyResult<Option<String>> {
+    /// The id a batch's `ids` give the record at position `i`, read as a
+    /// record dict's `id` is read: none where they give none or `None`
+    /// there, and the words of the record's refusal where the entry is not a
+    /// `str` or does not encode. See `record_id`.
+    fn provided_id(
+        ids: Option<&Bound<PyList>>,
+        i: usize,
+    ) -> PyResult<Result<Option<String>, String>> {
         Ok(match ids {
-            Some(ids) if i < ids.len() => ids.get_item(i)?.extract::<String>().ok(),
-            _ => None,
+            Some(ids) if i < ids.len() => record_id(Some(ids.get_item(i)?)),
+            _ => Ok(None),
         })
     }
 
@@ -685,7 +719,13 @@ impl HNSWIndex {
         let texts_list = parallel_list(dict, "texts");
 
         for (i, vector_item) in vectors.iter().enumerate() {
-            let provided = Self::provided_id(ids_list.as_ref(), i)?;
+            let provided = match Self::provided_id(ids_list.as_ref(), i)? {
+                Ok(provided) => provided,
+                Err(e) => {
+                    errors.push(format!("Vector item_{}: {}", i, e));
+                    continue;
+                }
+            };
             let label = || provided.clone().unwrap_or_else(|| format!("item_{}", i));
             let vector = match self.extract_single_vector_safe(&vector_item) {
                 Ok(vector) => vector,
@@ -708,6 +748,7 @@ impl HNSWIndex {
                     continue;
                 }
             };
+            let generated = provided.is_none();
             let id = match provided {
                 Some(id) => id,
                 None => self.inner.generate_id(),
@@ -717,6 +758,7 @@ impl HNSWIndex {
                 vector,
                 metadata,
                 sparse,
+                generated,
             });
         }
 
@@ -757,7 +799,14 @@ impl HNSWIndex {
             // Resolve the caller's id before validating, so a rejected row can
             // be named without advancing the generated id counter for a record
             // that is never stored.
-            let provided_id = Self::provided_id(ids_list.as_ref(), i)?;
+            let provided_id = match Self::provided_id(ids_list.as_ref(), i)? {
+                Ok(provided) => provided,
+                Err(e) => {
+                    errors.push(format!("Vector row_{}: {}", i, e));
+                    rejected += 1;
+                    continue;
+                }
+            };
             let label = || provided_id.clone().unwrap_or_else(|| format!("row_{}", i));
 
             match self.inner.screen_vector(raw_vector) {
@@ -810,6 +859,7 @@ impl HNSWIndex {
             let processed_vector = self.inner.process_vector_for_space(raw_vector.to_vec());
 
             // Get ID from provided IDs or generate
+            let generated = provided_id.is_none();
             let id = match provided_id {
                 Some(id) => id,
                 None => self.inner.generate_id(),
@@ -829,6 +879,7 @@ impl HNSWIndex {
                     vector: processed_vector,
                     metadata,
                     sparse,
+                    generated,
                 }),
                 Err(e) => {
                     errors.push(format!("Vector {}: {}", id, e));
@@ -880,11 +931,13 @@ impl HNSWIndex {
 
                 match vector_result {
                     Ok(vector) => {
-                        let provided = item_dict
-                            .get_item("id")
-                            .ok()
-                            .flatten()
-                            .and_then(|id_item| id_item.extract::<String>().ok());
+                        let provided = match record_id(item_dict.get_item("id").ok().flatten()) {
+                            Ok(provided) => provided,
+                            Err(e) => {
+                                errors.push(format!("Vector item_{}: {}", item_index, e));
+                                continue;
+                            }
+                        };
 
                         // Read before the record takes a generated id, so a
                         // record refused for its metadata takes none.
@@ -898,6 +951,7 @@ impl HNSWIndex {
                             }
                         };
 
+                        let generated = provided.is_none();
                         let id = provided.unwrap_or_else(|| self.inner.generate_id());
 
                         match sparse_input_of_record(item_dict) {
@@ -906,6 +960,7 @@ impl HNSWIndex {
                                 vector,
                                 metadata,
                                 sparse,
+                                generated,
                             }),
                             Err(e) => errors.push(format!("Vector {}: {}", id, e)),
                         }
@@ -927,7 +982,7 @@ impl HNSWIndex {
                 match self.extract_single_vector_safe(&item) {
                     Ok(vector) => {
                         let id = self.inner.generate_id();
-                        parsed_vectors.push(Parsed::dense(id, vector, HashMap::new()));
+                        parsed_vectors.push(Parsed::generated_dense(id, vector));
                     }
                     Err(e) => {
                         errors.push(format!("Item {}: {}", item_index, e));
@@ -989,7 +1044,7 @@ impl HNSWIndex {
 
             let processed_vector = self.inner.process_vector_for_space(raw_vector.to_vec());
             let id = self.inner.generate_id();
-            parsed_vectors.push(Parsed::dense(id, processed_vector, HashMap::new()));
+            parsed_vectors.push(Parsed::generated_dense(id, processed_vector));
         }
 
         Ok(())

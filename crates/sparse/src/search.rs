@@ -514,12 +514,13 @@ impl PostingsIndex {
     }
 
     /// Document frequencies over the records `admit` admits, by whichever
-    /// of the two walks the search itself would take under that set, or
-    /// `None` where the set can neither be tested as a bitmap nor
-    /// enumerated. A set admitting everything answers from the lists alone.
-    pub(crate) fn stats_under(&self, dims: &[u32], admit: &dyn Admit) -> Option<CorpusStats> {
+    /// of the two walks the search itself would take under that set, and by
+    /// asking the set of every record and every posting where it can neither
+    /// be tested as a bitmap nor enumerated. A set admitting everything
+    /// answers from the lists alone.
+    pub(crate) fn stats_under(&self, dims: &[u32], admit: &dyn Admit) -> CorpusStats {
         if admit.admits_all() {
-            return Some(self.global_stats(dims));
+            return self.global_stats(dims);
         }
         let bitmap = admit.as_bitmap();
         let enumerate_first = admit
@@ -527,13 +528,48 @@ impl PostingsIndex {
             .is_some_and(|admitted| self.prefers_enumerate(dims, admitted, bitmap.is_some()));
         if enumerate_first {
             if let Some(stats) = self.stats_by_enumerate(dims, admit) {
-                return Some(stats);
+                return stats;
             }
         }
         if let Some(bitmap) = bitmap {
-            return Some(self.stats_by_walk(dims, bitmap));
+            return self.stats_by_walk(dims, bitmap);
         }
         self.stats_by_enumerate(dims, admit)
+            .unwrap_or_else(|| self.stats_by_test(dims, admit))
+    }
+
+    /// The counts [`PostingsIndex::stats_by_walk`] gives under the bitmap a
+    /// set stands for, for a set that can neither be tested as a bitmap nor
+    /// enumerated, being a predicate over metadata: the set is asked of every
+    /// live record for the document count, and of every posting of each named
+    /// list a removal has not killed, with the dead test only where a record
+    /// has been removed since the last compaction.
+    fn stats_by_test(&self, dims: &[u32], admit: &dyn Admit) -> CorpusStats {
+        let mut documents = 0usize;
+        self.live_set.for_each(|slot| {
+            if admit.admits(Position::from_slot(slot)) {
+                documents += 1;
+            }
+        });
+        let has_dead = self.dead_records > 0;
+        let dead = &self.dead;
+        let df = dims
+            .iter()
+            .map(|d| {
+                let Some(&slot) = self.slots_by_dim.get(d) else {
+                    return 0;
+                };
+                self.lists[slot as usize]
+                    .postings
+                    .iter()
+                    .filter(|p| {
+                        !(has_dead && dead.contains(p.key as usize))
+                            && admit.admits(Position(p.key))
+                    })
+                    .count()
+            })
+            .collect();
+        CorpusStats { documents, df }
     }
 
     /// Each named list walked under the bitmap, counting the postings it
@@ -638,9 +674,7 @@ impl PostingsIndex {
     ) -> Weighted {
         let stats = match idf {
             IdfScope::Global => self.global_stats(query.dims),
-            IdfScope::Corpus => self
-                .stats_under(query.dims, admit)
-                .unwrap_or_else(|| self.global_stats(query.dims)),
+            IdfScope::Corpus => self.stats_under(query.dims, admit),
         };
         let n = stats.documents as f64;
         let numerator = k1 as f64 + 1.0;
@@ -1069,7 +1103,8 @@ mod tests {
 
     /// Corpus statistics count admitted live records and their postings by
     /// every walk, agree with the global count under a set admitting
-    /// everything, and answer `None` for a set that is only a predicate.
+    /// everything, and count a set that is only a predicate by asking it of
+    /// each live record and each posting.
     #[test]
     fn corpus_statistics_count_under_every_shape_of_admit_set() {
         let mut index = index_of(
@@ -1126,7 +1161,16 @@ mod tests {
                 None
             }
         }
-        assert_eq!(index.corpus_stats(&dims, &Odd), None);
+        // Odd admits 1, 3 and 5 of the live 1, 2, 3 and 5, and of the
+        // postings that are not dead, 1 and 5 of term 1, 1, 3 and 5 of term 2,
+        // and 3 and 5 of term 3.
+        assert_eq!(
+            index.corpus_stats(&dims, &Odd),
+            Some(CorpusStats {
+                documents: 3,
+                df: vec![2, 3, 2, 0]
+            })
+        );
     }
 
     /// A score is a function of the corpus at the moment of the query and

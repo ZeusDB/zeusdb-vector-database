@@ -23,10 +23,7 @@ const NAMES: [&str; 3] = ["call", "interval", "none"];
 pub(crate) fn parse_durability(name: &str, interval_ms: Option<u64>) -> PyResult<Durability> {
     if !NAMES.contains(&name) {
         return Err(PyValueError::new_err(format!(
-            "durability must be 'call', 'interval' or 'none', got '{}'. 'call' puts every \
-             record of a call on the device before the call returns, 'interval' does that \
-             from a thread within interval_ms milliseconds of the call, and 'none' leaves it \
-             to the next checkpoint.",
+            "durability must be 'call', 'interval' or 'none', got '{}'.",
             name
         )));
     }
@@ -38,10 +35,7 @@ pub(crate) fn parse_durability(name: &str, interval_ms: Option<u64>) -> PyResult
             )));
         }
         Some(0) => {
-            return Err(PyValueError::new_err(
-                "interval_ms must be at least 1, being the milliseconds between the journal's \
-                 flushes",
-            ));
+            return Err(PyValueError::new_err("interval_ms must be at least 1"));
         }
         _ => {}
     }

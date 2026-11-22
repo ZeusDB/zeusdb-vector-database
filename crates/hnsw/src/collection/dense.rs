@@ -829,10 +829,12 @@ impl DenseIndex {
     /// whether its page is exact, priced on the path
     /// [`VectorIndex::search`] takes. That is one evaluation a record held
     /// where a search admitting every record scores the records, and
-    /// [`VectorIndex::cost`] everywhere else.
+    /// otherwise [`DenseIndex::cost_at`] at the width the traversal runs at,
+    /// being the larger of the budget's `ef` and `k` by the core graph's
+    /// `search`.
     pub(crate) fn cost_under(
         &self,
-        query: &[f32],
+        _query: &[f32],
         k: usize,
         shape: &AdmitShape,
         budget: &Budget,
@@ -844,7 +846,33 @@ impl DenseIndex {
                 exact: true,
             };
         }
-        self.cost(query, k, shape.selectivity().as_ref())
+        self.cost_at(ef.max(k), shape.selectivity().as_ref())
+    }
+
+    /// What a search admitting `admitted` costs where its traversal runs at
+    /// width `ef`: an exact scan of the admitted records where they are few
+    /// enough to be scanned, and otherwise `ef` units of traversal, divided by
+    /// the admitted share where a filter applies.
+    fn cost_at(&self, ef: usize, admitted: Option<&Selectivity>) -> Cost {
+        let ef = ef as f64;
+        match admitted {
+            Some(selectivity) if (selectivity.expected as usize) <= FULL_SCAN_THRESHOLD => Cost {
+                work_ns: selectivity.expected as f64 * self.units.distance_ns,
+                exact: true,
+            },
+            Some(selectivity) => {
+                let live = self.live_count.max(1) as f64;
+                let share = (selectivity.expected as f64 / live).clamp(1e-3, 1.0);
+                Cost {
+                    work_ns: ef * self.units.ef_ns / share.powf(SELECTIVITY_EXPONENT),
+                    exact: false,
+                }
+            }
+            None => Cost {
+                work_ns: ef * self.units.ef_ns,
+                exact: false,
+            },
+        }
     }
 
     /// The distance from `query` to the record one node holds, scored from
@@ -1375,28 +1403,11 @@ impl VectorIndex<Dense> for DenseIndex {
         Ok(self.traverse(query, k, ef, admit))
     }
 
-    /// Priced from `ef` and the admitted share, and the query is ignored,
-    /// since a traversal's work does not depend on which vector is asked.
+    /// Priced from the default `ef` for `k` and the admitted share, and the
+    /// query is ignored, since a traversal's work does not depend on which
+    /// vector is asked. See [`DenseIndex::cost_at`].
     fn cost(&self, _query: &[f32], k: usize, admitted: Option<&Selectivity>) -> Cost {
-        let ef = self.default_ef(k) as f64;
-        match admitted {
-            Some(selectivity) if (selectivity.expected as usize) <= FULL_SCAN_THRESHOLD => Cost {
-                work_ns: selectivity.expected as f64 * self.units.distance_ns,
-                exact: true,
-            },
-            Some(selectivity) => {
-                let live = self.live_count.max(1) as f64;
-                let share = (selectivity.expected as f64 / live).clamp(1e-3, 1.0);
-                Cost {
-                    work_ns: ef * self.units.ef_ns / share.powf(SELECTIVITY_EXPONENT),
-                    exact: false,
-                }
-            }
-            None => Cost {
-                work_ns: ef * self.units.ef_ns,
-                exact: false,
-            },
-        }
+        self.cost_at(self.default_ef(k), admitted)
     }
 }
 

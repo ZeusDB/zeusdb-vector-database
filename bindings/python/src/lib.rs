@@ -200,7 +200,9 @@ impl From<PyEngineError> for PyErr {
 /// the first call the damage touches is replayed, that call and every byte
 /// after it are copied into `<path>.zdbjournal/quarantine/<UTC stamp>-<first
 /// sequence set aside>/` with a `repair.json` describing them, the journal
-/// is cut there, and a checkpoint is written. A stale segment whose header
+/// is cut there, and a checkpoint is written. A journal of format version 1
+/// marks no calls, so it is cut at the damaged record itself, or at its
+/// first byte where its header does not read. A stale segment whose header
 /// does not read is copied there whole instead, and nothing is cut. A
 /// `RuntimeWarning` names the damage, the records set aside and the folder,
 /// and `index.recovery` reports the same. A load that finds nothing damaged

@@ -13,8 +13,10 @@ authority on what the right answer was.
 """
 
 import contextlib
+import gc
 import json
 import os
+import stat
 import struct
 import subprocess
 import sys
@@ -356,11 +358,12 @@ def test_an_invalid_expected_size_raises_the_same_way():
     assert index.expected_size == SIZE
 
 
-def test_rebuild_with_no_parameter_at_all_points_at_compact():
+def test_rebuild_with_no_parameter_at_all_names_the_three_it_changes():
     index, _, _, _ = build(m=8, size=50)
     with pytest.raises(ValueError) as excinfo:
         index.rebuild()
-    assert "compact()" in str(excinfo.value)
+    assert str(excinfo.value) == ("rebuild() changes m, expected_size, ef_construction or any "
+                                  "combination of them, and was given none.")
 
 
 def test_the_two_warnings_are_the_same_sentence():
@@ -468,6 +471,80 @@ assert idx.expected_size == 90
     assert len(lines) == 2, f"expected two warnings, got {len(lines)}"
     assert json.loads(lines[0])["fields"]["expected_size"] == 10
     assert json.loads(lines[1])["fields"]["expected_size"] == 90
+
+
+def test_a_refused_rebuild_leaves_the_overgrowth_warning_as_it_was(tmp_path):
+    """A rebuild refused at its record leaves the index as it was, the
+    overgrowth warning among it, so an add after it does not warn again. A
+    journaled directory whose lock file this process cannot write opens read
+    only, and refuses the rebuild's record."""
+    path = tmp_path / "grown.zdb"
+    index = VectorDatabase().create("hnsw", dim=8, expected_size=10)
+    index.journal_to(str(path))
+    rng = np.random.default_rng(4242)
+    assert index.add({"vectors": rng.random((40, 8)).astype(np.float32)}).is_success()
+    del index
+    gc.collect()
+    lock = tmp_path / "grown.zdb.zdblock"
+    log_file = tmp_path / "refused.log"
+    code = rf"""
+import numpy as np
+import zeusdb_vector_database as zdb
+held = zdb.VectorDatabase().load({str(path)!r})
+assert held.recovery['read_only'] is True, held.recovery
+rng = np.random.default_rng(7)
+held.add({{'vectors': rng.random((1, 8)).astype('float32').tolist()}})
+try:
+    held.rebuild(expected_size=10)
+except RuntimeError:
+    pass
+else:
+    raise AssertionError('the rebuild was not refused')
+held.add({{'vectors': rng.random((1, 8)).astype('float32').tolist()}})
+"""
+    env = os.environ.copy()
+    env.update({
+        "ZEUSDB_LOG_LEVEL": "info",
+        "ZEUSDB_LOG_FORMAT": "json",
+        "ZEUSDB_LOG_TARGET": "file",
+        "ZEUSDB_LOG_FILE": str(log_file),
+    })
+    os.chmod(lock, stat.S_IREAD)
+    try:
+        if os.access(lock, os.W_OK):
+            pytest.skip("this process writes through a read-only permission")
+        done = subprocess.run([sys.executable, "-c", code], env=env,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    finally:
+        os.chmod(lock, stat.S_IREAD | stat.S_IWRITE)
+    assert done.returncode == 0, done.stderr.decode("utf-8", errors="ignore")[-2000:]
+
+    text = log_file.read_text(encoding="utf-8", errors="ignore")
+    lines = [ln for ln in text.splitlines() if "expected_size_exceeded" in ln]
+    # One at the first add of the index the load opened, which a load leaves
+    # armed. The refused rebuild arms nothing.
+    assert len(lines) == 1, f"expected one warning, got {len(lines)}"
+
+
+def test_a_rebuild_naming_expected_size_keeps_the_reservation_create_makes():
+    """A rebuild whose records fit inside the expected_size it names keeps
+    the reservation that declaration makes for the graph and its rows, as
+    create() keeps it, and a compact() gives it back."""
+    vectors = np.random.default_rng(7).random((50, 16), dtype=np.float32)
+    ids = [f"r{i}" for i in range(50)]
+    made = VectorDatabase().create("hnsw", dim=16, m=16, expected_size=100_000)
+    assert made.add({"ids": ids, "embeddings": vectors}).is_success()
+    declared = made.get_stats()
+    rebuilt = VectorDatabase().create("hnsw", dim=16, m=16, expected_size=100)
+    assert rebuilt.add({"ids": ids, "embeddings": vectors}).is_success()
+    rebuilt.rebuild(expected_size=100_000)
+    stats = rebuilt.get_stats()
+    for key in ("graph_memory_mb", "raw_vectors_memory_mb"):
+        assert stats[key] == declared[key], (key, stats[key], declared[key])
+    assert rebuilt.remove_point("r0")
+    rebuilt.compact()
+    assert (float(rebuilt.get_stats()["graph_memory_mb"])
+            < 0.05 * float(declared["graph_memory_mb"]))
 
 
 # ---------------------------------------------------------------------------

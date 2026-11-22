@@ -1188,6 +1188,6 @@ def test_a_filter_value_metadata_does_not_hold_raises_from_every_call():
         with pytest.raises(TypeError) as refusal:
             call({"tag": {"in": ("x", "y")}})
         assert str(refusal.value) == (
-            "the value at key 'tag', key 'in' is a tuple, and a metadata value is None, a bool, "
-            "an int, a float, a str, a list or a dict, so convert it to one of those."), name
+            "the value at key 'tag', key 'in' is of type tuple, and a metadata value is None, "
+            "a bool, an int, a float, a str, a list or a dict, so convert it to one of those."), name
     assert len(index) == 1

@@ -662,11 +662,13 @@ impl HNSWIndex {
             // read once per call, with no guard taken.
             let takes_text_alone = inner.takes_text();
             let mut records: Vec<ParsedRecord> = Vec::with_capacity(parsed.len());
+            let mut generated: Vec<bool> = Vec::with_capacity(parsed.len());
             for Parsed {
                 id,
                 vector,
                 metadata,
                 sparse,
+                generated: id_generated,
             } in parsed
             {
                 let sparse = match sparse {
@@ -705,6 +707,7 @@ impl HNSWIndex {
                     sparse,
                     metadata,
                 });
+                generated.push(id_generated);
             }
 
             // Parsing and tokenizing are the whole of what reads Python objects,
@@ -715,12 +718,13 @@ impl HNSWIndex {
             // without the lock. Holding it while waiting would stall every
             // Python thread in the process for the length of the writer ahead.
             //
-            // `Collection::add_records` carries the proof that nothing inside
-            // touches Python. A record's terms travel as strings and are counted
-            // into ids there, under the mutation guard, so nothing this thread
-            // holds across the boundary is an id the dictionary issued.
+            // `Collection::add_generated_records` carries the proof that nothing
+            // inside touches Python. A record's terms travel as strings and are
+            // counted into ids there, under the mutation guard, so nothing this
+            // thread holds across the boundary is an id the dictionary issued.
             let py = data.py();
-            let added: Added = py.detach(|| inner.add_records(records, errors, overwrite));
+            let added: Added =
+                py.detach(|| inner.add_generated_records(records, generated, errors, overwrite));
 
             Ok(AddResult::from(added))
         })

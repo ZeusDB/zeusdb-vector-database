@@ -554,6 +554,10 @@ impl OperationSink for JournalSink {
         self.writer.append(kind, payload).map(|_| ())
     }
 
+    fn forked(&self) -> Option<Error> {
+        self.writer.check_process().err()
+    }
+
     /// Under the per-call policy, the commit record and the flush, and a
     /// flush that fails withdraws the call. Under the other two, the commit
     /// record with nothing on the device: the interval policy's thread is
@@ -1433,11 +1437,13 @@ pub enum JournalPolicy {
     /// the journal's history is cut away rather than refused: every whole
     /// call before the damage is replayed, the damaged call and everything
     /// after it are copied into the journal's `quarantine` folder, the
-    /// journal is cut and a checkpoint seals it. A stale segment whose header
-    /// does not read is copied there whole instead, and nothing is cut. Where
-    /// nothing is damaged and no repair is unfinished it is a replay and
-    /// writes nothing more, and on a collection opened read only it writes
-    /// nothing.
+    /// journal is cut and a checkpoint seals it. A journal of format version
+    /// 1 marks no calls, so it is cut at the damaged record itself, or at its
+    /// first byte where its header does not read. A stale segment whose
+    /// header does not read is copied there whole instead, and nothing is
+    /// cut. Where nothing is damaged and no repair is unfinished it is a
+    /// replay and writes nothing more, and on a collection opened read only
+    /// it writes nothing.
     Repair(Durability),
     /// Open the checkpoint alone. The journal is neither read nor reopened,
     /// no sink is attached, and the mutations it holds are not applied.

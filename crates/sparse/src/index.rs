@@ -1244,7 +1244,7 @@ impl VectorIndex<Sparse> for PostingsIndex {
     }
 
     fn corpus_stats(&self, dims: &[u32], admit: &dyn Admit) -> Option<CorpusStats> {
-        self.stats_under(dims, admit)
+        Some(self.stats_under(dims, admit))
     }
 }
 

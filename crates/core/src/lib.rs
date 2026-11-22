@@ -63,6 +63,7 @@ mod int8;
 mod journal;
 mod kill;
 mod metadata;
+mod metadata_value;
 mod operation;
 mod panic_point;
 mod pq;
@@ -136,6 +137,7 @@ pub use kill::{
 #[cfg(any(test, feature = "test-support"))]
 pub use metadata::{MetadataCopy, MoveHook, METADATA_MOVE_HOOK};
 pub use metadata::{MetadataParts, MetadataStore, RecordFields};
+pub use metadata_value::{record_metadata, MetadataValue, METADATA_MAX_DEPTH};
 pub use operation::{
     AbortReason, Fitted, FittedRef, InsertParts, Operation, Values, STAMP_CEILING,
 };

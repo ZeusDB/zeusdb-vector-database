@@ -152,7 +152,7 @@ class VectorDatabase:
         import warnings
         warnings.warn(
             f"ef_construction={ef_construction} is not greater than 2*m={budget}, "
-            f"so the neighbour selection heuristic does not run. Layer zero "
+            f"so the neighbour selection heuristic does not run at layer zero. Layer zero "
             f"insertion keeps every candidate the construction search returns, in "
             f"distance order, and prunes none of them. {remedy}, to run it.",
             UserWarning,
@@ -168,29 +168,29 @@ class VectorDatabase:
         """The shape of a declared field list, checked here first.
 
         A single string, a value that is not iterable and a name that is not
-        a string are refused here with ValueError, against the argument
+        a string are refused here with TypeError, against the argument
         the caller wrote. The count of fields, the names themselves and a
         name given twice are held to their rules by the Rust constructor
         alone, which holds a directory loaded from disk to the same rules and
-        raises ValueError too.
+        raises ValueError.
         """
         if isinstance(fields, str):
-            raise ValueError(
+            raise TypeError(
                 f"indexed_fields must be a list of field names, not a single string. "
                 f"Pass indexed_fields=['{fields}'] to declare one field."
             )
         try:
             names = list(fields)
         except TypeError:
-            raise ValueError(
+            raise TypeError(
                 f"indexed_fields must be a list of metadata field names, got "
                 f"{type(fields).__name__}."
             ) from None
         for name in names:
             if not isinstance(name, str):
-                raise ValueError(
+                raise TypeError(
                     f"indexed_fields must hold field names as strings, but it holds "
-                    f"{name!r}, which is a {type(name).__name__}."
+                    f"{name!r}, of type {type(name).__name__}."
                 )
         return names
 
@@ -601,12 +601,14 @@ class VectorDatabase:
                 call and everything after it in the journal are copied into
                 <path>.zdbjournal/quarantine/ beside a repair.json that
                 describes them, the journal is cut there, and the directory
-                is saved. A stale segment whose header does not read is
-                copied there whole instead, and nothing is cut. A
-                RuntimeWarning names the damage, the records set aside and
-                the folder, and index.recovery reports the same. A directory
-                with nothing damaged and no repair unfinished loads as it
-                would without repair. Where the index opens read only,
+                is saved. A journal of format version 1 marks no calls, so it
+                is cut at the damaged record itself, or at its first byte
+                where its header does not read. A stale segment whose header
+                does not read is copied there whole instead, and nothing is
+                cut. A RuntimeWarning names the damage, the records set aside
+                and the folder, and index.recovery reports the same. A
+                directory with nothing damaged and no repair unfinished loads
+                as it would without repair. Where the index opens read only,
                 nothing is set aside or changed. Refused beside
                 checkpoint_only with ValueError.
 
@@ -656,10 +658,17 @@ class VectorDatabase:
             Validated and normalized configuration
 
         Raises:
+            TypeError: If config is not a dict or holds a key that is not a str.
             ValueError: If configuration is invalid
         """
         if not isinstance(config, dict):
-            raise ValueError("quantization_config must be a dictionary")
+            raise TypeError("quantization_config must be a dictionary")
+        for key in config:
+            if not isinstance(key, str):
+                raise TypeError(
+                    f"quantization_config must have str keys, but it holds the key {key!r}, "
+                    f"of type {type(key).__name__}."
+                )
         
         # Create a copy to avoid modifying the original
         validated_config = config.copy()
@@ -681,6 +690,7 @@ class VectorDatabase:
                 "quantization_config names 'scale' under type 'pq', and 'scale' is read "
                 "under type 'int8' alone. Drop it, or change type."
             )
+        self._refuse_unread_keys(validated_config, 'pq', self._PQ_KEYS, ('scale',))
 
         # Every rule below derives from dim, and the engine refuses a dim it
         # does not take before it reads this config, so for such a dim the
@@ -712,7 +722,9 @@ class VectorDatabase:
         validated_config['subvectors'] = subvectors
         
         # Validate bits per subvector
-        bits = validated_config.get('bits', 8)
+        bits = validated_config.get('bits')
+        if bits is None:
+            bits = 8
         if not isinstance(bits, int) or bits < 1 or bits > 8:
             raise ValueError(f"bits must be an integer between 1 and 8, got {bits}")
         
@@ -723,7 +735,12 @@ class VectorDatabase:
         if training_size is None:
             training_size = self._calculate_smart_training_size(subvectors, bits)
         else:
-            if not isinstance(training_size, int) or training_size < 1000:
+            if not isinstance(training_size, int):
+                raise ValueError(
+                    f"training_size must be an integer, got {training_size!r}, of type "
+                    f"{type(training_size).__name__}."
+                )
+            if training_size < 1000:
                 raise ValueError(f"training_size must be at least 1000 for stable k-means clustering, got {training_size}")
         
         validated_config['training_size'] = training_size
@@ -731,14 +748,20 @@ class VectorDatabase:
         # Validate max training vectors if provided
         max_training_vectors = validated_config.get('max_training_vectors')
         if max_training_vectors is not None:
-            if not isinstance(max_training_vectors, int) or max_training_vectors < training_size:
+            if not isinstance(max_training_vectors, int):
+                raise ValueError(
+                    f"max_training_vectors must be an integer, got {max_training_vectors!r}, "
+                    f"of type {type(max_training_vectors).__name__}."
+                )
+            if max_training_vectors < training_size:
                 raise ValueError(
                     f"max_training_vectors ({max_training_vectors}) must be >= training_size ({training_size})"
                 )
             validated_config['max_training_vectors'] = max_training_vectors
         
         # Validate storage mode
-        storage_mode = str(validated_config.get('storage_mode', 'quantized_only')).lower()
+        storage_mode = validated_config.get('storage_mode')
+        storage_mode = 'quantized_only' if storage_mode is None else str(storage_mode).lower()
         valid_modes = {'quantized_only', 'quantized_with_raw'}
         if storage_mode not in valid_modes:
             raise ValueError(
@@ -829,6 +852,26 @@ class VectorDatabase:
 
         return validated_config
 
+    # The keys each scheme reads, in the order its refusal names them.
+    _PQ_KEYS = ('type', 'subvectors', 'bits', 'training_size', 'max_training_vectors',
+                'storage_mode')
+    _INT8_KEYS = ('type', 'scale', 'training_size', 'max_training_vectors', 'storage_mode')
+
+    @staticmethod
+    def _refuse_unread_keys(config: Dict[str, Any], qtype: str, reads: tuple,
+                            refused_apart: tuple) -> None:
+        """Raise ValueError naming the first key of `config` that type `qtype`
+        does not read, being one in neither `reads` nor `refused_apart`, the
+        other scheme's keys, which the caller refuses in words of their own
+        where they are not None. The engine reads named keys alone, so a key
+        it does not read would change nothing."""
+        for key in config:
+            if key not in reads and key not in refused_apart:
+                raise ValueError(
+                    f"quantization_config holds the key '{key}', which type '{qtype}' does "
+                    f"not read. Type '{qtype}' reads {', '.join(reads[:-1])} and {reads[-1]}."
+                )
+
     # Records a scalar quantized index collects before it fits its scales.
     #
     # The scales are the largest magnitude a dimension reaches over the
@@ -871,6 +914,7 @@ class VectorDatabase:
                     f"quantization_config names '{key}' under type 'int8', and '{key}' is "
                     f"read under type 'pq' alone. Drop it, or change type."
                 )
+        self._refuse_unread_keys(config, 'int8', self._INT8_KEYS, ('subvectors', 'bits'))
         config['type'] = 'int8'
 
         scale = str(config.get('scale') or 'per_dimension').lower()
@@ -885,21 +929,30 @@ class VectorDatabase:
         training_size = config.get('training_size')
         if training_size is None:
             training_size = self.DEFAULT_INT8_TRAINING_SIZE
-        elif (not isinstance(training_size, int) or isinstance(training_size, bool)
-              or training_size < 1000):
+        elif not isinstance(training_size, int):
+            raise ValueError(
+                f"training_size must be an integer, got {training_size!r}, of type "
+                f"{type(training_size).__name__}."
+            )
+        elif isinstance(training_size, bool) or training_size < 1000:
             raise ValueError(f"training_size must be at least 1000, got {training_size}")
         config['training_size'] = training_size
 
         max_training_vectors = config.get('max_training_vectors')
         if max_training_vectors is not None:
-            if (not isinstance(max_training_vectors, int) or isinstance(max_training_vectors, bool)
-                    or max_training_vectors < training_size):
+            if not isinstance(max_training_vectors, int):
+                raise ValueError(
+                    f"max_training_vectors must be an integer, got {max_training_vectors!r}, "
+                    f"of type {type(max_training_vectors).__name__}."
+                )
+            if isinstance(max_training_vectors, bool) or max_training_vectors < training_size:
                 raise ValueError(
                     f"max_training_vectors ({max_training_vectors}) must be >= training_size ({training_size})"
                 )
             config['max_training_vectors'] = max_training_vectors
 
-        storage_mode = str(config.get('storage_mode', 'quantized_only')).lower()
+        storage_mode = config.get('storage_mode')
+        storage_mode = 'quantized_only' if storage_mode is None else str(storage_mode).lower()
         if storage_mode == 'quantized_with_raw':
             raise ValueError(
                 "storage_mode='quantized_with_raw' is not available under type 'int8'. The "
@@ -1318,12 +1371,15 @@ class VectorDatabase:
         # subvectors, so only subvectors moves it. bits sets the centroid count
         # and leaves the code at one byte per subvector, so it does not.
         #
-        # A derived subvectors is exempt. This warning tells a caller that the
-        # value they chose looks unbalanced, and the derived value is 128x from
-        # dim 256 upward, which is above the threshold and is the measured
-        # choice. Warning about it would have create() warn about its own
-        # default at every common embedding dimension.
-        if compression_ratio > 50 and not subvectors_was_derived:
+        # A derived subvectors is held to 4 * DEFAULT_SUBVECTOR_WIDTH, the
+        # ratio the default is measured at, rather than to the threshold a
+        # given one is held to, since that threshold would have create() warn
+        # about its own default at every common embedding dimension. Past the
+        # measured ratio the snap to a divisor or the clamp has moved the
+        # default off the measured choice, and the warning holds for it as for
+        # a given value.
+        threshold = 4 * self.DEFAULT_SUBVECTOR_WIDTH if subvectors_was_derived else 50
+        if compression_ratio > threshold:
             warnings.warn(
                 f"Very high compression ratio: {compression_ratio:.1f}x may significantly impact recall quality. "
                 f"Increase subvectors ({subvectors}) to lower it, at the cost of memory and build time.",

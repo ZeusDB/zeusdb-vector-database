@@ -1384,3 +1384,45 @@ fn a_training_whose_record_fails_trains_nothing_live_or_replayed() {
     );
     assert_eq!(ids(&recovered), ids(&collection));
 }
+
+/// An add whose training's record fails to commit inserts its records and
+/// counts no error, and the training's entry in `errors` says the training's
+/// record was withdrawn, since the call's own records committed before it.
+/// Every later change is refused until a checkpoint commits.
+#[test]
+fn a_failed_training_names_the_trainings_record_and_counts_no_record() {
+    let tmp = TempDir::new("training-entry");
+    let path = tmp.at("index.zdb");
+    let (declaration, quantization) = trained_declaration();
+    let (collection, armed) = failing_after(
+        &path,
+        declaration,
+        Some(quantization),
+        zeusdb_vector_core::OperationKind::Train,
+    );
+    armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    let added = try_add(&collection, 0..1000);
+    assert_eq!(added.inserted.len(), 1000);
+    assert_eq!(added.total_errors, 0, "{:?}", added.errors);
+    let entry = added
+        .errors
+        .iter()
+        .find(|e| e.starts_with("Training failed: "))
+        .expect("the training's entry");
+    assert!(
+        entry.contains(
+            "The training's record was withdrawn by an abort record, so the training does not \
+             come back after a crash."
+        ),
+        "{entry}"
+    );
+    assert!(!entry.contains("The call's records"), "{entry}");
+    armed.store(false, std::sync::atomic::Ordering::SeqCst);
+    let next = try_add(&collection, 1000..1001);
+    assert_eq!(next.total_errors, 1, "{:?}", next.errors);
+    assert!(
+        next.errors[0].contains("Call checkpoint()"),
+        "{:?}",
+        next.errors
+    );
+}

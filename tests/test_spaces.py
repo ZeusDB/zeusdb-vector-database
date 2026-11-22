@@ -978,6 +978,33 @@ def test_idf_scope_reads_the_admitted_corpus_by_default_and_the_whole_index_on_r
     assert filtered_corpus[0]["score"] != filtered_global[0]["score"]
 
 
+def test_declaring_a_field_changes_no_bm25_page_under_corpus_idf():
+    """A filter returns the same page whether or not its field is declared,
+    as indexed_fields says, and that holds for a bm25 arm under idf corpus,
+    whose rarity is counted over the records the filter admits whether they
+    are tested one by one or read from the field's bitmap."""
+    query = [{"sparse": {"dims": [1, 2], "values": [1.0, 1.0]}, "idf": "corpus"}]
+    pages, shapes = {}, {}
+    for fields in ((), ("lang",)):
+        index = VectorDatabase().create("hnsw", dim=2, space="l2", expected_size=12000,
+                                        indexed_fields=list(fields),
+                                        sparse={"weighting": "bm25"})
+        records = []
+        for i in range(11500):
+            lang = "en" if i < 5500 else "fr"
+            term = 1 if i < 5000 else 2
+            records.append({"id": f"d{i:05d}", "values": [float(i % 7), float(i % 11)],
+                            "sparse": {"dims": [term], "values": [1.0]},
+                            "metadata": {"lang": lang}})
+        added = index.add(records)
+        assert added.is_success(), added.errors[:3]
+        shapes[fields] = index.explain(query, filter={"lang": "en"})["admit"]["shape"]
+        hits = index.query(query, filter={"lang": "en"}, top_k=10)
+        pages[fields] = [(hit["id"], round(hit["score"], 6)) for hit in hits]
+    assert shapes == {(): "predicate", ("lang",): "bitmap"}, shapes
+    assert pages[()] == pages[("lang",)], pages
+
+
 def rrf_by_hand(pages, k=60.0):
     fused = {}
     for arm, page in enumerate(pages):

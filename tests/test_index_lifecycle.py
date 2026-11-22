@@ -773,3 +773,90 @@ def test_an_expected_size_the_engine_refuses_raises_its_refusal_alone(expected_s
                                     quantization_config=dict(config))
     assert (refusal.type, str(refusal.value)) == expected
     assert [str(w.message) for w in caught] == []
+
+
+# ------------------------------------------------------------
+# An argument of the wrong type raises TypeError
+# ------------------------------------------------------------
+@pytest.mark.parametrize("kwargs, words", [
+    ({"indexed_fields": 5}, "indexed_fields must be a list of metadata field names, got int."),
+    ({"indexed_fields": [5]},
+     "indexed_fields must hold field names as strings, but it holds 5, of type int."),
+    ({"indexed_fields": "lang"},
+     "indexed_fields must be a list of field names, not a single string. Pass "
+     "indexed_fields=['lang'] to declare one field."),
+    ({"quantization_config": 5}, "quantization_config must be a dictionary"),
+    ({"quantization_config": {"type": "pq", 1: 2}},
+     "quantization_config must have str keys, but it holds the key 1, of type int."),
+    ({"quantization_config": {"type": "int8", ("a",): 2}},
+     "quantization_config must have str keys, but it holds the key ('a',), of type tuple."),
+], ids=["fields-int", "fields-holding-an-int", "fields-str", "config-int", "pq-key-int",
+        "int8-key-tuple"])
+def test_an_argument_of_the_wrong_type_raises_type_error(kwargs, words):
+    """A parameter of the wrong type raises TypeError, as the docstring says:
+    a field list that is not a list of str, a quantization config that is
+    not a dict and a config key that is not a str."""
+    with pytest.raises(TypeError) as refusal:
+        VectorDatabase().create("hnsw", dim=8, **kwargs)
+    assert str(refusal.value) == words
+
+
+# ------------------------------------------------------------
+# A quantization count that is not an int names its type
+# ------------------------------------------------------------
+@pytest.mark.parametrize("scheme", ["pq", "int8"])
+@pytest.mark.parametrize("key, value", [("training_size", "2000"), ("training_size", 2000.0),
+                                        ("max_training_vectors", "5000")],
+                         ids=["training_size-str", "training_size-float",
+                              "max_training_vectors-str"])
+def test_a_quantization_count_that_is_not_an_int_names_its_type(scheme, key, value):
+    """A training_size or max_training_vectors that is not an int raises
+    ValueError naming the value and its type, under both schemes."""
+    config = {"type": scheme, key: value}
+    if scheme == "pq":
+        config["subvectors"] = 2
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pytest.raises(ValueError) as refusal:
+            VectorDatabase().create("hnsw", dim=8, quantization_config=config)
+    assert str(refusal.value) == (
+        f"{key} must be an integer, got {value!r}, of type {type(value).__name__}.")
+
+
+# ------------------------------------------------------------
+# None for a quantization key is the key left out
+# ------------------------------------------------------------
+@pytest.mark.parametrize("config", [
+    {"type": "pq", "subvectors": 2, "bits": None},
+    {"type": "pq", "subvectors": 2, "storage_mode": None},
+    {"type": "int8", "storage_mode": None},
+], ids=["pq-bits", "pq-storage_mode", "int8-storage_mode"])
+def test_none_for_a_quantization_key_with_a_default_is_that_default(config):
+    """None for bits or storage_mode is the key left out, as it is for every
+    other key of a quantization config, so the index takes the default."""
+    without = {key: value for key, value in config.items() if value is not None}
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        given = VectorDatabase().create("hnsw", dim=8, quantization_config=config)
+        left_out = VectorDatabase().create("hnsw", dim=8, quantization_config=without)
+    assert given.get_quantization_info() == left_out.get_quantization_info()
+
+
+# ------------------------------------------------------------
+# A quantization key the scheme does not read is refused
+# ------------------------------------------------------------
+@pytest.mark.parametrize("config, words", [
+    ({"type": "pq", "subvector": 4},
+     "quantization_config holds the key 'subvector', which type 'pq' does not read. Type 'pq' "
+     "reads type, subvectors, bits, training_size, max_training_vectors and storage_mode."),
+    ({"type": "int8", "trainingsize": 2000},
+     "quantization_config holds the key 'trainingsize', which type 'int8' does not read. Type "
+     "'int8' reads type, scale, training_size, max_training_vectors and storage_mode."),
+], ids=["pq", "int8"])
+def test_a_quantization_key_the_scheme_does_not_read_is_refused(config, words):
+    """The engine reads the keys a scheme names alone, so a key the scheme
+    does not read would change nothing, and create() raises ValueError
+    naming it and the keys the scheme reads."""
+    with pytest.raises(ValueError) as refusal:
+        VectorDatabase().create("hnsw", dim=8, quantization_config=config)
+    assert str(refusal.value) == words

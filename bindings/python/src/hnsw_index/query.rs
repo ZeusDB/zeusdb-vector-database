@@ -316,9 +316,7 @@ fn parse_idf(dict: &Bound<PyDict>, position: usize) -> Result<IdfScope, PyEngine
         "corpus" => Ok(IdfScope::Corpus),
         "global" => Ok(IdfScope::Global),
         other => Err(value_error(format!(
-            "arms[{}]['idf'] is '{}', and it is 'corpus' to weight a term by its rarity \
-             over the records the filter admits, or 'global' to weight it over every live \
-             record.",
+            "arms[{}]['idf'] is '{}', and it is 'corpus' or 'global'.",
             position, other
         ))),
     }

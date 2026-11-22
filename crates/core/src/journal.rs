@@ -2374,7 +2374,7 @@ impl JournalWriter {
     }
 
     /// Refuse in a process that is not the one that opened the writer.
-    fn check_process(&self) -> Result<(), Error> {
+    pub fn check_process(&self) -> Result<(), Error> {
         let current = std::process::id();
         if current != self.process {
             return Err(Error::JournalForked {

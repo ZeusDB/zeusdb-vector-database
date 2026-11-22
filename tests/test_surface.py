@@ -1112,6 +1112,31 @@ def test_an_id_a_caller_chose_still_raises_the_floor(tmp_path):
     assert loaded.add({"vectors": [[0, 1.0, 0, 0]]}).ids == ["vec_10"]
 
 
+def test_a_generated_id_moves_past_a_vec_id_the_same_call_names():
+    """A record given no id takes the next generated id that neither the
+    index nor a record of the same call names, so the record the call names
+    `vec_1` keeps that id and its metadata."""
+    index = VectorDatabase().create("hnsw", dim=2, space="l2", expected_size=10)
+    added = index.add([{"id": "vec_1", "values": [1.0, 0.5], "metadata": {"who": "named"}},
+                       {"values": [1.0, 0.5], "metadata": {"who": "generated"}}])
+    assert added.errors == []
+    assert added.ids == ["vec_1", "vec_2"]
+    held = {r["id"]: r["metadata"] for r in index.get_records(added.ids, return_vector=False)}
+    assert held == {"vec_1": {"who": "named"}, "vec_2": {"who": "generated"}}
+
+
+def test_a_vec_id_the_call_names_after_a_generated_one_is_kept():
+    """A record the call names `vec_1` after a record given no id keeps that
+    id, and the record given no id takes the next generated id."""
+    index = VectorDatabase().create("hnsw", dim=2, space="l2", expected_size=10)
+    added = index.add([{"values": [1.0, 0.5], "metadata": {"who": "generated"}},
+                       {"id": "vec_1", "values": [1.0, 0.5], "metadata": {"who": "named"}}])
+    assert added.errors == []
+    assert added.ids == ["vec_2", "vec_1"]
+    held = {r["id"]: r["metadata"] for r in index.get_records(added.ids, return_vector=False)}
+    assert held == {"vec_1": {"who": "named"}, "vec_2": {"who": "generated"}}
+
+
 # ---------------------------------------------------------------- list cursor
 
 

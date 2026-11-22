@@ -691,11 +691,13 @@ impl<'a> Cursor<'a> {
             .map_err(|e| format!("the {what} is not UTF-8: {e}"))
     }
 
-    /// A length-prefixed JSON object.
+    /// A length-prefixed JSON object holding a record's metadata, read with
+    /// `serde_json`'s own limit off and every value held to the depth the
+    /// binding takes; see [`crate::metadata_value`].
     fn object(&mut self, what: &str) -> Result<Map<String, Value>, String> {
         let len = self.u32(&format!("{what} length"))? as usize;
         let raw = self.take(len, what)?;
-        match serde_json::from_slice::<Value>(raw) {
+        match crate::metadata_value::record_metadata(raw) {
             Ok(Value::Object(map)) => Ok(map),
             Ok(other) => Err(format!(
                 "the {what} is a JSON {} where an object was expected",
@@ -1411,6 +1413,52 @@ mod tests {
                 );
             }
             other => panic!("{other:?}"),
+        }
+    }
+
+    /// An insert's and an update's metadata are read to the depth the
+    /// binding takes: a field of 127 lists with the innermost empty decodes,
+    /// and one of 128 or of 100,000 is refused in the words of the limit,
+    /// without the read recursing past the bound.
+    #[test]
+    fn a_records_metadata_is_read_to_the_depth_the_binding_takes() {
+        let mut insert = Vec::new();
+        insert.extend_from_slice(&1u32.to_le_bytes());
+        insert.push(b'a');
+        insert.extend_from_slice(&1u64.to_le_bytes());
+        insert.push(0);
+        insert.extend_from_slice(&4u32.to_le_bytes());
+        insert.extend_from_slice(&[0u8; 16]);
+        let mut update = Vec::new();
+        update.extend_from_slice(&1u32.to_le_bytes());
+        update.push(b'a');
+        let field = |levels: usize| {
+            format!("{{\"k\":{}{}}}", "[".repeat(levels), "]".repeat(levels)).into_bytes()
+        };
+        let with = |prefix: &[u8], json: &[u8], kind: OperationKind| {
+            let mut p = prefix.to_vec();
+            p.extend_from_slice(&(json.len() as u32).to_le_bytes());
+            p.extend_from_slice(json);
+            if kind == OperationKind::Insert {
+                p.extend_from_slice(&NO_SPARSE.to_le_bytes());
+            }
+            p
+        };
+        for (kind, prefix) in [
+            (OperationKind::Insert, &insert),
+            (OperationKind::UpdateMetadata, &update),
+        ] {
+            assert!(
+                decode(kind, &with(prefix, &field(127), kind)).is_ok(),
+                "{kind:?}"
+            );
+            for levels in [128, 100_000] {
+                let words = refused(kind, &with(prefix, &field(levels), kind));
+                assert!(
+                    words.starts_with("the metadata is not JSON: recursion limit exceeded"),
+                    "{kind:?} {levels}: {words}"
+                );
+            }
         }
     }
 

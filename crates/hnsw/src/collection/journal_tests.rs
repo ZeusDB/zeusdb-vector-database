@@ -534,7 +534,8 @@ fn a_directory_whose_manifest_names_an_absent_journal_is_refused() {
 
 /// A journal whose segments after the checkpoint do not begin at the
 /// sequence after its own is refused, and so is one with a segment missing
-/// between two, because the records between are in neither.
+/// between two, because the records between are in neither. The refusal of
+/// the missing segment carries the cut a repair makes there.
 #[test]
 fn a_journal_missing_a_segment_is_refused() {
     let temp = TempDir::new("journal-tests");
@@ -551,10 +552,13 @@ fn a_journal_missing_a_segment_is_refused() {
 
     // The second segment gone, between the first and the third.
     std::fs::remove_file(&segments.files[1]).unwrap();
-    assert!(matches!(
-        recover(&path),
-        Err(Error::JournalSegmentsInvalid { .. })
-    ));
+    match recover(&path) {
+        Err(Error::JournalRepairable { refusal, .. }) => assert!(
+            matches!(*refusal, Error::JournalSegmentsInvalid { .. }),
+            "{refusal:?}"
+        ),
+        other => panic!("expected a refusal, got {:?}", other.map(|_| ())),
+    }
     // The first gone, so the journal begins above the checkpoint.
     std::fs::remove_file(&segments.files[0]).unwrap();
     match recover(&path) {
@@ -616,8 +620,8 @@ fn insert_out_of_turn(internal_id: u64) -> Operation {
     }
 }
 
-/// A record that will not apply refuses the open, naming its sequence, and
-/// nothing from it on is applied.
+/// A record that will not apply refuses the open, naming its sequence and
+/// the cut a repair makes at its call, and nothing from it on is applied.
 #[test]
 fn a_record_that_does_not_belong_refuses_the_open_naming_its_sequence() {
     let temp = TempDir::new("journal-tests");
@@ -628,11 +632,20 @@ fn a_record_that_does_not_belong_refuses_the_open_naming_its_sequence() {
 
     append_by_hand(&path, &[insert_out_of_turn(9)]);
     match recover(&path) {
-        Err(Error::JournalReplayFailed {
-            sequence, detail, ..
+        Err(Error::JournalRepairable {
+            refusal,
+            cut_sequence,
+            ..
         }) => {
-            assert_eq!(sequence, 8, "six inserts and a commit before it");
+            let Error::JournalReplayFailed {
+                sequence, detail, ..
+            } = refusal.as_ref()
+            else {
+                panic!("expected a refusal to replay, got {refusal:?}");
+            };
+            assert_eq!(*sequence, 8, "six inserts and a commit before it");
             assert!(detail.contains("internal id"), "{detail}");
+            assert_eq!(cut_sequence, 8, "a repair cuts at the record's call");
         }
         other => panic!("expected a refusal, got {:?}", other.map(|_| ())),
     }
@@ -641,7 +654,8 @@ fn a_record_that_does_not_belong_refuses_the_open_naming_its_sequence() {
 /// A refusal to replay says each sentence once: what refused the record, as
 /// whole sentences each ending in a full stop, and then what was applied. A
 /// record that does not belong gives its first sentence alone, and words that
-/// end without a full stop are given one.
+/// end without a full stop are given one. A plain load's refusal is that
+/// refusal and then the repair's sentence.
 #[test]
 fn a_refusal_to_replay_says_each_sentence_once() {
     let temp = TempDir::new("journal-tests");
@@ -650,10 +664,27 @@ fn a_refusal_to_replay_says_each_sentence_once() {
     add(&collection, 0..6);
     drop(collection);
     append_by_hand(&path, &[insert_out_of_turn(9)]);
-    let mismatch = match recover(&path) {
-        Err(error @ Error::JournalReplayFailed { .. }) => error.to_string(),
+    let (mismatch, whole) = match recover(&path) {
+        Err(error @ Error::JournalRepairable { .. }) => {
+            let Error::JournalRepairable { refusal, .. } = &error else {
+                unreachable!()
+            };
+            assert!(
+                matches!(**refusal, Error::JournalReplayFailed { .. }),
+                "{refusal:?}"
+            );
+            (refusal.to_string(), error.to_string())
+        }
         other => panic!("expected a refusal, got {:?}", other.map(|_| ())),
     };
+    assert!(
+        whole.starts_with(&mismatch)
+            && whole[mismatch.len()..].starts_with(
+                " Restore the journal from a copy, or load the directory with repair=True, "
+            ),
+        "{whole}"
+    );
+    assert_eq!(whole.matches("Nothing from").count(), 1, "{whole}");
     let unpunctuated = Error::JournalReplayFailed {
         file: "00000000000000000001.zdbseg".to_string(),
         sequence: 4,

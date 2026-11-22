@@ -915,14 +915,20 @@ def _nested(levels):
     return value
 
 
-KEY_WORDS = "Metadata error: TypeError: 'int' object is not an instance of 'str'"
+def key_words(place):
+    """The words `errors` names a record with whose metadata holds the key 7
+    in the mapping at `place`."""
+    return (f"Metadata error: TypeError: the mapping at {place} holds the key 7, of type int, "
+            f"and a metadata key is a str, so convert it to one.")
+
+
 DEPTH_WORDS = ("Metadata error: ValueError: Nested value is deeper than 128 levels, "
                "which is as far as mappings and lists nest.")
 
 
 @pytest.mark.parametrize("metadata,words", [
-    ({7: "a key that is not a string"}, KEY_WORDS),
-    ({"outer": {7: "a nested key that is not a string"}}, KEY_WORDS),
+    ({7: "a key that is not a string"}, key_words("the entry")),
+    ({"outer": {7: "a nested key that is not a string"}}, key_words("key 'outer'")),
     (_nested(200), DEPTH_WORDS),
 ])
 def test_metadata_that_does_not_convert_is_refused_in_every_shape(metadata, words):
@@ -951,16 +957,17 @@ def test_a_record_refused_for_its_metadata_takes_no_generated_id():
     """A record given no id is named by its position and leaves the id it
     would have taken to the next record."""
     index = VectorDatabase().create("hnsw", dim=2)
+    words = key_words("the entry")
     added = index.add([{"values": [0.1, 0.2], "metadata": {7: "x"}},
                        {"values": [0.3, 0.4], "metadata": {"k": 1}}])
-    assert added.errors == [f"Vector item_0: {KEY_WORDS}"]
+    assert added.errors == [f"Vector item_0: {words}"]
     assert added.ids == ["vec_1"]
     added = index.add({"vectors": [[0.1, 0.2], [0.3, 0.4]], "metadatas": [{7: "x"}, {"k": 1}]})
-    assert added.errors == [f"Vector item_0: {KEY_WORDS}"]
+    assert added.errors == [f"Vector item_0: {words}"]
     assert added.ids == ["vec_2"]
     added = index.add({"vectors": np.array([[0.1, 0.2], [0.3, 0.4]], dtype=np.float32),
                        "metadatas": [{7: "x"}, {"k": 1}]})
-    assert added.errors == [f"Vector row_0: {KEY_WORDS}"]
+    assert added.errors == [f"Vector row_0: {words}"]
     assert added.ids == ["vec_3"]
 
 
@@ -1195,9 +1202,9 @@ def metadata_refusal(kind, place, shown):
     """The words `errors` names a refused metadata value with, after
     `Metadata error: `."""
     if kind == "type":
-        return (f"TypeError: the value at {place} is a {shown}, and a metadata value is None, "
-                f"a bool, an int, a float, a str, a list or a dict, so convert it to one of "
-                f"those.")
+        return (f"TypeError: the value at {place} is of type {shown}, and a metadata value is "
+                f"None, a bool, an int, a float, a str, a list or a dict, so convert it to one "
+                f"of those.")
     if kind == "not finite":
         return (f"ValueError: the value at {place} is {shown}, a float that is not finite, and "
                 f"a metadata value is a finite float, so give None or a string in its place.")
@@ -1237,3 +1244,162 @@ def test_a_metadata_value_json_does_not_hold_refuses_its_record(value, kind, sho
             assert added.errors == [f"Vector b: Metadata error: "
                                     f"{metadata_refusal(kind, place, shown)}"], (shape, place)
             assert "b" not in index and "a" in index, (shape, place)
+
+
+# ------------------------------------------------------------
+# Metadata as deep as add() takes comes back after a save and a load
+# ------------------------------------------------------------
+def _lists(levels, innermost=None):
+    """`levels` lists, one inside the next, the innermost holding
+    `innermost`, or nothing where it is None."""
+    value = [] if innermost is None else [innermost]
+    for _ in range(levels - 1):
+        value = [value]
+    return value
+
+
+def test_metadata_add_takes_comes_back_after_a_save_and_a_load(tmp_path):
+    """A field of 126 lists around an int, whose int is at level 128, the
+    deepest add() takes, comes back after a save and a load in the array
+    batch shape."""
+    value = _lists(126, 1)
+    index = VectorDatabase().create("hnsw", dim=2, expected_size=10)
+    added = index.add({"ids": ["k"], "embeddings": np.ones((1, 2), dtype=np.float32),
+                       "metadatas": [{"k": value}]})
+    assert added.is_success(), added.errors
+    index.save(str(tmp_path / "deep.zdb"))
+    loaded = VectorDatabase().load(str(tmp_path / "deep.zdb"))
+    assert loaded.get_records("k")[0]["metadata"]["k"] == value
+
+
+@pytest.mark.parametrize("levels, innermost", [(126, 1), (127, None)],
+                         ids=["126-around-an-int", "127-empty"])
+def test_deep_metadata_comes_back_after_a_save_and_a_load(tmp_path, levels, innermost):
+    """A field that reaches level 128, the deepest add() takes, as 126 lists
+    around an int or as 127 lists with the innermost empty, comes back after
+    a save and a load, and one level more is refused where it is written."""
+    value = _lists(levels, innermost)
+    index = VectorDatabase().create("hnsw", dim=2, expected_size=10)
+    added = index.add({"id": "k", "values": [1.0, 0.5], "metadata": {"k": value}})
+    assert added.is_success(), added.errors
+    deeper = index.add({"id": "d", "values": [1.0, 0.5],
+                        "metadata": {"k": _lists(levels + 1, innermost)}})
+    assert deeper.errors == [f"Vector d: {DEPTH_WORDS}"], deeper.errors
+    index.save(str(tmp_path / "deep.zdb"))
+    loaded = VectorDatabase().load(str(tmp_path / "deep.zdb"))
+    assert loaded.get_records("k")[0]["metadata"]["k"] == value
+    assert len(loaded) == 1
+
+
+def test_deep_metadata_update_comes_back_after_a_save_and_a_load(tmp_path):
+    """A mapping update_metadata() writes whose field reaches level 128 comes
+    back after a save and a load."""
+    value = _lists(127)
+    index = VectorDatabase().create("hnsw", dim=2, expected_size=10)
+    assert index.add({"id": "u", "values": [1.0, 0.5], "metadata": {"k": 1}}).is_success()
+    assert index.update_metadata("u", {"k": value})
+    index.save(str(tmp_path / "updated.zdb"))
+    loaded = VectorDatabase().load(str(tmp_path / "updated.zdb"))
+    assert loaded.get_records("u")[0]["metadata"]["k"] == value
+
+
+# ------------------------------------------------------------
+# A metadata key that is not a str is refused with its place
+# ------------------------------------------------------------
+@pytest.mark.parametrize("metadata, words", [
+    ({1: "x"}, "the mapping at the entry holds the key 1, of type int"),
+    ({"outer": [{"inner": {(1, 2): "x"}}]},
+     "the mapping at key 'outer', item 0, key 'inner' holds the key (1, 2), of type tuple"),
+], ids=["entry", "nested"])
+def test_a_metadata_key_that_is_not_a_str_is_refused_with_its_place(metadata, words):
+    """A key that is not a str refuses its record with TypeError, in words
+    that name the mapping holding it, the key as Python writes it and its
+    type, and the records around it go in."""
+    index = VectorDatabase().create("hnsw", dim=2, expected_size=10)
+    added = index.add({"ids": ["a", "b"], "embeddings": np.ones((2, 2), dtype=np.float32),
+                       "metadatas": [metadata, {"k": 1}]})
+    assert added.errors == [f"Vector a: Metadata error: TypeError: {words}, and a metadata "
+                            f"key is a str, so convert it to one."], added.errors
+    assert added.ids == ["b"]
+
+
+# ------------------------------------------------------------
+# A str holding a lone surrogate is refused in words that say so
+# ------------------------------------------------------------
+SURROGATE = "a" + chr(0xD800) + "b"
+
+
+@pytest.mark.parametrize("entry, place", [
+    (SURROGATE, "the entry"), ({"k": SURROGATE}, "key 'k'"),
+    ({"k": [1, {"j": SURROGATE}]}, "key 'k', item 1, key 'j'"),
+], ids=["entry", "value", "nested"])
+def test_a_metadata_str_holding_a_lone_surrogate_is_refused_in_true_words(entry, place):
+    """A str holding a lone surrogate, which UTF-8 does not encode, refuses
+    its record with ValueError in words that say so, in every shape, and the
+    records around it go in."""
+    for shape in METADATA_SHAPES:
+        index = VectorDatabase().create("hnsw", dim=2, expected_size=10)
+        assert add_with_metadata(index, shape, "a", {"k": 1}).is_success()
+        added = add_with_metadata(index, shape, "b", entry)
+        assert added.errors == [
+            f"Vector b: Metadata error: ValueError: the value at {place} is a str holding a "
+            f"lone surrogate, which a metadata value cannot hold, so remove it."
+        ], (shape, added.errors)
+        assert "b" not in index and "a" in index, shape
+
+
+@pytest.mark.parametrize("entry, place", [
+    ({SURROGATE: 1}, "the entry"), ({"k": [{SURROGATE: 1}]}, "key 'k', item 0"),
+], ids=["entry", "nested"])
+def test_a_metadata_key_holding_a_lone_surrogate_is_refused_in_true_words(entry, place):
+    """A key that is a str holding a lone surrogate refuses its record with
+    ValueError in words naming the mapping holding it and the key as Python
+    writes it, in every shape, and the records around it go in."""
+    for shape in METADATA_SHAPES:
+        index = VectorDatabase().create("hnsw", dim=2, expected_size=10)
+        assert add_with_metadata(index, shape, "a", {"k": 1}).is_success()
+        added = add_with_metadata(index, shape, "b", entry)
+        assert added.errors == [
+            f"Vector b: Metadata error: ValueError: the mapping at {place} holds the key "
+            f"{SURROGATE!r}, a str holding a lone surrogate, which a metadata key cannot "
+            f"hold, so remove it."
+        ], (shape, added.errors)
+        assert "b" not in index and "a" in index, shape
+
+
+# ------------------------------------------------------------
+# An id that is not a str refuses its record
+# ------------------------------------------------------------
+@pytest.mark.parametrize("bad, words", [
+    (5, "TypeError: the id is of type int, and an id is a str, so convert it to one."),
+    (2.5, "TypeError: the id is of type float, and an id is a str, so convert it to one."),
+    (b"a", "TypeError: the id is of type bytes, and an id is a str, so convert it to one."),
+    (SURROGATE, "ValueError: the id is a str holding a lone surrogate, which an id cannot "
+                "hold, so remove it."),
+], ids=["int", "float", "bytes", "surrogate"])
+def test_an_id_that_is_not_a_str_refuses_its_record(bad, words):
+    """A record whose id is not a str, or is a str holding a lone surrogate,
+    is refused in `errors`, named by its position, rather than taking a
+    generated id, in every shape, and the records around it go in under
+    their own ids. An id of None is an id left out, so its record takes a
+    generated id."""
+    vectors = [[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]]
+    shapes = {
+        "single object": ({"id": bad, "values": vectors[1]}, "single_object", []),
+        "list of records": ([{"id": record_id, "values": vector}
+                             for record_id, vector in zip(["a", bad, "c"], vectors)],
+                            "item_1", ["a", "c"]),
+        "list batch": ({"ids": ["a", bad, "c"], "vectors": vectors}, "item_1", ["a", "c"]),
+        "array batch": ({"ids": ["a", bad, "c"], "vectors": np.array(vectors, dtype=np.float32)},
+                        "row_1", ["a", "c"]),
+    }
+    for shape, (data, position, kept) in shapes.items():
+        index = VectorDatabase().create("hnsw", dim=2, expected_size=10)
+        added = index.add(data)
+        assert added.errors == [f"Vector {position}: {words}"], (shape, added.errors)
+        assert added.ids == kept, shape
+        assert len(index) == len(kept), shape
+    index = VectorDatabase().create("hnsw", dim=2, expected_size=10)
+    added = index.add([{"id": None, "values": [0.1, 0.2]}, {"id": "a", "values": [0.3, 0.4]}])
+    assert added.errors == []
+    assert added.ids == ["vec_1", "a"]

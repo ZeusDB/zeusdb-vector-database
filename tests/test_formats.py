@@ -138,6 +138,20 @@ def test_a_fixtures_checkpoint_alone_upgrades_nothing(tmp_path, name):
     assert files() == before
 
 
+def test_a_version_1_journal_counts_only_its_records_above_the_checkpoint(tmp_path):
+    """recovery's first_sequence is the first sequence above the checkpoint,
+    and records_in_journal counts the records above it the load kept, for a
+    journal of format version 1 as for a journal of segments. A checkpoint at
+    the journal's last whole record leaves none above it."""
+    path = copy_of("v3.0.0-journaled", tmp_path)
+    m = manifest(path)
+    m["journal"]["sequence"] = 72
+    (path / "manifest.json").write_text(json.dumps(m, indent=2), encoding="utf-8", newline="\n")
+    index, _ = loaded_with_warnings(path)
+    recovery = index.recovery
+    assert (recovery["first_sequence"], recovery["records_in_journal"]) == (73, 0), recovery
+
+
 def test_the_fixtures_are_as_the_releases_wrote_them():
     """No load has written to a fixture: each holds its file at journal format
     version 1 of the recorded length, no journal of segments and no lock
@@ -770,6 +784,31 @@ def test_a_directory_read_only_for_its_medium_and_past_the_bound_refuses_a_save_
     finally:
         os.chmod(lock, stat.S_IREAD | stat.S_IWRITE)
     assert not copy.exists()
+
+
+def test_a_directory_read_only_for_its_medium_at_the_largest_generation_names_the_generation(
+        tmp_path):
+    """A journaled directory below 5.0.0 at the largest generation whose lock
+    file this process cannot write opens read only for the generation, which
+    refuses a save into every directory, rather than for the medium, which
+    refuses a save into its own alone."""
+    path = opened_copy("v4.0.0-journaled-text", tmp_path)
+    at_the_largest_generation(path)
+    lock = path.parent / (path.name + ".zdblock")
+    lock.write_bytes(b"")
+    os.chmod(lock, stat.S_IREAD)
+    try:
+        if os.access(lock, os.W_OK):
+            pytest.skip("this process writes through a read-only permission")
+        index, messages = loaded_with_warnings(path)
+        assert index.recovery["read_only"] is True
+        assert index.recovery["read_only_reason"] == AT_THE_LARGEST
+        [message] = messages
+        assert AT_THE_LARGEST in message and "opened read only" in message
+        del index
+        gc.collect()
+    finally:
+        os.chmod(lock, stat.S_IREAD | stat.S_IWRITE)
 
 
 # ============================================================================

@@ -268,6 +268,15 @@ pub trait OperationSink: Send + std::fmt::Debug {
     /// nothing of the record behind.
     fn append(&mut self, kind: OperationKind, payload: &[u8]) -> Result<(), Error>;
 
+    /// The refusal of a process other than the one that opened the sink,
+    /// which is a child forked from it, or `None` in that process. The
+    /// collection asks it before any fault the sink holds, since the
+    /// checkpoint a fault's words ask for is one such a child cannot take.
+    /// The default answers `None`, for a sink that no process owns.
+    fn forked(&self) -> Option<Error> {
+        None
+    }
+
     /// Close what was appended since the last commit and make it durable
     /// under the sink's policy, after the last record of a call and before
     /// the call mutates anything a search can see. A commit that fails
@@ -492,8 +501,12 @@ impl SinkFault {
 }
 
 impl SinkSlot {
-    /// The refusal every record meets while the fault stands.
+    /// The refusal every record meets in a child forked from the process
+    /// that opened the sink, and otherwise while the fault stands.
     fn refuse_if_faulted(&self) -> Result<(), Error> {
+        if let Some(forked) = self.attached.as_deref().and_then(|sink| sink.forked()) {
+            return Err(forked);
+        }
         match &self.fault {
             Some(fault) => Err(fault.refusal()),
             None => Ok(()),
@@ -1331,8 +1344,11 @@ pub struct Collection {
     ///
     /// Splitting them lets each keep the property it needs. `id_counter` still
     /// resets, so the internal ids start again. This one never goes backwards
-    /// and follows every `vec_N` a record takes, by `follow_generated_id`, so
-    /// a generated id never names a record the index holds, across a save and
+    /// and follows every `vec_N` a record takes, by `follow_generated_id`,
+    /// and a generated id that a record installed since it was issued, or a
+    /// record of the same call, names is moved past under the mutation guard,
+    /// by `add_generated_records`, so a generated id never names a record the
+    /// index holds, across a save and
     /// a load and a replay of its journal. See `config.json`'s
     /// `generated_ids`.
     ///
@@ -2108,6 +2124,17 @@ impl Collection {
                 Err(error)
             }
         }
+    }
+
+    /// The refusal a child forked from the process that opened the sink
+    /// meets, where this is such a child; see [`OperationSink::forked`].
+    fn sink_forked(&self) -> Option<Error> {
+        self.sink
+            .lock()
+            .unwrap()
+            .attached
+            .as_deref()
+            .and_then(|sink| sink.forked())
     }
 
     /// The fault a failed commit left, where it stands, which a batch reads

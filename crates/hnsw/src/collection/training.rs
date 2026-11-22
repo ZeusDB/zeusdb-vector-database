@@ -23,8 +23,36 @@ use std::time::Instant;
 use tracing::{debug, error, info, instrument, trace, warn};
 use zeusdb_vector_core::{
     Error, FittedRef, Int8Codec, Operation, OperationKind, Position, SeededRng, Values,
-    VectorGraph, JOURNAL_MAX_PAYLOAD, PQ,
+    VectorGraph, Withdrawal, JOURNAL_MAX_PAYLOAD, PQ,
 };
+
+/// A training's refused record in the words its entry in `errors` takes:
+/// the refusal, with each sentence a withdrawal gives a call put as the
+/// training's, since the records of the call that set the training off
+/// committed before the training's record.
+fn training_failure(error: &Error) -> String {
+    let mut words = error.to_string();
+    for (call, training) in [
+        (
+            Withdrawal::Aborted.sentence(),
+            "The training's record was withdrawn by an abort record, so the training does not \
+             come back after a crash.",
+        ),
+        (
+            Withdrawal::CutBack.sentence(),
+            "The training's record was cut from the journal, so the training does not come \
+             back after a crash.",
+        ),
+        (
+            Withdrawal::Neither.sentence(),
+            "The training's record could be neither withdrawn nor cut from the journal, so the \
+             training may come back after a crash until a checkpoint.",
+        ),
+    ] {
+        words = words.replace(call, training);
+    }
+    words
+}
 
 /// What a training fitted, held until its record has committed and then
 /// installed, by the live training and by a replay of its record alike.
@@ -98,7 +126,7 @@ impl Collection {
         // nothing: what was fitted is dropped, the fault stands, and the
         // first call after the checkpoint fits again.
         self.record_training(&completed_at, &trained)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| training_failure(&error))?;
         // Once the record has committed, no valid record reaches a failure of
         // the install, so one is a defect that leaves the fault.
         self.install_training(writers, trained, completed_at)

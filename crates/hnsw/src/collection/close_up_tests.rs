@@ -239,6 +239,7 @@ fn both_ways(collection: &Collection, replace: bool, label: &str) {
                 collection.m(),
                 collection.expected_size(),
                 collection.ef_construction(),
+                false,
             )
             .unwrap()
     });
@@ -376,6 +377,7 @@ fn both_copies(collection: &Collection, replace: bool, label: &str) {
                 collection.m(),
                 collection.expected_size(),
                 collection.ef_construction(),
+                false,
             )
             .unwrap()
     });

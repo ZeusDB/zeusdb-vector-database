@@ -324,7 +324,9 @@ fn requested_filter(call: &str, level: Option<&str>) -> PyResult<EnvFilter> {
         return Ok(filter);
     }
     let level = level.unwrap_or("info");
-    EnvFilter::try_new(level).map_err(|error| {
+    // A name of the table `ZEUSDB_LOG_LEVEL` is read through, such as
+    // Python's `warning`, is that level, and any other text is a filter.
+    EnvFilter::try_new(known_level(level).unwrap_or(level)).map_err(|error| {
         pyo3::exceptions::PyValueError::new_err(format!(
             "{} takes a level such as 'info' or a filter such as \
              'zeusdb_vector_database=debug', and cannot read '{}': {}.",
@@ -371,7 +373,8 @@ pub fn py_init_logging(level: Option<String>) -> PyResult<bool> {
 /// Python-exposed file logging initialization (JSON to rotating files)
 ///
 /// Returns true if initialization occurred, false if already initialized,
-/// and raises ValueError for an empty `log_dir` or a level it cannot read.
+/// and raises ValueError for an empty `log_dir` or a level it cannot read
+/// and OSError for a folder it cannot make or a log file it cannot open.
 /// `level` left out or `None` is `info`, under a `RUST_LOG` that takes
 /// precedence where it parses, and `file_prefix` left out or `None` is
 /// `zeusdb`.
@@ -388,31 +391,36 @@ pub fn py_init_file_logging(
     }
     let filter = requested_filter("init_file_logging()", level.as_deref())?;
 
+    // Where the one setup has run, nothing is made or opened. Otherwise the
+    // folder and the file come before the setup, so a call that cannot make
+    // the one or open the other raises OSError and leaves the setup to a
+    // later call.
+    if INIT.is_completed() {
+        return Ok(false);
+    }
+    std::fs::create_dir_all(&log_dir).map_err(|error| {
+        pyo3::exceptions::PyOSError::new_err(format!(
+            "init_file_logging() cannot make the folder {}: {}.",
+            log_dir, error
+        ))
+    })?;
+    let appender = tracing_appender::rolling::RollingFileAppender::builder()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix(file_prefix.unwrap_or_else(|| "zeusdb".to_string()))
+        .build(&log_dir)
+        .map_err(|error| {
+            let cause = std::error::Error::source(&error)
+                .map_or_else(|| error.to_string(), |source| source.to_string());
+            pyo3::exceptions::PyOSError::new_err(format!(
+                "init_file_logging() cannot open a log file in {}: {}.",
+                log_dir, cause
+            ))
+        })?;
+
     let mut took_init = false;
     INIT.call_once(|| {
         took_init = true;
 
-        // Try to create log directory
-        if let Err(e) = std::fs::create_dir_all(&log_dir) {
-            // Install fallback subscriber first, then warn
-            let _ = Registry::default()
-                .with(filter)
-                .with(create_json_stderr_layer::<_>())
-                .try_init();
-
-            tracing::warn!(
-                operation = "create_log_dir",
-                error = ?e,
-                path = %log_dir,
-                "Failed to create log directory, using stderr instead"
-            );
-            return;
-        }
-
-        let appender = tracing_appender::rolling::daily(
-            log_dir,
-            file_prefix.unwrap_or_else(|| "zeusdb".to_string()),
-        );
         let (non_blocking, guard) = tracing_appender::non_blocking(appender);
         store_worker_guard(guard);
 
@@ -477,14 +485,20 @@ fn create_env_filter(log_level: &str) -> EnvFilter {
 /// An unrecognised name falls back to `warn`, which is the default this module
 /// already used, rather than being passed through for `EnvFilter` to reject.
 fn canonical_level(log_level: &str) -> &'static str {
+    known_level(log_level).unwrap_or("warn")
+}
+
+/// The level a name of the table above names, whatever its case and the
+/// space around it, or `None` for any other text.
+fn known_level(log_level: &str) -> Option<&'static str> {
     match log_level.trim().to_lowercase().as_str() {
-        "trace" => "trace",
-        "debug" => "debug",
-        "info" => "info",
-        "warn" | "warning" => "warn",
-        "error" | "err" | "critical" | "fatal" => "error",
-        "off" | "none" | "silent" => "off",
-        _ => "warn",
+        "trace" => Some("trace"),
+        "debug" => Some("debug"),
+        "info" => Some("info"),
+        "warn" | "warning" => Some("warn"),
+        "error" | "err" | "critical" | "fatal" => Some("error"),
+        "off" | "none" | "silent" => Some("off"),
+        _ => None,
     }
 }
 
@@ -714,10 +728,19 @@ fn create_file_appender(
         return None;
     }
 
-    let file_appender = match configured_rotation() {
-        LogRotation::Never => tracing_appender::rolling::never(directory, &*filename),
-        LogRotation::Daily => tracing_appender::rolling::daily(directory, &*filename),
+    // Built through the builder, whose `build` returns the failure that
+    // `rolling::never` and `rolling::daily` panic with, so a file this
+    // process cannot open falls back to stderr, as a folder it cannot make
+    // does.
+    let rotation = match configured_rotation() {
+        LogRotation::Never => tracing_appender::rolling::Rotation::NEVER,
+        LogRotation::Daily => tracing_appender::rolling::Rotation::DAILY,
     };
+    let file_appender = tracing_appender::rolling::RollingFileAppender::builder()
+        .rotation(rotation)
+        .filename_prefix(filename.into_owned())
+        .build(directory)
+        .ok()?;
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
     Some((non_blocking, guard))

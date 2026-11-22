@@ -15,7 +15,7 @@ use std::path::Path;
 use serde_json::{json, Value};
 use zeusdb_vector_core::{
     encode_journal_record, read_legacy_journal, Error, FsStorage, Operation, Storage,
-    JOURNAL_RECORD_HEADER_BYTES,
+    JOURNAL_RECORD_HEADER_BYTES, JOURNAL_RECORD_OVERHEAD_BYTES,
 };
 
 use super::journal_support::{
@@ -116,8 +116,8 @@ fn journaled(path: &Path, calls: usize) {
 /// aside whole in one folder whose name ends at the first sequence set
 /// aside, holding no marker and a report of the cut, the report and the
 /// warning say what was cut and why, and the directory opens plainly from
-/// then on. A load that does not repair refuses each class first, and the
-/// refusal of a corrupt middle names `repair=True` with the cut.
+/// then on. A load that does not repair refuses each class first, and its
+/// refusal names `repair=True` with the cut.
 #[test]
 fn a_repair_keeps_every_call_before_the_damage_for_each_class() {
     for class in REPAIR_CLASSES.into_iter().filter(|class| *class != "stale") {
@@ -132,17 +132,43 @@ fn a_repair_keeps_every_call_before_the_damage_for_each_class() {
         match (class, &refused) {
             ("corrupt" | "sealed", Error::JournalCorrupt { cut_sequence, .. }) => {
                 assert_eq!(*cut_sequence, first_discarded, "{class}");
-                let message = refused.to_string();
-                assert!(message.contains("repair=True"), "{message}");
-                assert!(
-                    message.contains(&format!("before record {first_discarded}")),
-                    "{message}"
-                );
             }
-            ("header", Error::JournalHeaderInvalid { .. }) => {}
-            ("decode", Error::JournalRecordInvalid { .. }) => {}
+            (
+                "header",
+                Error::JournalRepairable {
+                    refusal,
+                    cut_sequence,
+                    ..
+                },
+            ) => {
+                assert!(
+                    matches!(**refusal, Error::JournalHeaderInvalid { .. }),
+                    "{refusal:?}"
+                );
+                assert_eq!(*cut_sequence, first_discarded, "{class}");
+            }
+            (
+                "decode",
+                Error::JournalRepairable {
+                    refusal,
+                    cut_sequence,
+                    ..
+                },
+            ) => {
+                assert!(
+                    matches!(**refusal, Error::JournalRecordInvalid { .. }),
+                    "{refusal:?}"
+                );
+                assert_eq!(*cut_sequence, first_discarded, "{class}");
+            }
             (class, other) => panic!("{class}: a plain load refused with {other:?}"),
         }
+        let message = refused.to_string();
+        assert!(message.contains("repair=True"), "{class}: {message}");
+        assert!(
+            message.contains(&format!("before record {first_discarded}")),
+            "{class}: {message}"
+        );
 
         let (repaired, report) = repair(&path).unwrap_or_else(|e| panic!("{class}: {e}"));
         assert_eq!(ids(&repaired), kept_ids(calls), "{class}");
@@ -331,10 +357,27 @@ fn a_record_that_will_not_apply_is_cut_with_its_call() {
     )
     .unwrap();
 
-    assert!(matches!(
-        plain(&path),
-        Err(Error::JournalReplayFailed { .. })
-    ));
+    let refused = plain(&path)
+        .err()
+        .expect("a plain load refuses a record that will not apply");
+    let Error::JournalRepairable {
+        refusal,
+        cut_sequence,
+        ..
+    } = &refused
+    else {
+        panic!("a plain load refused with {refused:?}");
+    };
+    assert!(
+        matches!(**refusal, Error::JournalReplayFailed { .. }),
+        "{refusal:?}"
+    );
+    assert_eq!(
+        *cut_sequence,
+        1 + 4 * 3,
+        "the cut is at the call's first record"
+    );
+    assert!(refused.to_string().contains("repair=True"), "{refused}");
     let (repaired, report) = repair(&path).unwrap();
     assert_eq!(
         ids(&repaired),
@@ -707,10 +750,11 @@ fn journaled_with_a_panicked_call(path: &Path) -> u64 {
 }
 
 /// A committed call whose install panics where the replay applies it is a
-/// record that will not apply. A plain load refuses it, naming the record
-/// and the panic, and opens nothing. A repair reads the checkpoint again,
-/// replays every call before that call, cuts at the call's first record and
-/// sets that call aside, and the directory opens plainly from then on.
+/// record that will not apply. A plain load refuses it, naming the record,
+/// the panic and the cut at the call's first record, and opens nothing. A
+/// repair reads the checkpoint again, replays every call before that call,
+/// cuts at the call's first record and sets that call aside, and the
+/// directory opens plainly from then on.
 #[test]
 fn a_call_whose_install_panics_at_the_replay_is_cut_with_its_call() {
     use super::run_without_index;
@@ -722,14 +766,23 @@ fn a_call_whose_install_panics_at_the_replay_is_cut_with_its_call() {
 
     panic_arm(PanicPoint::InstallBeforeSparse);
     match run_without_index("load()", || plain(&path)) {
-        Err(Error::JournalReplayFailed {
-            sequence, detail, ..
+        Err(Error::JournalRepairable {
+            refusal,
+            cut_sequence,
+            ..
         }) => {
+            let Error::JournalReplayFailed {
+                sequence, detail, ..
+            } = refusal.as_ref()
+            else {
+                panic!("a plain load refused with {refusal:?}");
+            };
             assert_eq!(
-                sequence, first,
+                *sequence, first,
                 "the refusal names the record that panicked"
             );
             assert!(detail.contains(cause), "{detail}");
+            assert_eq!(cut_sequence, first, "the cut is at the call's first record");
         }
         Err(other) => panic!("a plain load refused with {other:?}"),
         Ok(_) => panic!("a plain load opened the directory"),
@@ -777,10 +830,11 @@ fn a_call_whose_install_panics_at_the_replay_is_cut_with_its_call() {
 
 /// A committed record whose install panics where the upgrade replays a
 /// journal of format version 1 is a record that will not apply. A plain load
-/// refuses it, naming the record and the panic, and leaves the directory as
-/// it was. A repair keeps every record before it, since version 1 frames no
-/// call, sets the bytes from it on aside in the quarantine of the new
-/// journal's directory, and the upgrade's checkpoint seals the repair.
+/// refuses it, naming the record, the panic and the cut at the record, and
+/// leaves the directory as it was. A repair keeps every record before it,
+/// since version 1 frames no call, sets the bytes from it on aside in the
+/// quarantine of the new journal's directory, and the upgrade's checkpoint
+/// seals the repair.
 #[test]
 fn a_version_1_record_whose_install_panics_at_the_upgrade_is_cut() {
     use super::run_without_index;
@@ -826,14 +880,27 @@ fn a_version_1_record_whose_install_panics_at_the_upgrade_is_cut() {
 
     panic_arm(PanicPoint::InstallBeforeSparse);
     match run_without_index("load()", || plain(&path)) {
-        Err(Error::JournalReplayFailed {
-            sequence, detail, ..
+        Err(Error::JournalRepairable {
+            refusal,
+            cut_sequence,
+            cut_at,
         }) => {
+            let Error::JournalReplayFailed {
+                sequence, detail, ..
+            } = refusal.as_ref()
+            else {
+                panic!("a plain load refused with {refusal:?}");
+            };
             assert_eq!(
-                sequence, damaged,
+                *sequence, damaged,
                 "the refusal names the record that panicked"
             );
             assert!(detail.contains(cause), "{detail}");
+            assert_eq!(
+                (cut_sequence, cut_at),
+                (damaged, at as u64),
+                "the cut is at the record"
+            );
         }
         Err(other) => panic!("a plain load refused with {other:?}"),
         Ok(_) => panic!("a plain load opened the directory"),
@@ -936,4 +1003,49 @@ fn a_repair_names_a_record_that_will_not_apply_in_its_own_words() {
         serde_json::from_str(&std::fs::read_to_string(folder.join("repair.json")).unwrap())
             .unwrap();
     assert_eq!(written["damage"]["detail"], json!(words));
+}
+
+/// A break of the run of segments, being a first segment whose last call
+/// lost its commit, is refused by a plain load naming `repair=True` and the
+/// record a repair cuts at, which is that call's first, and the repair keeps
+/// every call before it.
+#[test]
+fn a_plain_load_names_the_repair_for_a_break_of_the_run_of_segments() {
+    let tmp = TempDir::new("repair-structure");
+    let path = tmp.at("index.zdb");
+    let _ = damaged_journal(&path, "corrupt", declaration(), record);
+    let segments = Segments::of(&path);
+    let first = journal_path(&path)
+        .unwrap()
+        .join(format!("{:020}.zdbseg", segments.numbers[0]));
+    let bytes = std::fs::read(&first).unwrap();
+    let commit = JOURNAL_RECORD_OVERHEAD_BYTES + 8;
+    std::fs::write(&first, &bytes[..bytes.len() - commit]).unwrap();
+
+    let refused = plain(&path)
+        .err()
+        .expect("a plain load refuses a broken run of segments");
+    let Error::JournalRepairable {
+        refusal,
+        cut_sequence,
+        ..
+    } = &refused
+    else {
+        panic!("a plain load refused with {refused:?}");
+    };
+    assert!(
+        matches!(**refusal, Error::JournalSegmentsInvalid { .. }),
+        "{refusal:?}"
+    );
+    let first_of_fourth = 1 + 4 * 3;
+    assert_eq!(*cut_sequence, first_of_fourth);
+    let message = refused.to_string();
+    assert!(
+        message.contains("repair=True")
+            && message.contains(&format!("before record {first_of_fourth}")),
+        "{message}"
+    );
+    let (repaired, report) = repair(&path).unwrap();
+    assert_eq!(ids(&repaired), kept_ids(3));
+    assert_eq!(report.damage.unwrap().kind, "structure");
 }

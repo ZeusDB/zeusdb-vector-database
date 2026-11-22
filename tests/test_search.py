@@ -1392,3 +1392,20 @@ def test_a_query_batch_is_read_by_rows_whatever_its_layout(dtype):
         pages = index.search(batch, top_k=1)
         assert [page[0]["id"] for page in pages] == ["a", "b", "c"], name
         assert [page[0]["score"] for page in pages] == [0.0, 0.0, 0.0], name
+
+
+# ------------------------------------------------------------
+# explain() prices a dense arm at its own ef_search
+# ------------------------------------------------------------
+def test_explain_prices_a_dense_arm_at_its_own_ef_search():
+    """A dense arm's traversal runs at the larger of its ef_search and its
+    fetch, so the price explain() gives it rises with its ef_search."""
+    rng = np.random.default_rng(1)
+    index = VectorDatabase().create("hnsw", dim=4, space="l2", expected_size=2000)
+    index.add({"ids": [str(i) for i in range(2000)],
+               "embeddings": rng.random((2000, 4), dtype=np.float32)})
+
+    def price(**arm):
+        return index.explain([{"vector": [0.1] * 4, **arm}])["arms"][0]["cost_ns"]
+
+    assert price(ef_search=1000) > price()

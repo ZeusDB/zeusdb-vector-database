@@ -47,17 +47,18 @@ pub(crate) fn count_if_given(
 /// takes the interpreter with it. Deeper input now raises `ValueError` from the
 /// level that would have been the next frame.
 ///
-/// The number is `serde_json`'s own default recursion limit, which is what
-/// reads `metadata.json` back. Matching it means anything this accepts can be
-/// reloaded: a value one level past what the loader would parse is refused at
-/// the point it is written rather than on the load that fails to read it.
+/// The number is the engine's `METADATA_MAX_DEPTH`, the depth to which the
+/// read of `metadata.json` and the journal's read of a record's metadata take
+/// a value, so anything this accepts comes back after a save, a load and a
+/// replay, and a value one level past it is refused where it is written
+/// rather than by the load that would read it.
 ///
 /// The filter language has a second, much smaller limit,
 /// `filter::MAX_FILTER_DEPTH`, which bounds how far `$and`, `$or` and `$not`
 /// nest. That one is a contract about the language. This one is about the
 /// stack, and it applies to metadata values too, since they arrive through the
 /// same function.
-pub(crate) const MAX_VALUE_DEPTH: usize = 128;
+pub(crate) const MAX_VALUE_DEPTH: usize = zeusdb_vector_core::METADATA_MAX_DEPTH;
 
 /// A Python mapping as a metadata map, held to the metadata rule.
 ///
@@ -70,7 +71,7 @@ pub(crate) fn python_dict_to_value_map(
     let mut map = HashMap::new();
 
     for (key, value) in py_dict.iter() {
-        let string_key = key.extract::<String>()?;
+        let string_key = key_of(&key, Rule::Metadata).map_err(Refused::into_error)?;
         // The mapping itself is level one, so its values start at two.
         let json_value = convert_value(&value, 2, Rule::Metadata)
             .map_err(|refused| refused.under(Step::Key(string_key.clone())).into_error())?;
@@ -130,6 +131,14 @@ enum Kind {
     NotFinite(String),
     /// An integer outside -2^63 to 2^63 - 1, as Python writes it.
     OutOfRange(String),
+    /// A `str` holding a lone surrogate, which UTF-8 does not encode.
+    Surrogate,
+    /// A mapping's key that is not a `str`, as Python writes it, with its
+    /// type's Python name. The steps lead to the mapping.
+    Key { key: String, type_name: String },
+    /// A mapping's key that is a `str` holding a lone surrogate, as Python
+    /// writes it. The steps lead to the mapping.
+    KeySurrogate(String),
 }
 
 /// Why a conversion stopped: an error whose words are settled, or a value
@@ -175,8 +184,8 @@ impl Refused {
         };
         match kind {
             Kind::Type(name) => PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
-                "the value at {} is a {}, and a metadata value is None, a bool, an int, a \
-                 float, a str, a list or a dict, so convert it to one of those.",
+                "the value at {} is of type {}, and a metadata value is None, a bool, an int, \
+                 a float, a str, a list or a dict, so convert it to one of those.",
                 place, name
             )),
             Kind::NotFinite(value) => PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
@@ -189,6 +198,23 @@ impl Refused {
                  metadata value holds, so give it as a string.",
                 place, value
             )),
+            Kind::Surrogate => PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "the value at {} is a str holding a lone surrogate, which a metadata value \
+                 cannot hold, so remove it.",
+                place
+            )),
+            Kind::Key { key, type_name } => {
+                PyErr::new::<pyo3::exceptions::PyTypeError, _>(format!(
+                "the mapping at {} holds the key {}, of type {}, and a metadata key is a str, so \
+                 convert it to one.",
+                place, key, type_name
+            ))
+            }
+            Kind::KeySurrogate(key) => PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "the mapping at {} holds the key {}, a str holding a lone surrogate, which a \
+                 metadata key cannot hold, so remove it.",
+                place, key
+            )),
         }
     }
 }
@@ -198,6 +224,26 @@ fn refused(kind: Kind) -> Refused {
     Refused::Value {
         kind,
         steps: Vec::new(),
+    }
+}
+
+/// A mapping's key as a `String` under `rule`. Under the metadata rule a key
+/// that is not a `str`, or a `str` holding a lone surrogate, is refused with
+/// the key as Python writes it, and a declaration's key is read as PyO3
+/// reads a `str`.
+fn key_of(key: &Bound<PyAny>, rule: Rule) -> Result<String, Refused> {
+    if rule == Rule::Declaration {
+        return Ok(key.extract::<String>()?);
+    }
+    if !key.is_instance_of::<PyString>() {
+        return Err(refused(Kind::Key {
+            key: key.repr()?.to_string(),
+            type_name: key.get_type().name()?.to_string(),
+        }));
+    }
+    match key.extract::<String>() {
+        Ok(key) => Ok(key),
+        Err(_) => Err(refused(Kind::KeySurrogate(key.repr()?.to_string()))),
     }
 }
 
@@ -266,6 +312,10 @@ fn convert_value(py_obj: &Bound<PyAny>, depth: usize, rule: Rule) -> Result<Valu
     if let Ok(s) = py_obj.extract::<String>() {
         return Ok(Value::String(s));
     }
+    if rule == Rule::Metadata && py_obj.is_instance_of::<PyString>() {
+        // A `str` that does not extract holds a lone surrogate.
+        return Err(refused(Kind::Surrogate));
+    }
     if let Ok(py_list) = py_obj.cast::<PyList>() {
         let mut vec = Vec::new();
         for (item, value) in py_list.iter().enumerate() {
@@ -278,7 +328,7 @@ fn convert_value(py_obj: &Bound<PyAny>, depth: usize, rule: Rule) -> Result<Valu
     if let Ok(py_dict) = py_obj.cast::<PyDict>() {
         let mut map = serde_json::Map::new();
         for (key, value) in py_dict.iter() {
-            let string_key = key.extract::<String>()?;
+            let string_key = key_of(&key, rule)?;
             let json_value = convert_value(&value, depth + 1, rule)
                 .map_err(|r| r.under(Step::Key(string_key.clone())))?;
             map.insert(string_key, json_value);

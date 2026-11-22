@@ -251,7 +251,7 @@ def test_the_declaration_is_reported_back():
 ])
 def test_a_bad_declaration_is_refused_with_a_message_naming_what_is_wrong(
         declaration, fragment):
-    with pytest.raises((ValueError, RuntimeError)) as excinfo:
+    with pytest.raises((TypeError, ValueError, RuntimeError)) as excinfo:
         VectorDatabase().create("hnsw", dim=4, indexed_fields=declaration)
     assert fragment in str(excinfo.value)
 

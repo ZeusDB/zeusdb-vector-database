@@ -169,7 +169,7 @@ pub(super) fn warn_if_selection_disabled(
     };
     let message = format!(
         "ef_construction={} is not greater than 2*m={}, so the neighbour selection \
-         heuristic does not run. Layer zero insertion keeps every candidate the \
+         heuristic does not run at layer zero. Layer zero insertion keeps every candidate the \
          construction search returns, in distance order, and prunes none of them. \
          {}, to run it.",
         ef_construction, budget, remedy

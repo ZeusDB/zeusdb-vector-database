@@ -466,9 +466,10 @@ pub struct Budget {
 /// weighting by the whole index at every filter width tried, and the two are
 /// the same weighting when nothing is filtered, so the admitted corpus is the
 /// default. The cost is one pass over the query's postings under the admit
-/// set, and, where a filter admits a few hundred records, an estimate of
-/// rarity noisy enough to move a page slightly, which the measurement put an
-/// order of magnitude below the gain.
+/// set, with a test of every record besides where the set is a predicate
+/// over metadata, and, where a filter admits a few hundred records, an
+/// estimate of rarity noisy enough to move a page slightly, which the
+/// measurement put an order of magnitude below the gain.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum IdfScope {
     /// The records the admit set admits.
@@ -650,11 +651,11 @@ pub trait VectorIndex<K: Kind>: Persist + Send + Sync {
     /// admit set admits, and the count of admitted records this index holds
     /// a vector for. What a corpus-scoped term weighting reads.
     ///
-    /// `None` from an index that keeps no postings, which is the default,
-    /// and from a postings index handed an admit set it can neither test as
-    /// a bitmap nor enumerate, since counting the corpus under such a set
-    /// would evaluate its predicate over every record. A caller that gets
-    /// `None` weights by the whole index instead.
+    /// `None` from an index that keeps no postings, which is the default. A
+    /// postings index handed an admit set it can neither test as a bitmap
+    /// nor enumerate, being a predicate over metadata, counts the corpus by
+    /// asking the set of every record it holds and of every posting of the
+    /// named lists. A caller that gets `None` weights by the whole index.
     fn corpus_stats(&self, dims: &[u32], admit: &dyn Admit) -> Option<CorpusStats> {
         let _ = (dims, admit);
         None

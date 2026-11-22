@@ -601,3 +601,42 @@ def test_a_text_record_refused_after_its_terms_are_counted_is_recovered_whole(tm
     assert loaded.recovery["damage"] is None, loaded.recovery["damage"]
     assert loaded.get_stats()["term_count"] == live_terms
     assert len(loaded) == 1
+
+
+# ------------------------------------------------------------
+# Metadata as deep as add() takes comes back after a replay
+# ------------------------------------------------------------
+def lists(levels, innermost=None):
+    """`levels` lists, one inside the next, the innermost holding
+    `innermost`, or nothing where it is None."""
+    value = [] if innermost is None else [innermost]
+    for _ in range(levels - 1):
+        value = [value]
+    return value
+
+
+@pytest.mark.parametrize("levels, innermost", [(126, 1), (127, None)],
+                         ids=["126-around-an-int", "127-empty"])
+def test_deep_metadata_comes_back_after_a_replay_and_its_checkpoint(tmp_path, levels, innermost):
+    """A field that reaches level 128, the deepest add() and update_metadata()
+    take, is journaled by both, comes back after a replay, and comes back
+    again after the checkpoint the replayed index writes and a load of it."""
+    value = lists(levels, innermost)
+    path = tmp_path / "deep.zdb"
+    index = VectorDatabase().create("hnsw", dim=2, expected_size=10)
+    index.journal_to(str(path))
+    assert index.add({"id": "k", "values": [1.0, 0.5], "metadata": {"k": value}}).is_success()
+    assert index.add({"id": "u", "values": [0.5, 1.0], "metadata": {"k": 1}}).is_success()
+    assert index.update_metadata("u", {"k": value})
+    del index
+    gc.collect()
+
+    replayed = VectorDatabase().load(str(path))
+    for record in replayed.get_records(["k", "u"], return_vector=False):
+        assert record["metadata"] == {"k": value}, record["id"]
+    replayed.checkpoint()
+    del replayed
+    gc.collect()
+    loaded = VectorDatabase().load(str(path))
+    for record in loaded.get_records(["k", "u"], return_vector=False):
+        assert record["metadata"] == {"k": value}, record["id"]

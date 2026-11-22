@@ -474,7 +474,7 @@ The rule covers `ids`, `metadatas` and `metadata`, under every spelling of the v
 `AddResult` with:
 - `total_inserted`: number of records successfully inserted or replaced
 - `total_errors`: number of failed records
-- `errors`: list of error messages
+- `errors`: list of error messages, one for each failed record, plus one for a training that failed, which `total_errors` does not count
 - `vector_shape`: the shape of the processed batch, as `(rows, dim)`
 - `ids`: the ID of every record that was inserted or replaced, in insertion order
 - `is_success()`: `True` when `total_errors` is zero
@@ -1235,7 +1235,7 @@ Going lower than 128x costs memory and build time and buys nothing on recall unt
 
 `bits` does not change the size of a record's code, which is always one byte per subvector, so lowering it saves no memory per record. It sets the number of centroids per subvector to 2^bits, which sizes the codebook and the centroid distance table. Lowering it costs recall and shortens the build. Leave it at 8 unless the fixed cost or the build time is the constraint.
 
-`create()` emits a `UserWarning` when the configuration looks unbalanced, for example when the compression ratio exceeds 50x, and another when `storage_mode` is `quantized_with_raw`. The ratio warning does not fire on a `subvectors` the library derived, only on one you passed.
+`create()` emits a `UserWarning` when the configuration looks unbalanced, for example when the compression ratio exceeds 50x, and another when `storage_mode` is `quantized_with_raw`. On a `subvectors` the library derived, the ratio warning fires only where the ratio passes 128x.
 
 It also warns when `quantized_only` cannot repay its fixed memory at the `expected_size` you declared, naming the record count above which it starts saving. Raise `expected_size` if your estimate was low, or drop `quantization_config`. `quantized_with_raw` has no such record count, because it holds more than an unquantized index at every one, and the warning that names the mode says so. A separate warning fires when `expected_size` is below `training_size`, because an index that never reaches its training threshold never trains.
 
@@ -2671,7 +2671,7 @@ print("initialized:", success)
 vdb = zeusdb_vector_database.VectorDatabase()
 ```
 
-**Only the first initializer to run takes effect.** Both functions return `True` if they installed the subscriber and `False` if one was already installed, and raise `ValueError` for a level they cannot read, so calling both leaves the second with no effect and a `False` return. `zeusdb_vector_database.is_logging_initialized()` reports whether either has run.
+**Only the first initializer to run takes effect.** Both functions return `True` if they installed the subscriber and `False` if one was already installed, and raise `ValueError` for a level they cannot read, so calling both leaves the second with no effect and a `False` return. `init_file_logging()` raises `OSError` for a folder it cannot make or a log file it cannot open, and leaves logging as it was. `zeusdb_vector_database.is_logging_initialized()` reports whether either has run.
 
 **The file target is drained at exit.** Records reach the file through a background writer, so a record emitted immediately before the process ends is still in flight when it ends. Importing the package registers the drain with `atexit`, which covers a normal exit and needs no call. `zeusdb_vector_database.shutdown_logging()` runs the same drain on demand and returns `True` if it drained a file appender, or `False` if there was nothing to drain, which is the answer for the `stdout` and `stderr` targets and for a second call. It closes the file, so records emitted after it are discarded. Nothing runs on `os._exit` or on a crash, and records still in flight at either are lost.
 

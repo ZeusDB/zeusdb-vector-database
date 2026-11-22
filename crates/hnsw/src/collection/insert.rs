@@ -545,7 +545,7 @@ impl Collection {
              expected_size is a hint and not a limit, so nothing is broken, but m \
              was sized for the declaration. Call rebuild(m=..., expected_size=...) \
              to build the graph again at a degree matching what the index actually \
-             holds, if recall matters. This warning fires once.",
+             holds, if recall matters.",
             EXPECTED_SIZE_OVERGROWTH_FACTOR
         );
     }
@@ -1661,6 +1661,7 @@ impl Collection {
             self.dense().m(),
             self.expected_size(),
             self.dense().ef_construction(),
+            false,
         )?;
         let reclaimed = nodes_before - nodes_after;
         info!(target: LOG_TARGET, operation = "compact_complete",
@@ -1720,7 +1721,7 @@ impl Collection {
         let live_count = self.ids.read().unwrap().len();
         let nodes_before = self.dense().index.read().unwrap().graph().nb_points();
 
-        let nodes_after = self.rebuild_graph(writers, m, expected_size, ef_construction)?;
+        let nodes_after = self.rebuild_graph(writers, m, expected_size, ef_construction, true)?;
 
         self.dense().m.store(m, Ordering::Release);
         self.expected_size.store(expected_size, Ordering::Release);
@@ -1759,15 +1760,18 @@ impl Collection {
     /// index whose records cannot be rebuilt from therefore still reports the
     /// configuration its graph actually has.
     ///
-    /// The caller holds `writers` and lends it here.
+    /// The caller holds `writers` and lends it here. `keep_reserved` is set
+    /// for a rebuild, whose replacement keeps the reservation `expected_size`
+    /// makes; see `replacement_graph`.
     fn rebuild_graph(
         &self,
         writers: &MutationGuard<'_>,
         m: usize,
         expected_size: usize,
         ef_construction: usize,
+        keep_reserved: bool,
     ) -> Result<usize, Error> {
-        let new_hnsw = self.replacement_graph(m, expected_size, ef_construction)?;
+        let new_hnsw = self.replacement_graph(m, expected_size, ef_construction, keep_reserved)?;
         let nodes_after = new_hnsw.nb_points();
 
         // The text of every removed record, which stayed in the id store's
@@ -1787,16 +1791,20 @@ impl Collection {
 
     /// The replacement `rebuild_graph` installs: every record held
     /// re-inserted at one degree, in position order, under the internal id
-    /// it holds, with the slack of its arenas given back. Refused, with
-    /// nothing built, where a record held has no source data, and with what
-    /// was built dropped where the replacement has no room for a record at
-    /// the level drawn for it. The caller holds `writers`, so nothing it
-    /// reads can change before the install.
+    /// it holds. The slack of its arenas is given back unless `keep_reserved`
+    /// is set and the records fit inside `expected_size`, in which case the
+    /// replacement keeps the reservation `expected_size` makes, as `create()`
+    /// keeps it. Refused, with nothing built, where a record held
+    /// has no source data, and with what was built dropped where the
+    /// replacement has no room for a record at the level drawn for it. The
+    /// caller holds `writers`, so nothing it reads can change before the
+    /// install.
     pub(super) fn replacement_graph(
         &self,
         m: usize,
         expected_size: usize,
         ef_construction: usize,
+        keep_reserved: bool,
     ) -> Result<VectorGraph, Error> {
         let live_count = self.ids.read().unwrap().len();
         let quantized = self.is_quantized();
@@ -1979,9 +1987,47 @@ impl Collection {
         // geometric slack the graph being replaced carried. Compaction exists to
         // return memory, and returning it while still holding the graph outside
         // the write guard costs one copy of the live bytes against a rebuild that
-        // has just re-inserted every record.
-        new_hnsw.shrink_to_fit();
+        // has just re-inserted every record. A rebuild whose records fit inside
+        // `expected_size` holds no slack past the reservation it was made with,
+        // which it keeps.
+        if !keep_reserved || live_count > expected_size {
+            new_hnsw.shrink_to_fit();
+        }
         Ok(new_hnsw)
+    }
+
+    /// Give each record whose id this call generated, being each `i` where
+    /// `generated[i]` is set, the next generated id until its id names no
+    /// record the id store holds and no record of the call given its own
+    /// id. The counter only rises, so each loop ends, and two generated ids
+    /// are never one. Only an id of the form `vec_N` can be one the counter
+    /// issues, so the records given their own id are held to that form
+    /// alone. The caller holds the mutation guard, so nothing is installed
+    /// between this and the admission.
+    fn move_generated_ids(
+        &self,
+        _writers: &MutationGuard<'_>,
+        records: &mut [ParsedRecord],
+        generated: &[bool],
+    ) {
+        let named: HashSet<String> = records
+            .iter()
+            .zip(generated)
+            .filter(|&(record, &was_generated)| {
+                !was_generated && super::generated_number(&record.id).is_some()
+            })
+            .map(|(record, _)| record.id.clone())
+            .collect();
+        let ids = self.ids.read().unwrap();
+        for (record, _) in records
+            .iter_mut()
+            .zip(generated)
+            .filter(|&(_, &was_generated)| was_generated)
+        {
+            while ids.contains_name(&record.id) || named.contains(&record.id) {
+                record.id = self.generate_id();
+            }
+        }
     }
 
     /// The insertion phase of `add`, run with the interpreter lock released
@@ -2097,6 +2143,19 @@ impl Collection {
         // A sink that takes nothing refuses every record of the batch, an
         // overwrite's removal included, before anything is admitted.
         let (attached, read_only) = self.sink_state();
+        // A child forked from the process that opened the journal is refused
+        // with the fork before anything else, a standing fault among it.
+        if let Some(forked) = self.sink_forked() {
+            let class = forked.exception().name();
+            let message = forked.to_string();
+            for record in parsed_data {
+                errors.push(InsertError::Counted(format!(
+                    "Vector {}: {}: {}",
+                    record.id, class, message
+                )));
+            }
+            return (inserted_ids, errors);
+        }
         if let Some(refusing) = read_only {
             for record in parsed_data {
                 let err = refusing.error();
@@ -2864,10 +2923,43 @@ impl Collection {
     /// has them counted into term ids inside the mutation guard this takes,
     /// as the record is inserted, so nothing can empty the dictionary between
     /// a record's ids being issued and its postings being written. The terms
-    /// themselves come from `tokenize`, which runs under no guard.
+    /// themselves come from `tokenize`, which runs under no guard. Every id
+    /// is the caller's own; see [`Collection::add_generated_records`].
     pub fn add_records(
         &self,
         parsed_data: Vec<ParsedRecord>,
+        parse_errors: Vec<String>,
+        overwrite: bool,
+    ) -> Added {
+        self.add_marked_records(parsed_data, None, parse_errors, overwrite)
+    }
+
+    /// [`Collection::add_records`] for records some of whose ids the caller
+    /// generated, `generated[i]` being set where record `i`'s is one.
+    ///
+    /// A generated id is issued before the mutation guard is taken, so a
+    /// record another call installs meanwhile, or a record of this call
+    /// given its own id, can name it. Under the guard, before any record is
+    /// admitted, each generated id that the id store holds or that a record
+    /// of this call given its own id names takes the next generated id until
+    /// it names neither; see `move_generated_ids`. So a generated id never
+    /// names a record the collection holds.
+    pub fn add_generated_records(
+        &self,
+        parsed_data: Vec<ParsedRecord>,
+        generated: Vec<bool>,
+        parse_errors: Vec<String>,
+        overwrite: bool,
+    ) -> Added {
+        self.add_marked_records(parsed_data, Some(generated), parse_errors, overwrite)
+    }
+
+    /// The body of [`Collection::add_records`] and
+    /// [`Collection::add_generated_records`].
+    fn add_marked_records(
+        &self,
+        mut parsed_data: Vec<ParsedRecord>,
+        generated: Option<Vec<bool>>,
         parse_errors: Vec<String>,
         overwrite: bool,
     ) -> Added {
@@ -2913,7 +3005,11 @@ impl Collection {
         );
 
         let (inserted_ids, insert_errors) = {
+            zeusdb_vector_core::panic_at(zeusdb_vector_core::PanicPoint::AddBeforeGuard);
             let writers = self.hold_writers();
+            if let Some(generated) = &generated {
+                self.move_generated_ids(&writers, &mut parsed_data, generated);
+            }
             self.insert_parsed_records(&writers, parsed_data, overwrite)
         };
         let total_inserted = inserted_ids.len();
@@ -3123,11 +3219,10 @@ impl Collection {
     /// Rebuild the graph at the degree a plan names. See `rebuild_locked`.
     /// The record carries the three values the plan resolved, never the
     /// options the caller gave, since an option's meaning depends on the
-    /// configuration it was resolved against.
+    /// configuration it was resolved against. The overgrowth warning is armed
+    /// again once the rebuild has written the three values, so a rebuild that
+    /// fails leaves the warning as it left the declaration.
     pub fn rebuild(&self, plan: RebuildPlan) -> Result<usize, Error> {
-        if plan.rearm_overgrowth {
-            self.overgrowth_warned.store(false, Ordering::Release);
-        }
         let writers = self.hold_writers();
         self.record(|| Operation::Rebuild {
             m: plan.m as u64,
@@ -3135,7 +3230,12 @@ impl Collection {
             ef_construction: plan.ef_construction as u64,
         })?;
         self.commit_records()?;
-        self.rebuild_locked(&writers, plan.m, plan.expected_size, plan.ef_construction)
+        let rebuilt =
+            self.rebuild_locked(&writers, plan.m, plan.expected_size, plan.ef_construction)?;
+        if plan.rearm_overgrowth {
+            self.overgrowth_warned.store(false, Ordering::Release);
+        }
+        Ok(rebuilt)
     }
 
     /// Empty the index, keeping its configuration, and report how many

@@ -733,3 +733,95 @@ print("then", call(*args, level="info"))
         f"'zeusdb_vector_database=debug', and cannot read 'a=b=c': "), lines
     assert lines[0].endswith("."), lines
     assert lines[1] == "then True", lines
+
+
+# ------------------------------------------------------------
+# A folder or a log file init_file_logging() cannot use
+# ------------------------------------------------------------
+def _stdout_with_auto_logging_off(script):
+    """The stdout of `script` run in a fresh interpreter with every ZEUSDB_
+    setting and RUST_LOG removed and the automatic setup off."""
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("ZEUSDB_") and k not in ("PYTEST_CURRENT_TEST", "RUST_LOG")}
+    env["ZEUSDB_DISABLE_AUTO_LOGGING"] = "1"
+    proc = subprocess.run([sys.executable, "-c", script], env=env, check=True,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return proc.stdout.decode("utf-8", errors="ignore")
+
+
+def test_init_file_logging_raises_os_error_for_a_folder_it_cannot_make(tmp_path):
+    """A folder init_file_logging() cannot make, being one under a file,
+    raises OSError naming it and leaves the one setup unused, so a later
+    call with a folder it can make sets logging up."""
+    blocker = tmp_path / "a-file"
+    blocker.write_text("", encoding="utf-8")
+    folder = blocker / "logs"
+    script = rf"""
+import zeusdb_vector_database as z
+try:
+    z.init_file_logging({str(folder)!r})
+    print("returned")
+except OSError as error:
+    print("refused", error)
+print("then", z.init_file_logging({str(tmp_path / "logs")!r}))
+"""
+    lines = _stdout_with_auto_logging_off(script).splitlines()
+    assert len(lines) == 2, lines
+    assert lines[0].startswith(
+        f"refused init_file_logging() cannot make the folder {folder}: "), lines
+    assert lines[0].endswith("."), lines
+    assert lines[1] == "then True", lines
+
+
+def test_init_file_logging_raises_os_error_for_a_log_file_it_cannot_open(tmp_path):
+    """A log file init_file_logging() cannot open, being one whose name
+    holds a NUL character, raises OSError naming the folder rather than a
+    panic, and leaves the one setup unused, so a later call sets logging
+    up."""
+    script = rf"""
+import zeusdb_vector_database as z
+try:
+    z.init_file_logging({str(tmp_path)!r}, file_prefix="bad" + chr(0) + "name")
+    print("returned")
+except OSError as error:
+    print("refused", error)
+print("then", z.init_file_logging({str(tmp_path)!r}))
+"""
+    lines = _stdout_with_auto_logging_off(script).splitlines()
+    assert len(lines) == 2, lines
+    assert lines[0].startswith(
+        f"refused init_file_logging() cannot open a log file in {tmp_path}: "), lines
+    assert lines[0].endswith("."), lines
+    assert lines[1] == "then True", lines
+
+
+def test_init_logging_reads_the_python_level_name_warning():
+    """init_logging(level="warning") runs the engine at warn, as the name
+    reads in ZEUSDB_LOG_LEVEL, so a warning the engine emits is written and
+    a record at info is not."""
+    script = r"""
+import numpy as np
+import zeusdb_vector_database as z
+z.init_logging(level="warning")
+index = z.VectorDatabase().create("hnsw", dim=2, expected_size=1)
+index.add({"ids": ["a", "b", "c"], "embeddings": np.ones((3, 2), dtype=np.float32)})
+"""
+    out = _stdout_with_auto_logging_off(script)
+    assert "expected_size_exceeded" in out, out[-400:]
+    assert "Vector addition completed" not in out, out[-400:]
+
+
+@pytest.mark.parametrize("name", [
+    "",
+    pytest.param("bad<name.log", marks=pytest.mark.skipif(
+        os.name != "nt", reason="a file name holding '<' opens on POSIX")),
+], ids=["a-folder", "a-name-windows-refuses"])
+def test_the_package_imports_where_the_engine_cannot_open_the_log_file(tmp_path, name):
+    """ZEUSDB_LOG_FILE naming a file the engine cannot open, such as a
+    folder, sends the engine's records to stderr at import, as a folder it
+    cannot make does, rather than failing the import."""
+    target = str(tmp_path / name) if name else str(tmp_path)
+    out, err = _run_script_with_logging_env(
+        "import zeusdb_vector_database as z\nprint('imported')\n",
+        ZEUSDB_LOG_TARGET="file", ZEUSDB_LOG_FILE=target)
+    assert out.strip().splitlines()[-1] == "imported", (out, err[-400:])

@@ -2582,3 +2582,50 @@ fn a_load_sizes_the_metadata_entries_once_whatever_order_the_file_names_them_in(
         }
     }
 }
+
+/// `metadata.json` is read to the depth the binding takes: a field of 127
+/// lists with the innermost empty comes back after a save and a load, and a
+/// file whose field nests 128 or 100,000 lists is refused in the words of the
+/// limit, without the read recursing past the bound.
+#[test]
+fn metadata_json_is_read_to_the_depth_the_binding_takes() {
+    let temp = TempDir::new();
+    let deep = |levels: usize| {
+        let mut value = Value::Array(Vec::new());
+        for _ in 1..levels {
+            value = Value::Array(vec![value]);
+        }
+        value
+    };
+    let declaration = Declaration::validate(2, "l2", 4, 20, 10, vec![]).unwrap();
+    let collection = Collection::build(declaration, None);
+    let added = collection.add_records(
+        vec![ParsedRecord {
+            id: "k".to_string(),
+            vector: vec![1.0, 0.5],
+            sparse: None,
+            metadata: HashMap::from([("k".to_string(), deep(127))]),
+        }],
+        vec![],
+        false,
+    );
+    assert_eq!(added.total_errors, 0, "{:?}", added.errors);
+    let path = temp.at("deep.zdb");
+    collection.save(path.to_str().unwrap()).unwrap();
+    let loaded = Collection::load(path.to_str().unwrap()).unwrap();
+    let records = loaded.records(vec!["k".to_string()], false, true).unwrap();
+    assert_eq!(records[0].metadata.get("k"), Some(&deep(127)));
+    for levels in [128, 100_000] {
+        let text = format!(
+            "{{\"k\":{{\"k\":{}{}}}}}",
+            "[".repeat(levels),
+            "]".repeat(levels)
+        );
+        replace(&path, "metadata.json", text.as_bytes());
+        let words = refused(Collection::load(path.to_str().unwrap()));
+        assert!(
+            words.starts_with("Failed to parse metadata.json: recursion limit exceeded"),
+            "{levels}: {words}"
+        );
+    }
+}

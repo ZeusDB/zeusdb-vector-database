@@ -751,6 +751,20 @@ pub enum Error {
     /// A save or a backup into a directory whose lock file this process
     /// cannot open to write, so it cannot hold the lock exclusive
     LockFileReadOnly { path: String, error: String },
+
+    // ------------------------------------------------------------------
+    // A plain load's refusal of damage a repair handles. Appended after
+    // every variant above, and none wider than the widest above.
+    // ------------------------------------------------------------------
+    /// The refusal `refusal` of a journal a load did not repair, where a
+    /// load with `repair=True` keeps every record before `cut_sequence` and
+    /// cuts the file holding that record at byte `cut_at`. It is raised as
+    /// the refusal's own class
+    JournalRepairable {
+        refusal: Box<Error>,
+        cut_sequence: u64,
+        cut_at: u64,
+    },
 }
 
 impl Error {
@@ -935,6 +949,17 @@ impl Error {
             | TermTooLong { .. }
             | Panicked { .. }
             | RecordRemoved { .. } => Exception::Runtime,
+            JournalRepairable { refusal, .. } => refusal.exception(),
+        }
+    }
+
+    /// `refusal`, of a journal a load did not repair, carrying the cut a
+    /// repair of the same journal makes, so its words name `repair=True`.
+    pub fn repairable(refusal: Error, cut_sequence: u64, cut_at: u64) -> Self {
+        Error::JournalRepairable {
+            refusal: Box::new(refusal),
+            cut_sequence,
+            cut_at,
         }
     }
 
@@ -1344,9 +1369,7 @@ impl fmt::Display for Error {
             ),
             RebuildWithoutChanges => f.write_str(
                 "rebuild() changes m, expected_size, ef_construction or any combination \
-                 of them, and was given none. Rebuilding the graph as it stands is \
-                 compact(), which reclaims the nodes that removals and overwrites leave \
-                 behind.",
+                 of them, and was given none.",
             ),
             NoQuantizer => {
                 f.write_str("Index reports a quantized graph but holds no product quantizer")
@@ -2088,6 +2111,22 @@ impl fmt::Display for Error {
                  Make the lock file writable, or save into another directory.",
                 path, error
             ),
+            JournalRepairable {
+                refusal,
+                cut_sequence,
+                cut_at,
+            } => {
+                let words = refusal.to_string();
+                let stop = if words.ends_with('.') { "" } else { "." };
+                write!(
+                    f,
+                    "{}{} Restore the journal from a copy, or load the directory with \
+                     repair=True, which keeps every record before record {}, cuts the journal \
+                     at byte {} of the file holding that record, and sets aside record {} and \
+                     every record after it in the journal's quarantine folder.",
+                    words, stop, cut_sequence, cut_at, cut_sequence
+                )
+            }
             BackupIntoOwnDirectory { path } => write!(
                 f,
                 "This collection's journal sits beside {}, so that directory is the \

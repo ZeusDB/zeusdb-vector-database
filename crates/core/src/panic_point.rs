@@ -57,6 +57,9 @@ pub enum PanicPoint {
     /// After an `add` has committed and removed the records an overwrite
     /// replaces, and before the first record of its segment is installed.
     AddBeforeInstalls,
+    /// After an `add` has parsed its records and issued their generated
+    /// ids, and before it takes the mutation guard, with no guard held.
+    AddBeforeGuard,
     /// After a training has installed the codebook, the stamp and the
     /// calibration and cleared the collected ids, and before the graph is
     /// rebuilt over the codes.
@@ -71,6 +74,7 @@ impl PanicPoint {
             PanicPoint::InsertAfterName => "insert:after_name",
             PanicPoint::InstallBeforeSparse => "install:before_sparse",
             PanicPoint::AddBeforeInstalls => "add:before_installs",
+            PanicPoint::AddBeforeGuard => "add:before_guard",
             PanicPoint::TrainingBeforeRebuild => "training:before_rebuild",
         }
     }
@@ -79,11 +83,12 @@ impl PanicPoint {
 #[cfg(any(test, feature = "pause-points"))]
 impl PanicPoint {
     /// Every point, in the order the enum declares them.
-    pub const ALL: [PanicPoint; 5] = [
+    pub const ALL: [PanicPoint; 6] = [
         PanicPoint::InsertAfterPlan,
         PanicPoint::InsertAfterName,
         PanicPoint::InstallBeforeSparse,
         PanicPoint::AddBeforeInstalls,
+        PanicPoint::AddBeforeGuard,
         PanicPoint::TrainingBeforeRebuild,
     ];
 

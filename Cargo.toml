@@ -65,9 +65,12 @@ pyo3 = { version = "0.29.0", features = ["abi3-py310"] }
 numpy = "0.29.0"
 # `float_roundtrip` reads every float back as the float written, so a float
 # in a record's metadata, in `metadata.json` and in a journal record, comes
-# back bit for bit after a save and a load and after a replay. The feature
-# adds no crate.
-serde_json = { version = "1.0", features = ["float_roundtrip"] }
+# back bit for bit after a save and a load and after a replay.
+# `unbounded_depth` lets the read of `metadata.json` and the journal's read
+# of a record's metadata turn `serde_json`'s own nesting limit off, which
+# each replaces with the bound of crates/core/src/metadata_value.rs. Neither
+# feature adds a crate.
+serde_json = { version = "1.0", features = ["float_roundtrip", "unbounded_depth"] }
 serde = { version = "1.0", features = ["derive"] }
 rayon = "1.10"
 rand = "0.10"

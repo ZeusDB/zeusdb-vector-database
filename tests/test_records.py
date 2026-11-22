@@ -359,8 +359,8 @@ def test_update_metadata_refuses_a_value_metadata_does_not_hold():
     with pytest.raises(TypeError) as refusal:
         index.update_metadata("a", {"when": datetime.date(2026, 11, 21)})
     assert str(refusal.value) == (
-        "the value at key 'when' is a date, and a metadata value is None, a bool, an int, a "
-        "float, a str, a list or a dict, so convert it to one of those.")
+        "the value at key 'when' is of type date, and a metadata value is None, a bool, an "
+        "int, a float, a str, a list or a dict, so convert it to one of those.")
     with pytest.raises(ValueError) as refusal:
         index.update_metadata("a", {"scores": [0.5, float("nan")]})
     assert str(refusal.value) == (

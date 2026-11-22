@@ -375,3 +375,40 @@ fn a_forked_sink_refuses_everything() {
     assert_eq!(report.replayed, 2);
     assert_eq!(recovered.len(), 2);
 }
+
+/// A child forked while the fault a failed commit left stands refuses every
+/// mutation with `JournalForked`, since the checkpoint the fault's refusal
+/// asks for is one the child cannot take.
+#[test]
+fn a_forked_sink_refuses_with_the_fork_while_a_fault_stands() {
+    let temp = TempDir::new("segment-tests");
+    let path = temp.at("forked-fault.zdb");
+    let collection = Collection::build(declaration(), None);
+    let storage = FsStorage::at(&path).unwrap();
+    let mut sink = sink_over(
+        &storage,
+        &path,
+        collection.collection_id(),
+        Durability::PerCall,
+    );
+    sink.pretend_forked();
+    collection.attach_sink(Box::new(sink));
+    collection.fault_sink("the device refused the sync");
+    let added = collection.add_records(vec![record(0)], vec![], false);
+    assert_eq!(added.total_errors, 1, "{:?}", added.errors);
+    assert!(
+        added.errors[0].contains("a child forked from it"),
+        "{:?}",
+        added.errors
+    );
+    let cleared = collection.clear();
+    assert!(
+        matches!(cleared, Err(Error::JournalForked { .. })),
+        "{cleared:?}"
+    );
+    let checkpointed = collection.checkpoint();
+    assert!(
+        matches!(checkpointed, Err(Error::JournalForked { .. })),
+        "{checkpointed:?}"
+    );
+}

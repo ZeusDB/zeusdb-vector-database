@@ -9,6 +9,7 @@ aside; what is here is the surface a caller reaches.
 
 import gc
 import json
+import shutil
 import warnings
 from pathlib import Path
 
@@ -19,6 +20,7 @@ from zeusdb_vector_database import VectorDatabase
 DIM = 8
 SEGMENT_HEADER_BYTES = 128
 CALL = 4
+FIXTURES = Path(__file__).parent / "fixtures" / "formats"
 
 
 def build(n=0, **kw):
@@ -187,3 +189,68 @@ def test_repair_is_refused_beside_checkpoint_only(tmp_path):
     path = journaled(tmp_path)
     with pytest.raises(ValueError, match="checkpoint_only"):
         VectorDatabase().load(str(path), checkpoint_only=True, repair=True)
+
+
+def the_repair(record, at):
+    """The sentence a plain load's refusal ends with, naming the record a
+    repair keeps every record before and the byte it cuts at."""
+    return (f" Restore the journal from a copy, or load the directory with repair=True, which "
+            f"keeps every record before record {record}, cuts the journal at byte {at} of the "
+            f"file holding that record, and sets aside record {record} and every record after "
+            f"it in the journal's quarantine folder.")
+
+
+def test_a_plain_load_names_the_repair_for_a_live_segment_whose_header_does_not_read(tmp_path):
+    """The refusal of a live segment whose header does not read names
+    repair=True, the record the repair keeps every record before and the
+    byte it cuts at, and the repair then sets the segment aside there."""
+    path = journaled(tmp_path, calls=1)
+    (segment,) = [p for p in journal_of(path).iterdir() if p.is_file()]
+    data = bytearray(segment.read_bytes())
+    data[40] ^= 0x40
+    segment.write_bytes(bytes(data))
+
+    with pytest.raises(RuntimeError) as refusal:
+        VectorDatabase().load(str(path))
+    assert str(refusal.value).endswith(the_repair(1, 0)), str(refusal.value)
+    with pytest.warns(RuntimeWarning, match="set aside"):
+        index = VectorDatabase().load(str(path), repair=True)
+    assert index.recovery["damage"]["kind"] == "header"
+    repair = index.recovery["repair"]
+    assert (repair["kept_through"], repair["discarded_from"]) == (0, 1)
+    assert repair["bytes_discarded"] == len(data)
+    assert len(index) == 0
+
+
+def test_a_repair_sets_aside_a_version_1_journal_whose_header_does_not_read(tmp_path):
+    """A journal of format version 1 whose header does not read is refused by
+    a plain load naming repair=True, and a repair sets the file aside whole,
+    replays nothing, and writes the directory at 5.0.0 holding the records
+    of its checkpoint, which a later load opens plainly."""
+    shutil.copytree(FIXTURES / "v3.0.0-journaled", tmp_path / "v3")
+    path = tmp_path / "v3" / "journaled.zdb"
+    wal = path.parent / (path.name + ".zdbwal")
+    data = bytearray(wal.read_bytes())
+    data[20] ^= 0x01
+    wal.write_bytes(bytes(data))
+
+    with pytest.raises(RuntimeError) as refusal:
+        VectorDatabase().load(str(path))
+    assert str(refusal.value).endswith(the_repair(1, 0)), str(refusal.value)
+    with pytest.warns(RuntimeWarning, match="set aside"):
+        index = VectorDatabase().load(str(path), repair=True)
+    assert len(index) == 120
+    recovery = index.recovery
+    assert recovery["damage"]["kind"] == "header"
+    repair = recovery["repair"]
+    assert (repair["kept_through"], repair["discarded_from"]) == (0, 1)
+    assert repair["records_discarded"] == 72
+    assert repair["bytes_discarded"] == len(data)
+    assert not wal.exists()
+    del index
+    gc.collect()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        again = VectorDatabase().load(str(path))
+    assert len(again) == 120
+    assert again.recovery["damage"] is None

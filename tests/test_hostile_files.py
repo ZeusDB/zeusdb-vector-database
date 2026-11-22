@@ -23,6 +23,7 @@ and those forgeries run on a copy of a saved directory rewritten in that wire.
 `config.json` and `quantization.json` are JSON and are edited in place.
 """
 
+import gc
 import json
 import os
 import shutil
@@ -32,8 +33,8 @@ import sys
 
 import numpy as np
 import pytest
-from helpers import (FRAME_KINDS, artefact_digest, as_before_five, as_old_wire, frame, reframe,
-                     repair_manifest, unframe)
+from helpers import (FRAME_KINDS, artefact_digest, as_before_five, as_old_wire, checksum, frame,
+                     reframe, repair_manifest, unframe)
 from zeusdb_vector_database import VectorDatabase
 
 # A length no file could carry and every unbounded container aborted on.
@@ -791,3 +792,64 @@ def test_the_dim_ceiling_admits_the_widest_real_embedding(tmp_path):
     path = tmp_path / "wide"
     index.save(str(path))
     assert VectorDatabase().load(str(path)).dim == 3072
+
+
+# ============================================================================
+# METADATA NESTED PAST THE BOUND
+# ============================================================================
+#
+# A load reads a record's metadata to the 128 levels add() takes, with the
+# JSON reader's own nesting limit off, and refuses a value past them before
+# it reads further. A field nested 100,000 levels deep, in metadata.json and
+# in a journal record, is refused and the child survives, so neither read
+# recursed past the bound.
+
+DEEP_LEVELS = 100_000
+# Bytes a journal segment's header occupies, before its first record.
+SEGMENT_HEADER_BYTES = 128
+
+
+def deep_mapping(levels=DEEP_LEVELS):
+    """The text of a record's mapping whose one field nests `levels` lists."""
+    return '{"k":' + "[" * levels + "]" * levels + "}"
+
+
+def test_a_metadata_json_field_nested_100000_levels_deep_is_refused(raw_index, tmp_path):
+    text = '{"a":' + deep_mapping() + ',"b":{}}'
+    path = forged(raw_index, tmp_path, "metadata.json", write_bytes(text.encode("utf-8")))
+    assert_refused(path, tmp_path, naming="Failed to parse metadata.json: recursion limit exceeded")
+
+
+def test_a_journal_record_whose_metadata_nests_100000_levels_deep_is_refused(tmp_path):
+    """An add's journal record is rewritten in place to carry a mapping whose
+    field nests 100,000 lists, and sealed again with its checksum, so the
+    replay's read of the record's metadata is what refuses it."""
+    deep = deep_mapping().encode("utf-8")
+    # A str field whose mapping's text is as long as the deep one, so the
+    # record keeps its length and only its checksum changes.
+    filler = "x" * (len(deep) - len('{"k":""}'))
+    held = ('{"k":"' + filler + '"}').encode("utf-8")
+    path = tmp_path / "deep.zdb"
+    index = VectorDatabase().create("hnsw", dim=4, expected_size=64)
+    index.journal_to(str(path))
+    assert index.add({"id": "a", "values": [1.0, 0, 0, 0], "metadata": {"k": filler}}).is_success()
+    del index
+    gc.collect()
+
+    (segment,) = [p for p in (tmp_path / "deep.zdb.zdbjournal").iterdir() if p.is_file()]
+    data = bytearray(segment.read_bytes())
+    at = data.find(held)
+    assert at > 0 and data.find(held, at + 1) == -1, "the record's metadata is held once"
+    data[at:at + len(held)] = deep
+    # A record is its sequence, its payload's length and its kind in 16
+    # bytes, then the payload, then a checksum over the 16 bytes and the
+    # payload.
+    start = SEGMENT_HEADER_BYTES
+    while True:
+        end = start + 16 + int.from_bytes(data[start + 8:start + 12], "little")
+        if start < at < end:
+            break
+        start = end + 8
+    data[end:end + 8] = checksum(bytes(data[start:end])).to_bytes(8, "little")
+    segment.write_bytes(bytes(data))
+    assert_refused(path, tmp_path, naming="the metadata is not JSON: recursion limit exceeded")
