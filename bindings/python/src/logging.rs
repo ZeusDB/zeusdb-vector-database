@@ -240,7 +240,10 @@ pub(crate) fn init_from_env_if_unset() {
         // Create base subscriber and consume it in the match
         let subscriber = Registry::default().with(filter);
 
-        // Initialize with appropriate layer, preserving format on file fallback
+        // Initialize with appropriate layer, preserving format on file fallback.
+        // What became of the file the `file` target names: written, or the
+        // cause it could not be opened, and nothing for any other target.
+        let mut file_layer: Option<Result<(), String>> = None;
         match (log_format.as_str(), log_target.as_str()) {
             ("json", "stdout") => {
                 let _ = subscriber.with(create_json_stdout_layer::<_>()).try_init();
@@ -248,28 +251,34 @@ pub(crate) fn init_from_env_if_unset() {
             ("json", "stderr") => {
                 let _ = subscriber.with(create_json_stderr_layer::<_>()).try_init();
             }
-            ("json", "file") => {
-                if let Some(layer) = create_json_file_layer::<_>() {
+            ("json", "file") => match create_json_file_layer::<_>() {
+                Ok(layer) => {
+                    file_layer = Some(Ok(()));
                     let _ = subscriber.with(layer).try_init();
-                } else {
+                }
+                Err(cause) => {
                     // Fallback: preserve JSON format, use stderr
+                    file_layer = Some(Err(cause));
                     let _ = subscriber.with(create_json_stderr_layer::<_>()).try_init();
                 }
-            }
+            },
             ("human", "stdout") => {
                 let _ = subscriber.with(create_human_stdout_layer::<_>()).try_init();
             }
             ("human", "stderr") => {
                 let _ = subscriber.with(create_human_stderr_layer::<_>()).try_init();
             }
-            ("human", "file") => {
-                if let Some(layer) = create_human_file_layer::<_>() {
+            ("human", "file") => match create_human_file_layer::<_>() {
+                Ok(layer) => {
+                    file_layer = Some(Ok(()));
                     let _ = subscriber.with(layer).try_init();
-                } else {
+                }
+                Err(cause) => {
                     // Fallback: preserve human format, use stderr
+                    file_layer = Some(Err(cause));
                     let _ = subscriber.with(create_human_stderr_layer::<_>()).try_init();
                 }
-            }
+            },
             _ => {
                 // Unknown format/target - safe fallback
                 let _ = subscriber.with(create_human_stderr_layer::<_>()).try_init();
@@ -288,7 +297,8 @@ pub(crate) fn init_from_env_if_unset() {
         // Name the destination when the target is a file, so the resolved path
         // is discoverable rather than inferred. Under daily rotation the
         // resolved name carries a date suffix and is not the name the caller
-        // typed, which is the case this record exists for.
+        // typed, which is the case this record exists for. Where the file
+        // could not be opened, a warning names it, the cause and stderr.
         if log_target == "file" {
             let requested_rotation = std::env::var("ZEUSDB_LOG_ROTATION").unwrap_or_default();
             if parse_rotation(&requested_rotation).is_none() {
@@ -299,12 +309,23 @@ pub(crate) fn init_from_env_if_unset() {
                 );
             }
 
-            tracing::info!(
-                operation = "logging_init_file",
-                rotation = %configured_rotation().as_str(),
-                log_file = %resolved_log_file_path(),
-                "ZeusDB file logging writing to resolved path"
-            );
+            match &file_layer {
+                Some(Ok(())) => tracing::info!(
+                    operation = "logging_init_file",
+                    rotation = %configured_rotation().as_str(),
+                    log_file = %resolved_log_file_path(),
+                    "ZeusDB file logging writing to resolved path"
+                ),
+                Some(Err(cause)) => tracing::warn!(
+                    operation = "logging_init_file",
+                    log_file = %resolved_log_file_path(),
+                    error = %cause,
+                    "ZeusDB file logging cannot open the resolved path, so the engine's \
+                     records go to stderr. Set ZEUSDB_LOG_FILE to a file this process can \
+                     write"
+                ),
+                None => {}
+            }
         }
     });
 }
@@ -315,7 +336,8 @@ pub fn init_logging() {
 }
 
 /// The filter `call` installs: `RUST_LOG` where it parses, and `level`
-/// otherwise, `info` where it is left out. A `level` that does not parse
+/// otherwise, `info` where it is left out. A `level` that does not parse,
+/// or that is one word naming no level and no target of the engine's,
 /// raises `ValueError` naming it, before the one initialization runs, so a
 /// call that raises leaves logging as it was and a later call can still
 /// initialize it.
@@ -324,15 +346,42 @@ fn requested_filter(call: &str, level: Option<&str>) -> PyResult<EnvFilter> {
         return Ok(filter);
     }
     let level = level.unwrap_or("info");
-    // A name of the table `ZEUSDB_LOG_LEVEL` is read through, such as
-    // Python's `warning`, is that level, and any other text is a filter.
-    EnvFilter::try_new(known_level(level).unwrap_or(level)).map_err(|error| {
+    let refused = |cause: &dyn std::fmt::Display| {
         pyo3::exceptions::PyValueError::new_err(format!(
             "{} takes a level such as 'info' or a filter such as \
              'zeusdb_vector_database=debug', and cannot read '{}': {}.",
-            call, level, error
+            call, level, cause
         ))
-    })
+    };
+    // A name of the table `ZEUSDB_LOG_LEVEL` is read through, such as
+    // Python's `warning`, is that level. `EnvFilter` reads one word that is
+    // no level as a target at every level, as it would read a misspelt
+    // level, so such a word is refused unless it is the engine's own target
+    // or one under it. Any other text is a filter.
+    let text = known_level(level).unwrap_or(level);
+    if names_no_level(text) {
+        return Err(refused(&"it names no level"));
+    }
+    EnvFilter::try_new(text).map_err(|error| refused(&error))
+}
+
+/// The target of the engine's records, which each record carries or one
+/// under it.
+const ENGINE_TARGET: &str = "zeusdb_vector_database";
+
+/// Whether `text` is one word that `EnvFilter` reads as a target and not
+/// as a level, being no level name and no target of the engine's own.
+fn names_no_level(text: &str) -> bool {
+    let word = text.trim();
+    !word.is_empty()
+        && !word.contains(['=', ',', '['])
+        && word
+            .parse::<tracing_subscriber::filter::LevelFilter>()
+            .is_err()
+        && word != ENGINE_TARGET
+        && !word
+            .strip_prefix(ENGINE_TARGET)
+            .is_some_and(|rest| rest.starts_with("::"))
 }
 
 /// Python-exposed logging initialization (JSON to console)
@@ -374,7 +423,8 @@ pub fn py_init_logging(level: Option<String>) -> PyResult<bool> {
 ///
 /// Returns true if initialization occurred, false if already initialized,
 /// and raises ValueError for an empty `log_dir` or a level it cannot read
-/// and OSError for a folder it cannot make or a log file it cannot open.
+/// and, before logging is set up, OSError for a folder it cannot make or a
+/// log file it cannot open.
 /// `level` left out or `None` is `info`, under a `RUST_LOG` that takes
 /// precedence where it parses, and `file_prefix` left out or `None` is
 /// `zeusdb`.
@@ -590,8 +640,9 @@ where
     )
 }
 
-/// Create JSON formatter for file output with rotation
-fn create_json_file_layer<S>() -> Option<Box<dyn Layer<S> + Send + Sync + 'static>>
+/// Create JSON formatter for file output with rotation, or the cause the
+/// file cannot be opened
+fn create_json_file_layer<S>() -> Result<Box<dyn Layer<S> + Send + Sync + 'static>, String>
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
@@ -617,8 +668,9 @@ where
     })
 }
 
-/// Create human-readable formatter for file output with rotation
-fn create_human_file_layer<S>() -> Option<Box<dyn Layer<S> + Send + Sync + 'static>>
+/// Create human-readable formatter for file output with rotation, or the
+/// cause the file cannot be opened
+fn create_human_file_layer<S>() -> Result<Box<dyn Layer<S> + Send + Sync + 'static>, String>
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
@@ -708,10 +760,13 @@ fn configured_rotation() -> LogRotation {
 /// for rather than imposed.
 fn create_file_appender(
     log_file_path: &str,
-) -> Option<(
-    tracing_appender::non_blocking::NonBlocking,
-    tracing_appender::non_blocking::WorkerGuard,
-)> {
+) -> Result<
+    (
+        tracing_appender::non_blocking::NonBlocking,
+        tracing_appender::non_blocking::WorkerGuard,
+    ),
+    String,
+> {
     use std::borrow::Cow;
     use std::path::Path;
 
@@ -723,15 +778,14 @@ fn create_file_appender(
         _ => (Path::new("."), Cow::from("zeusdb.log")),
     };
 
-    // Silent failure for graceful degradation
-    if std::fs::create_dir_all(directory).is_err() {
-        return None;
-    }
+    // A folder this process cannot make is returned as the cause the setup
+    // warns of before it falls back to stderr.
+    std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
 
     // Built through the builder, whose `build` returns the failure that
     // `rolling::never` and `rolling::daily` panic with, so a file this
-    // process cannot open falls back to stderr, as a folder it cannot make
-    // does.
+    // process cannot open falls back to stderr with its cause, as a folder
+    // it cannot make does.
     let rotation = match configured_rotation() {
         LogRotation::Never => tracing_appender::rolling::Rotation::NEVER,
         LogRotation::Daily => tracing_appender::rolling::Rotation::DAILY,
@@ -740,10 +794,13 @@ fn create_file_appender(
         .rotation(rotation)
         .filename_prefix(filename.into_owned())
         .build(directory)
-        .ok()?;
+        .map_err(|error| {
+            std::error::Error::source(&error)
+                .map_or_else(|| error.to_string(), |source| source.to_string())
+        })?;
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
-    Some((non_blocking, guard))
+    Ok((non_blocking, guard))
 }
 
 /// The file the `file` target resolves to, absolute where that can be worked out

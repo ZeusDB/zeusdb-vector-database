@@ -466,9 +466,9 @@ fn a_dump_refused_on_its_header_identity_or_rows_refuses_the_load() {
     assert_eq!(
         message,
         "The graph dump hnsw_index.zdbgraph cannot be used, since its rows region fails its \
-         checksum. At format 5.0.0 the dump holds the only copy of each record's stored vector \
-         or code, so the directory cannot open without it. Restore the directory from a copy, \
-         such as one backup() wrote."
+         checksum. At format 5.0.0 the dump holds the only copy of each record's stored vector, \
+         code or row, so the directory cannot open without it. Restore the directory from a \
+         copy, such as one backup() wrote."
     );
 }
 
@@ -576,7 +576,7 @@ fn a_directory_that_lost_its_dump_is_refused() {
             assert_eq!(missing, vec![DUMP_FILENAME.to_string()]);
             assert_eq!(
                 contents,
-                "the graph and the stored vector or code of every record"
+                "the graph and the stored vector, code or row of every record"
             );
         }
         other => panic!("expected the dump missing, got {:?}", other.map(|_| ())),

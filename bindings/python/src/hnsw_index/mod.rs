@@ -581,7 +581,7 @@ impl HNSWIndex {
     /// Add records, in any of the five shapes.
     ///
     /// A record fills the sparse space under the key the space takes.
-    /// `sparse` is a mapping `{"dims": [...], "values": [...]}` of term ids
+    /// `sparse` is a dict `{"dims": [...], "values": [...]}` of term ids
     /// and weights, parallel, the dims strictly increasing and the values
     /// finite and at most 2^40 in magnitude, and whole numbers above zero on
     /// a space weighted by term frequency; a space that takes term ids alone
@@ -601,7 +601,7 @@ impl HNSWIndex {
     ///
     /// A record refused for its sparse half is counted and named in
     /// `errors`, and the records around it are inserted, as a record with a
-    /// malformed vector is treated. That covers a malformed mapping, a
+    /// malformed vector is treated. That covers a malformed `sparse`, a
     /// sparse vector or a text on an index whose space does not take it,
     /// the engine's rules on the vector, and an exception the tokenizer
     /// raised, which is named with its class in the record's error.
@@ -613,12 +613,13 @@ impl HNSWIndex {
     /// or underflows a float32 is normalized in float64 and stored at unit
     /// length.
     ///
-    /// Every shape reads a record's metadata entry the same way. A mapping
-    /// is the record's metadata, a string is kept under `text`, any other
-    /// value is kept under `value`, and `None` is no metadata. A value is
-    /// None, a bool, an integer from -2^63 to 2^63 - 1, a finite float, a
-    /// string, a list of values or a mapping with string keys, nested at
-    /// most 128 levels deep, and comes back as the value it was. A record
+    /// Every shape reads a record's metadata entry the same way. A dict is
+    /// the record's metadata, a string is kept under `text`, any other value
+    /// is kept under `value`, and `None` is no metadata. A value is None, a
+    /// bool, an integer from -2^63 to 2^63 - 1, a finite float, a string, a
+    /// list of values or a dict with string keys, nested at most 128 levels
+    /// deep, counting the record's metadata as the first, and comes back as
+    /// the value it was. A record
     /// whose metadata holds anything else, or a key that is not a string, is
     /// counted and named the same way as a malformed vector, after the words
     /// `Metadata error`, which say where the value sits.
@@ -952,9 +953,9 @@ impl HNSWIndex {
                 // was 84.41 microseconds a query against 8.43 for `float32`.
                 #[expect(clippy::cast_possible_truncation, reason = "a value narrowed to the f32 the index stores, not an offset, a count, an index or an id")]
                 let query_vector = if let Ok(array1d) = vector.cast::<PyArray1<f32>>() {
-                    array1d.readonly().as_slice()?.to_vec()
+                    input::c_ordered(array1d)?.readonly().as_slice()?.to_vec()
                 } else if let Ok(array1d) = vector.cast::<PyArray1<f64>>() {
-                    array1d
+                    input::c_ordered(array1d)?
                         .readonly()
                         .as_slice()?
                         .iter()
@@ -1019,7 +1020,7 @@ impl HNSWIndex {
 
     /// Search one or more spaces with one query and return one page.
     ///
-    /// `arms` is a list of mappings, one per arm, each asking one space with
+    /// `arms` is a list of dicts, one per arm, each asking one space with
     /// one query. `{"vector": [...]}` asks the dense space, with the
     /// vector on the caller's scale as `search` takes it, and takes
     /// `ef_search` and `rerank` as `search` does. `{"sparse": {"dims":
@@ -1195,8 +1196,9 @@ impl HNSWIndex {
     /// Opening it takes the directory's lock, `<path>.zdblock`, which the
     /// index holds until it is dropped, so a second index in this process or
     /// another that loads, saves into or journals the directory is refused
-    /// with `CollectionLocked`. It then saves the index into `path`, as
-    /// `save(path)` would, so the journal has a checkpoint to replay onto.
+    /// with `RuntimeError` (`CollectionLocked`). It then saves the index into
+    /// `path`, as `save(path)` would, so the journal has a checkpoint to
+    /// replay onto.
     /// From then on `save` on this index takes `path` and no other directory,
     /// `checkpoint()` is `save` with the path taken from the journal, and
     /// `journal_path` is the journal's directory. An index is journaled once.
@@ -1240,8 +1242,8 @@ impl HNSWIndex {
     /// whose journal entry would exceed 65 MiB is refused on a journaled index
     /// and accepted on one without a journal. When the process that opened
     /// the journal forks while no call on the index runs, every mutation in
-    /// the child is refused with `JournalForked`, which `add()` reports in
-    /// `errors`.
+    /// the child is refused with `RuntimeError` (`JournalForked`), which
+    /// `add()` reports in `errors`.
     ///
     /// Raises ValueError for a durability that is not one of the three, for
     /// `interval_ms` under any other durability or of 0 or below, and for a
@@ -1326,7 +1328,8 @@ impl HNSWIndex {
     ///   drawn at that save, or `None`.
     /// - `parent`: the snapshot that directory was saved from, or `None`.
     /// - `saved_at`: the time, in RFC 3339, that directory's manifest
-    ///   records as its save, or `None` where `snapshot` is `None`.
+    ///   records as its save, or `None` where `snapshot` is `None` or that
+    ///   manifest records no such time.
     /// - `sequence`: the journal sequence that directory's manifest records
     ///   under `identity`, or 0 where it records none.
     ///
@@ -2024,14 +2027,14 @@ impl HNSWIndex {
 
     /// Replace one record's metadata without resupplying its vector.
     ///
-    /// **Wholesale, not a merge.** The supplied mapping becomes the record's
+    /// **Wholesale, not a merge.** The supplied dict becomes the record's
     /// metadata and any key not in it is gone. That is what `add(overwrite=True)`
     /// already does, since it removes the record outright before inserting the
     /// replacement, so the two ways of re-tagging a record agree.
     ///
     /// Returns `false` for an id the index does not hold, and writes nothing in
     /// that case. `true` when the metadata was replaced. Passing an empty
-    /// mapping clears the record's metadata, which is a write and returns
+    /// dict clears the record's metadata, which is a write and returns
     /// `true`.
     ///
     /// No graph work, no vector work, no id allocation, no training. The

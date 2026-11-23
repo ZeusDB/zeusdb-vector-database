@@ -1431,7 +1431,7 @@ What `rerank` does:
 
 | `rerank` | Effect |
 | --- | --- |
-| omitted | Uses the calibrated fetch, held under the ceiling below. It is the only setting that holds recall across corpus sizes and across datasets |
+| omitted | Uses the calibrated fetch, held under the ceiling below. It is the only setting that grows with the record count and is measured on your data |
 | `N` of 1 or more | Fetches `top_k × N` candidates, a fixed multiple of the page that does not move with the corpus. Use it to override the default deliberately |
 | `0` | Turns reranking off and returns the ADC scores and ordering |
 
@@ -1462,7 +1462,7 @@ rerank_fetch_capped true
 
 `rerank_requested_fetch` is what the calibration asked for, which on the uniform random vectors of this example exceeds the corpus, so the fetch performed is the quarter of the 2,500 records the whole-fetch bound allows and `rerank_fetch_capped` says so. On the three real datasets measured, the request sits under the ceiling and the two figures agree.
 
-**A reranked quantized search is faster than an unquantized one at 10,000 records, level with it at 25,000 and slower at 50,000, and the ratio rises with the record count.** That is the price of the default holding recall. On dbpedia-openai at `dim=1,536`, paired against an unquantized index over the same records, 200 queries one each in turn, at up to 50,000 records.
+**A reranked quantized search is faster than an unquantized one at 10,000 records, level with it at 25,000 and slower at 50,000, and the ratio rises with the record count.** That is the price of a default fetch that grows with the record count. On dbpedia-openai at `dim=1,536`, paired against an unquantized index over the same records, 200 queries one each in turn, at up to 50,000 records.
 
 | records | calibrated fetch | unquantized | quantized, default rerank | ratio |
 |---:|---:|---:|---:|---:|
@@ -1848,7 +1848,7 @@ Every save records what the directory is in `manifest.json`, and an index report
 | `generation` | How many saves the index had made when it wrote, or read, its last directory. A new index is at 0, its first save writes 1, and each save writes one more |
 | `snapshot` | The id of the directory the index last saved or read, drawn at that save, or `None` before the first |
 | `parent` | The `snapshot` that directory was saved from, or `None` on a first save |
-| `saved_at` | The time, in RFC 3339, that directory's manifest records as its save, or `None` where `snapshot` is `None` |
+| `saved_at` | The time, in RFC 3339, that directory's manifest records as its save, or `None` where `snapshot` is `None` or that manifest records no such time |
 | `sequence` | The journal sequence that directory's manifest records under `identity`, or 0 where it records none |
 
 ```python
@@ -1936,7 +1936,7 @@ A release that meets a feature it does not know refuses the directory with a mes
 
 - **Version compatibility.** Every directory this release saves declares format version 5.0.0 and lists its features, see [What a Directory Holds](#-what-a-directory-holds---features). This release reads 1.x to 5.x. A 5.0.0 directory holds `mappings.bin`, `vectors.bin` and `pq_centroids.bin` inside a frame with checksums of its own, and 0.5.0 to 0.13.0 refuse it at the version check, and 0.3.0 to 0.4.1, which read no format version, refuse it when they decode its `mappings.bin`.
 
-- **Integrity checks on load.** Five run, in this order: the format version, then the features against the ones this release knows, then `files_included` against the directory, then each artefact against its recorded length and, for a JSON artefact, its digest, a binary artefact verifying its own checksums as it is read, then the restored record count against the count in `config.json`. Once `config.json` and `quantization.json` are read, the features a 4.0.0 directory lists are held to what it holds. A directory holding a sparse space adds two, being every record the space holds against the id mappings, and every term id the postings carry against the length of the dictionary. A journaled directory adds the journal's own, being the collection id in its header against the manifest's, its first record against the sequence the checkpoint holds, a record in its middle whose bytes changed after it was written, and every replayed record against the index it lands on. A directory recording an identity adds its own, being every id 32 hexadecimal digits and the generation 1 or more, and, where it is journaled, the collection id its journal record names against the identity's. A trained scalar directory adds the bounds of its scales, being one finite positive scale per declared dimension. A 4.0.0 directory adds the bounds of its binary artefacts, being every internal id `vectors.bin` and `pq_codes.bin` name one that `mappings.bin` holds, one vector of the declared width for every record `mappings.bin` holds where the directory holds `vectors.bin`, one code of the declared width for each record coded, and a codebook of the shape `quantization.json` describes.
+- **Integrity checks on load.** A load checks the directory and its journal, and a refusal names what failed.
 
 - **`save()` and `load()` are silent.** Every step they used to print to stdout is a `debug` log line instead, so a library caller sees nothing on stdout. Set `ZEUSDB_LOG_LEVEL=debug` to see the steps.
 
@@ -2036,7 +2036,7 @@ A filter is a conjunction of its keys. Three reserved keys compose whole filters
 | `$or` | a list of filters | at least one of them holds |
 | `$not` | one filter | that filter does not hold |
 
-**Precedence.** There is none to remember, because the structure is explicit. A mapping is an AND of everything in it, fields and groups alike, so `{"a": 1, "$or": [...]}` means `a == 1` AND the disjunction. A group's branches are each a whole filter, so a branch carrying two fields conjoins them.
+**Precedence.** There is none to remember, because the structure is explicit. A filter is an AND of everything in it, fields and groups alike, so `{"a": 1, "$or": [...]}` means `a == 1` AND the disjunction. A group's branches are each a whole filter, so a branch carrying two fields conjoins them.
 
 **Nesting.** Groups nest to 10 levels, counting the filter itself as level one. A filter deeper than that raises `ValueError`.
 
@@ -2303,7 +2303,7 @@ d1 0.9254
 | Key | Takes | Means |
 |-----|-------|-------|
 | `tokenizer` | `"simple"` or a callable | How a text becomes terms. Declaring it makes the space a text layer |
-| `weighting` | `"dot"`, `"bm25"`, or a mapping | How a term count scores. Defaults to `bm25` where a tokenizer is declared. `{"type": "bm25", "k1": 1.5, "b": 0.6}` sets the parameters, which otherwise take 1.2 and 0.75 |
+| `weighting` | `"dot"`, `"bm25"`, or a dict | How a term count scores. Defaults to `bm25` where a tokenizer is declared. `{"type": "bm25", "k1": 1.5, "b": 0.6}` sets the parameters, which otherwise take 1.2 and 0.75 |
 | `name` | a string | The directory the space saves under. Defaults to `sparse` |
 
 **Scores are similarities.** Higher is better, unlike the dense `search()`, whose scores are distances. A space with a text layer takes `text` and refuses `sparse`.
@@ -2438,11 +2438,11 @@ d2 0.0161 [(0, 2)]
 
 | Argument | Takes | Means |
 |----------|-------|-------|
-| `arms` | a list of mappings | One to eight arms. Each names `vector`, `sparse` or `text` |
+| `arms` | a list of dicts | One to eight arms. Each names `vector`, `sparse` or `text` |
 | `filter` | a filter | Applied once, to every arm |
 | `top_k` | an integer | The page size |
 | `fetch` | an integer | What each arm contributes. Defaults to `top_k` for one arm and five times it for several |
-| `fusion` | `"rrf"` or a mapping | How the pages combine. `{"type": "rrf", "k": 60.0}` sets the constant |
+| `fusion` | `"rrf"` or a dict | How the pages combine. `{"type": "rrf", "k": 60.0}` sets the constant |
 
 **A hit carries its rank and score on every arm's page it appeared on**, under `contributions`, indexed by the arm's position in `arms`. A fused score is a rank sum and means nothing on its own, which is what the contributions are for.
 
@@ -2577,7 +2577,7 @@ results = index.search(query_vector, top_k=5)
 ```
 
 **What you get automatically:**
-- ✅ **Quiet by default**, only warnings and errors outside development
+- ✅ **Quiet by default**, nothing below a warning outside Jupyter
 - ✅ **Environment detection**, appropriate defaults for dev, prod, testing, CI and notebooks
 - ✅ **Structured JSON logs** in production environments
 - ✅ **Human-readable logs** in development environments
@@ -2609,10 +2609,10 @@ python your_app.py
 
 | Variable | Options | Default | Description |
 |----------|---------|---------|-------------|
-| `ZEUSDB_LOG_LEVEL` | `trace`, `debug`, `info`, `warn`, `error` | `warn` (dev), `error` (prod) | Controls log verbosity. `warning` and `warn` are the same level, as are `critical`, `fatal`, `err` and `error`. An unrecognised name falls back to the default. |
+| `ZEUSDB_LOG_LEVEL` | `trace`, `debug`, `info`, `warn`, `error` | `warn` (dev), `error` (prod) | Controls log verbosity. `warning` and `warn` are the same level, and the engine reads `critical`, `fatal`, `err` and `error` as `error`. An unrecognised name falls back to the default. |
 | `ZEUSDB_LOG_FORMAT` | `human`, `json` | `human` (dev), `json` (prod) | Output format |
-| `ZEUSDB_LOG_TARGET` | `stdout`, `stderr`, `file` | `stderr` | Where logs go |
-| `ZEUSDB_LOG_FILE` | `/path/to/file.log` | `zeusdb.log` | Log file path, written exactly as given (if target=file) |
+| `ZEUSDB_LOG_TARGET` | `stdout`, `stderr`, `file` | `stderr`, or `file` where `ZEUSDB_LOG_FILE` is set | Where logs go |
+| `ZEUSDB_LOG_FILE` | `/path/to/file.log` | `zeusdb.log` | Log file path, written exactly as given |
 | `ZEUSDB_LOG_ROTATION` | `daily`, `never` | `never` | With `daily`, a UTC date is appended to the file name |
 | `ZEUSDB_LOG_CONSOLE` | `true`, `false` | Auto-detected | Force console output |
 | `ZEUSDB_DISABLE_AUTO_LOGGING` | `true`, `1`, `yes` | unset | Skip automatic configuration entirely |
@@ -2671,7 +2671,7 @@ print("initialized:", success)
 vdb = zeusdb_vector_database.VectorDatabase()
 ```
 
-**Only the first initializer to run takes effect.** Both functions return `True` if they installed the subscriber and `False` if one was already installed, and raise `ValueError` for a level they cannot read, so calling both leaves the second with no effect and a `False` return. `init_file_logging()` raises `OSError` for a folder it cannot make or a log file it cannot open, and leaves logging as it was. `zeusdb_vector_database.is_logging_initialized()` reports whether either has run.
+**Only the first initializer to run takes effect.** Both functions return `True` if they installed the subscriber and `False` if one was already installed, and raise `ValueError` for a level they cannot read, so calling both leaves the second with no effect and a `False` return. Before logging is set up, `init_file_logging()` raises `OSError` for a folder it cannot make or a log file it cannot open, and leaves logging as it was. `zeusdb_vector_database.is_logging_initialized()` reports whether either has run.
 
 **The file target is drained at exit.** Records reach the file through a background writer, so a record emitted immediately before the process ends is still in flight when it ends. Importing the package registers the drain with `atexit`, which covers a normal exit and needs no call. `zeusdb_vector_database.shutdown_logging()` runs the same drain on demand and returns `True` if it drained a file appender, or `False` if there was nothing to drain, which is the answer for the `stdout` and `stderr` targets and for a second call. It closes the file, so records emitted after it are discarded. Nothing runs on `os._exit` or on a crash, and records still in flight at either are lost.
 
@@ -2741,9 +2741,6 @@ grep -E '"operation":"(pq|int8)_training' /var/log/zeusdb/app.log
 ```bash
 # Check if auto-logging is disabled
 echo $ZEUSDB_DISABLE_AUTO_LOGGING
-
-# Verify the level is one both layers accept
-ZEUSDB_LOG_LEVEL=debug python -c "import zeusdb_vector_database as z; print(z.is_logging_initialized())"
 ```
 
 **File logging not working?**

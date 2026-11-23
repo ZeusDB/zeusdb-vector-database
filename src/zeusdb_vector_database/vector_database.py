@@ -278,7 +278,7 @@ class VectorDatabase:
                       over the corpus at the moment of the query, so it takes
                       whole numbers above zero alone, and is the default where
                       a tokenizer is declared, since a text layer stores term
-                      counts; as a mapping, {"type": "bm25", "k1": 1.2,
+                      counts; as a dict, {"type": "bm25", "k1": 1.2,
                       "b": 0.75} sets its two parameters, k1 finite, at least
                       zero and at most 2^40, and b between zero and one.
                     - unlink: What a removal does to the record's postings,
@@ -534,28 +534,31 @@ class VectorDatabase:
         <path>.zdblock, while it reads where that file can be locked, and a
         journaled index keeps it until the index is dropped, so a second
         index on the same directory, in this process or another, raises
-        RuntimeError (CollectionLocked). A journaled directory this process
-        cannot write, such as one on read-only media, opens read only with a
-        RuntimeWarning: every record is replayed in memory, nothing on the
-        medium changes, every change is refused with RuntimeError
+        RuntimeError (CollectionLocked). A journaled directory on a medium
+        that refuses writes, or one this process has no permission to write,
+        opens read only with a RuntimeWarning: every record is replayed in
+        memory, nothing on the medium changes, add() names every record in
+        errors, every other change is refused with RuntimeError
         (CollectionReadOnly), and save() into another directory copies it
         somewhere writable. A directory holding a feature this build does
         not know, which its manifest marks read_only, opens read only the
         same way whatever the medium, where its journal holds no record of a
-        kind this build does not know, and there every change, every save,
-        checkpoint(), journal_to() and backup() is refused with RuntimeError
-        (FeatureReadOnly). A journaled directory below format 5.0.0 whose
-        identity records the largest generation a manifest can hold opens
-        read only the same way, since its upgrade is a save and no save can
-        record the generation after it, and every change, save, checkpoint()
-        and backup() is refused with RuntimeError naming that generation. A
-        directory a release before 0.14.0 wrote from values past a bound,
-        being a stored vector of an l2, dot or l1 index whose Euclidean norm
-        passes 2^62, a codebook value past 2^62, a scale past the largest one
-        vectors within 2^62 fit, a sparse value whose magnitude passes 2^40
-        or a term weighting k1 past 2^40, opens read only the same way,
-        journaled or not and whatever the medium: a RuntimeWarning names the
-        value, its file and the bound, and every change, save, checkpoint()
+        kind this build does not know, and there add() names every record in
+        errors, and every other change, every save, checkpoint(), journal_to()
+        and backup() is refused with RuntimeError (FeatureReadOnly). A
+        journaled directory below format 5.0.0 whose identity records the
+        largest generation a manifest can hold opens read only the same way,
+        since its upgrade is a save and no save can record the generation
+        after it, and add() names every record in errors, and every other
+        change, save, checkpoint() and backup() is refused with RuntimeError
+        naming that generation. A directory a release before 0.14.0 wrote
+        from values past a bound, being a stored vector of an l2, dot or l1
+        index whose Euclidean norm passes 2^62, a codebook value past 2^62, a
+        scale past the largest one vectors within 2^62 fit, a sparse value
+        whose magnitude passes 2^40 or a term weighting k1 past 2^40, opens
+        read only the same way, journaled or not and whatever the medium: a
+        RuntimeWarning names the value, its file and the bound, add() names
+        every record in errors, and every other change, save, checkpoint()
         and backup() is refused with RuntimeError in the same words.
 
         Args:

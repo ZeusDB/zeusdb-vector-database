@@ -201,8 +201,8 @@ def test_a_dump_refused_on_its_rows_refuses_the_load(tmp_path):
     assert str(refused.value) == (
         "The graph dump hnsw_index.zdbgraph cannot be used, since its rows region fails its "
         "checksum. At format 5.0.0 the dump holds the only copy of each record's stored "
-        "vector or code, so the directory cannot open without it. Restore the directory from "
-        "a copy, such as one backup() wrote.")
+        "vector, code or row, so the directory cannot open without it. Restore the directory "
+        "from a copy, such as one backup() wrote.")
 
 
 @pytest.mark.parametrize("quantization", [None, PQ_ONLY, INT8])

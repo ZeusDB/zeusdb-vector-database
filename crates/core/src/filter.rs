@@ -352,9 +352,9 @@ fn check_depth(key: &str, depth: usize) -> Result<(), Error> {
 /// rather than by quietly selecting the wrong records.
 fn reserved_key_error(key: &str, condition: &Value) -> Error {
     let shape = if key == GROUP_NOT {
-        "one filter mapping, for example {\"$not\": {\"lang\": \"en\"}}"
+        "one filter, for example {\"$not\": {\"lang\": \"en\"}}"
     } else {
-        "a list of filter mappings, for example {\"$or\": [{\"lang\": \"en\"}, {\"lang\": \"es\"}]}"
+        "a list of filters, for example {\"$or\": [{\"lang\": \"en\"}, {\"lang\": \"es\"}]}"
     };
     Error::ReservedKeyShape {
         key: key.to_string(),

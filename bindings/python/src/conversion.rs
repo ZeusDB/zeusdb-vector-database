@@ -60,7 +60,7 @@ pub(crate) fn count_if_given(
 /// same function.
 pub(crate) const MAX_VALUE_DEPTH: usize = zeusdb_vector_core::METADATA_MAX_DEPTH;
 
-/// A Python mapping as a metadata map, held to the metadata rule.
+/// A Python dict as a metadata map, held to the metadata rule.
 ///
 /// A record's metadata, the metadata `update_metadata` replaces and every
 /// filter come through here. Each value is a metadata value, by
@@ -81,19 +81,21 @@ pub(crate) fn python_dict_to_value_map(
     Ok(map)
 }
 
-/// One metadata value as a `Value`, a record's metadata entry that is not
-/// a mapping being one.
+/// A record's metadata entry that is not a dict, as the `Value` the record
+/// keeps under `text` or `value`. That field is level two of the record's
+/// mapping, so the entry is held to the depth of a field's value.
 ///
 /// A metadata value is `None`, a `bool`, an integer from -2^63 to 2^63 - 1,
-/// a finite float, a `str`, a list of metadata values or a mapping of `str`
-/// keys to metadata values, nested at most [`MAX_VALUE_DEPTH`] levels. Each
+/// a finite float, a `str`, a list of metadata values or a dict of `str`
+/// keys to metadata values, nested at most [`MAX_VALUE_DEPTH`] levels,
+/// counting the record's mapping as level one. Each
 /// comes back as the value it was, so any other value is refused, naming
 /// where it sits: a type JSON does not hold with `TypeError`, and a float
 /// that is not finite or an integer outside that range with `ValueError`.
 /// A `numpy` integer, float or bool and a `str` subclass are read by their
 /// value, which comes back exact.
 pub(crate) fn metadata_value(py_obj: &Bound<PyAny>) -> PyResult<Value> {
-    convert_value(py_obj, 1, Rule::Metadata).map_err(Refused::into_error)
+    convert_value(py_obj, 2, Rule::Metadata).map_err(Refused::into_error)
 }
 
 /// One field of a declaration as a `Value`, for the parser of the

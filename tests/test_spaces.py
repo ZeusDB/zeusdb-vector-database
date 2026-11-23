@@ -409,7 +409,7 @@ def one_error(index, record):
 
 
 @pytest.mark.parametrize("sparse,fragment", [
-    ("nope", "'sparse' must be a mapping {'dims': [...], 'values': [...]}, got str"),
+    ("nope", "'sparse' must be a dict {'dims': [...], 'values': [...]}, got str"),
     ({"values": [1.0]}, "'sparse' is missing 'dims'"),
     ({"dims": [1]}, "'sparse' is missing 'values'"),
     ({"dims": [1], "values": [1.0], "extra": 1},
@@ -1089,11 +1089,11 @@ def test_explain_reports_the_plan_without_running_the_query():
 
 
 @pytest.mark.parametrize("arms,klass,fragment", [
-    ("nope", TypeError, "arms must be a list of mappings"),
-    ({"vector": [1.0] * DIM}, TypeError, "arms must be a list of mappings"),
+    ("nope", TypeError, "arms must be a list of dicts"),
+    ({"vector": [1.0] * DIM}, TypeError, "arms must be a list of dicts"),
     ([], ValueError, "A query needs at least one arm"),
     ([{"vector": [1.0] * DIM}] * 9, ValueError, "A query names at most 8 arms, got 9"),
-    ([[1.0] * DIM], TypeError, "arms[0] must be a mapping naming one of 'vector', 'sparse' or 'text', got list"),
+    ([[1.0] * DIM], TypeError, "arms[0] must be a dict naming one of 'vector', 'sparse' or 'text', got list"),
     ([{}], ValueError, "arms[0] names none of 'vector', 'sparse' or 'text'"),
     ([{"vector": None, "text": None}], ValueError, "arms[0] names none of"),
     ([{"vector": [1.0] * DIM, "text": "x"}], ValueError, "arms[0] names 'vector' and 'text'"),
@@ -1114,7 +1114,7 @@ def test_explain_reports_the_plan_without_running_the_query():
      "Sparse vector dims must be strictly increasing"),
     ([{"sparse": {"dims": [1], "values": [1.0, 2.0]}}], ValueError, "Sparse vector has 1 dims and 2 values"),
     ([{"sparse": {"dims": [1], "values": [math.inf]}}], ValueError, "Sparse vector contains invalid value"),
-    ([{"sparse": [1, 2]}], ValueError, "arms[0] 'sparse' must be a mapping {'dims': [...], 'values': [...]}, got list"),
+    ([{"sparse": [1, 2]}], ValueError, "arms[0] 'sparse' must be a dict {'dims': [...], 'values': [...]}, got list"),
     ([{"sparse": {"dims": [-1], "values": [1.0]}}], ValueError, "arms[0] 'sparse' dim -1 is outside"),
     ([{"text": 5}], TypeError, "arms[0]['text'] must be a str, got int"),
     ([{"text": "x", "idf": "sometimes"}], ValueError, "arms[0]['idf'] is 'sometimes', and it is 'corpus'"),
@@ -1143,7 +1143,7 @@ def test_query_and_explain_refuse_a_malformed_query(arms, klass, fragment):
      "fusion carries 'weights', and a fusion is {'type': 'rrf', 'k': 60.0}"),
     ({"fusion": {"k": 3}}, ValueError, "fusion is missing 'type'"),
     ({"fusion": {"type": "rrf", "k": "x"}}, TypeError, "fusion['k'] must be a number"),
-    ({"fusion": 60}, TypeError, "fusion must be 'rrf' or a mapping"),
+    ({"fusion": 60}, TypeError, "fusion must be 'rrf' or a dict"),
     ({"filter": {"cat": {"regex": "x"}}}, ValueError, "Unknown filter operation: regex"),
 ])
 def test_query_and_explain_refuse_bad_query_arguments(kwargs, klass, fragment):

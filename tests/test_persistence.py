@@ -2232,8 +2232,8 @@ def test_load_refuses_a_missing_vectors_bin_under_quantized_with_raw(tmp_path):
         "vectors.bin": "vectors.bin holds the raw vector of every record",
         "quantization.json": ("quantization.json holds the quantization "
                               "configuration of either scheme"),
-        "hnsw_index.zdbgraph": ("hnsw_index.zdbgraph holds the graph and the stored vector "
-                                "or code of every record"),
+        "hnsw_index.zdbgraph": ("hnsw_index.zdbgraph holds the graph and the stored vector, "
+                                "code or row of every record"),
     }
     for name, phrase in expected.items():
         work = tmp_path / f"qraw-refusal-{name}.zdb"

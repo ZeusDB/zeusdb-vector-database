@@ -825,3 +825,109 @@ def test_the_package_imports_where_the_engine_cannot_open_the_log_file(tmp_path,
         "import zeusdb_vector_database as z\nprint('imported')\n",
         ZEUSDB_LOG_TARGET="file", ZEUSDB_LOG_FILE=target)
     assert out.strip().splitlines()[-1] == "imported", (out, err[-400:])
+
+
+# ------------------------------------------------------------
+# A word that names no level
+# ------------------------------------------------------------
+@pytest.mark.parametrize("level", ["verbose", "warnin"])
+@pytest.mark.parametrize("call", ["init_logging", "init_file_logging"])
+def test_a_word_that_names_no_level_raises_value_error_and_logging_still_starts(tmp_path, call,
+                                                                               level):
+    """A level that is one word naming no level, such as a misspelt one,
+    raises ValueError naming it before logging is set up, so a later call
+    with a level it reads still sets it up."""
+    script = rf"""
+import zeusdb_vector_database as z
+call = z.{call}
+args = ({str(tmp_path / "logs")!r},) if "{call}" == "init_file_logging" else ()
+try:
+    print("returned", call(*args, level={level!r}))
+except ValueError as error:
+    print("refused", error)
+print("then", call(*args, level="info"))
+"""
+    lines = _stdout_with_auto_logging_off(script).splitlines()
+    assert lines == [
+        f"refused {call}() takes a level such as 'info' or a filter such as "
+        f"'zeusdb_vector_database=debug', and cannot read '{level}': it names no level.",
+        "then True"], lines
+
+
+def test_a_filter_naming_the_engine_alone_is_read():
+    """A level that names the engine's own target is a filter of it at
+    every level, so the engine's records at info are written."""
+    script = r"""
+import numpy as np
+import zeusdb_vector_database as z
+print("returned", z.init_logging(level="zeusdb_vector_database"))
+index = z.VectorDatabase().create("hnsw", dim=2, expected_size=10)
+index.add({"ids": ["a"], "embeddings": np.ones((1, 2), dtype=np.float32)})
+"""
+    out = _stdout_with_auto_logging_off(script)
+    assert "returned True" in out.splitlines(), out[-400:]
+    assert "Vector addition completed" in out, out[-400:]
+
+
+# ------------------------------------------------------------
+# A log file the engine cannot open is warned of
+# ------------------------------------------------------------
+def _engine_records(text):
+    """The engine's JSON records in `text`, being those that carry
+    `fields`."""
+    return [entry for entry in _json_lines(text) if "fields" in entry]
+
+
+def test_the_engine_warns_where_it_cannot_open_the_log_file(tmp_path):
+    """Where ZEUSDB_LOG_FILE names a file the engine cannot open, being a
+    folder, the engine writes its records to stderr, writes no record saying
+    it writes the file, and warns, naming the file, the cause and stderr."""
+    out, err = _run_script_with_logging_env(
+        "import zeusdb_vector_database as z\nprint('imported')\n",
+        ENVIRONMENT="development", ZEUSDB_LOG_TARGET="file", ZEUSDB_LOG_FILE=str(tmp_path),
+        ZEUSDB_LOG_LEVEL="info", ZEUSDB_LOG_FORMAT="json")
+    assert out.strip() == "imported", (out, err[-400:])
+    records = _engine_records(err)
+    messages = [record["fields"].get("message", "") for record in records]
+    assert "ZeusDB file logging writing to resolved path" not in messages, messages
+    warned = [record["fields"] for record in records if record["level"] == "WARN"
+              and record["fields"].get("operation") == "logging_init_file"]
+    assert len(warned) == 1, messages
+    assert os.path.samefile(warned[0]["log_file"].removeprefix("\\\\?\\"), tmp_path), warned
+    assert warned[0]["message"] == (
+        "ZeusDB file logging cannot open the resolved path, so the engine's records go to "
+        "stderr. Set ZEUSDB_LOG_FILE to a file this process can write"), warned
+    assert warned[0]["error"], warned
+
+
+# ------------------------------------------------------------
+# An unrecognised ZEUSDB_LOG_FORMAT runs the engine at the default
+# ------------------------------------------------------------
+_CREATE = r"""
+import zeusdb_vector_database as z
+z.VectorDatabase().create("hnsw", dim=2, expected_size=10)
+print("created")
+"""
+
+
+def test_an_unrecognised_format_runs_the_engine_at_the_default_it_names(tmp_path):
+    """Where ZEUSDB_LOG_FORMAT is unrecognised, the Python layer says it
+    uses the environment's default, and the engine writes that format to the
+    target named: JSON to stderr in production, and human records to the
+    file ZEUSDB_LOG_FILE names in development."""
+    out, err = _run_script_with_logging_env(
+        _CREATE, ENVIRONMENT="production", ZEUSDB_LOG_FORMAT="xml", ZEUSDB_LOG_LEVEL="info",
+        ZEUSDB_LOG_TARGET="stderr")
+    assert out.strip() == "created", (out, err[-400:])
+    messages = [record["fields"].get("message") for record in _engine_records(err)]
+    assert "HNSW index created successfully" in messages, err[-600:]
+
+    log_file = tmp_path / "engine.log"
+    out, err = _run_script_with_logging_env(
+        _CREATE, ENVIRONMENT="development", ZEUSDB_LOG_FORMAT="xml", ZEUSDB_LOG_LEVEL="info",
+        ZEUSDB_LOG_TARGET="file", ZEUSDB_LOG_FILE=str(log_file))
+    assert out.strip() == "created", (out, err[-400:])
+    assert "Using default: human" in err, err[-600:]
+    assert "HNSW index created successfully" not in err, err[-600:]
+    written = log_file.read_text(encoding="utf-8", errors="ignore")
+    assert "HNSW index created successfully" in written, written[-600:]

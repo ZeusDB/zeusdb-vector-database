@@ -14,7 +14,7 @@
 //! ├── quantization.json       # quantization configuration and training state (if enabled)
 //! ├── pq_centroids.bin        # PQ centroids (if trained)
 //! ├── int8_scales.zdbint8     # the scales of a scalar quantized index, one a dimension (if trained)
-//! ├── hnsw_index.zdbgraph     # the graph and the stored vector or code of every record
+//! ├── hnsw_index.zdbgraph     # the graph and the stored vector, code or row of every record
 //! └── spaces/                 # one directory per sparse space, where one is declared
 //!     └── <name>/
 //!         ├── postings.zdbsparse  # every live record's term ids and weights
@@ -39,9 +39,10 @@
 //! only copy of each record's row. A 5.x directory holds no `pq_codes.bin`
 //! and no `int8_rows.zdbint8`, and holds `vectors.bin` only beside a trained
 //! product quantized graph under `quantized_with_raw`. A release reading 1.x
-//! to 4.x alone refuses such a directory at its version check. Every field
-//! of a 5.x manifest is held to what a save writes, and `metadata.json`
-//! names only the records that hold a field, in increasing internal id.
+//! to 4.x alone refuses such a directory at its version check. A load holds
+//! a 5.x manifest's fields to the rules `check_manifest_fields` and
+//! `check_quantization_fields` state, and `metadata.json` names only the
+//! records that hold a field, in increasing internal id.
 //! A 5.x manifest lists its features and records its identity with the
 //! journal sequence its state holds, and one missing either is refused.
 //!
@@ -218,8 +219,9 @@ const FEATURES_FORMAT_MAJOR: u32 = 4;
 const SEGMENTED_FORMAT_MAJOR: u32 = 5;
 
 /// The first major whose graph dump is version 2 and holds the only copy of
-/// each record's row, whose manifest's fields are each held to what a save
-/// writes, and whose `metadata.json` is compact.
+/// each record's row, whose manifest's fields a load holds to the rules of
+/// `check_manifest_fields` and `check_quantization_fields`, and whose
+/// `metadata.json` is compact.
 const DUMP_V2_FORMAT_MAJOR: u32 = 5;
 
 /// Bytes in a mebibyte, which `total_size_mb` counts in.
@@ -546,7 +548,7 @@ fn artefact_contents(name: &str) -> &'static str {
         "pq_codes.bin" => "the quantized code of every record",
         INT8_SCALES_FILENAME => INT8_SCALES_CONTENTS,
         INT8_ROWS_FILENAME => INT8_ROWS_CONTENTS,
-        GRAPH_DUMP_FILENAME => "the graph and the stored vector or code of every record",
+        GRAPH_DUMP_FILENAME => "the graph and the stored vector, code or row of every record",
         _ if name.ends_with("/postings.zdbsparse") => {
             "the postings of a sparse space, being every record's term ids and weights"
         }
@@ -4104,9 +4106,12 @@ fn read_checkpoint(
             .and_then(|record| record.sequence)
             .filter(|_| major >= SEGMENTED_FORMAT_MAJOR)
             .unwrap_or(0);
+        // A save records an RFC 3339 time and a 5.x manifest is held to one,
+        // so a value below 5.x that is not one is no save time.
         restored_index.set_lineage(&IdentityRecord {
             identity,
-            saved_at: Some(manifest.saved_at.clone()),
+            saved_at: Some(manifest.saved_at.clone())
+                .filter(|value| chrono::DateTime::parse_from_rfc3339(value).is_ok()),
             sequence,
         });
     }

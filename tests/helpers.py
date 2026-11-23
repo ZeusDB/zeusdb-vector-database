@@ -429,6 +429,24 @@ def as_old_wire(directory, version):
     (directory / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
 
+def vector_layouts(vector):
+    """`vector` as one dimensional arrays that are not contiguous, being a
+    column of a two dimensional array, a reversed view and a stepped view,
+    every one of them holding the same values."""
+    import numpy as np
+    grid = np.zeros((len(vector), 3), dtype=vector.dtype)
+    grid[:, 1] = vector
+    backwards = np.ascontiguousarray(vector[::-1])
+    spaced = np.zeros(2 * len(vector), dtype=vector.dtype)
+    spaced[::2] = vector
+    held = {"a column": grid[:, 1], "a reversed view": backwards[::-1],
+            "a stepped view": spaced[::2]}
+    for name, array in held.items():
+        assert array.ndim == 1 and not array.flags["C_CONTIGUOUS"], name
+        assert np.array_equal(array, vector), name
+    return held
+
+
 def layouts(rows):
     """`rows` C-ordered, Fortran-ordered and as a strided view, every one of
     them holding the same rows."""

@@ -1199,7 +1199,7 @@ impl fmt::Display for Error {
 
             FilterBranchNotMapping { key, found } => write!(
                 f,
-                "Every entry of \"{}\" must be a filter mapping, for example \
+                "Every entry of \"{}\" must be a filter, for example \
                  {{\"lang\": \"en\"}}, but one of them is {}.",
                 key, found
             ),
@@ -2152,8 +2152,8 @@ impl fmt::Display for Error {
             GraphDumpInvalid { name, detail } => write!(
                 f,
                 "The graph dump {} cannot be used, since {}. At format 5.0.0 the dump holds the \
-                 only copy of each record's stored vector or code, so the directory cannot open \
-                 without it. Restore the directory from a copy, such as one backup() wrote.",
+                 only copy of each record's stored vector, code or row, so the directory cannot \
+                 open without it. Restore the directory from a copy, such as one backup() wrote.",
                 name, detail
             ),
             ManifestFieldInvalid { detail } => write!(

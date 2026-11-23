@@ -442,13 +442,15 @@ where
     /// candidates at the head of the heap are its twins, a twin being a
     /// candidate whose stored row equals `data`.
     ///
-    /// **Twins take one place.** A twin ties with the query against every
-    /// other candidate, so with a tie kept every twin at the head of the heap
-    /// would be kept in turn, and enough copies of one row would fill the
-    /// list with copies alone. The first twin popped is set aside instead,
-    /// takes one place of the budget and joins the list at the end, every
-    /// further twin at the head is pruned, and the rule runs over the
-    /// candidates after them.
+    /// **Twins at the head of the heap take one place.** Where the candidates
+    /// outnumber the list, a twin ties with the query against every other
+    /// candidate, so with a tie kept every twin at the head of the heap would
+    /// be kept in turn, and enough copies of one row would fill the list with
+    /// copies alone. The first twin popped is set aside instead, takes one
+    /// place of the budget and joins the list at the end, every further twin
+    /// at the head is pruned, and the rule runs over the candidates after
+    /// them, a twin among them kept or pruned as any candidate is. Where the
+    /// candidates fit the list, every one is kept.
     fn select_neighbours<P: Path<T, D>>(
         &self,
         path: P,
@@ -476,7 +478,7 @@ where
 
         // The twins at the head of the candidates, the first set aside and
         // the rest pruned, before the rule runs over the candidates after
-        // them. See "Twins take one place" above.
+        // them. See "Twins at the head of the heap take one place" above.
         let mut twin = None;
         let mut asked = nb_neighbours_asked;
         while let Some(first) = candidates.peek() {

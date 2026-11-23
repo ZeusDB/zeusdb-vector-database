@@ -990,11 +990,11 @@ def test_a_malformed_group_is_refused_before_any_record_is_read(operator_index):
     with pytest.raises(ValueError, match="reserved filter key"):
         filtered_ids(index, {"$and": 3})
 
-    # A branch of a group is a filter mapping, not a bare value.
-    with pytest.raises(ValueError, match="must be a filter mapping"):
+    # A branch of a group is a filter, not a bare value.
+    with pytest.raises(ValueError, match="must be a filter, for example"):
         filtered_ids(index, {"$or": ["count", 10]})
 
-    # `$not` takes one filter mapping rather than a list, so there is no
+    # `$not` takes one filter rather than a list, so there is no
     # convention to guess about how a list under it would combine.
     with pytest.raises(ValueError, match="reserved filter key"):
         filtered_ids(index, {"$not": [{"count": 10}]})

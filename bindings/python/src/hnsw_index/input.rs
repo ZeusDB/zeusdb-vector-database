@@ -14,7 +14,7 @@
 //! # The sparse half of a record
 //!
 //! A record may fill the collection's sparse space as well as the dense
-//! one, under one of two keys. `sparse` is a mapping `{"dims": [...],
+//! one, under one of two keys. `sparse` is a dict `{"dims": [...],
 //! "values": [...]}` of term ids and weights, parallel and sorted by id,
 //! and `text` is a string the space's text layer counts into term ids. In
 //! the single object and list shapes each record carries its own; in the
@@ -33,21 +33,22 @@
 //! # A record's metadata
 //!
 //! Every shape reads a record's metadata entry by one rule, `metadata_entry`.
-//! A mapping is converted key by key, a string is kept under `text`, any
-//! other value is kept under `value`, and `None` or an absent entry is no
+//! A dict is converted key by key, a string is kept under `text`, any other
+//! value is kept under `value`, and `None` or an absent entry is no
 //! metadata. Every value is a metadata value by `conversion::metadata_value`,
 //! being what JSON holds, so it comes back as the value it was. A record
 //! whose entry does not convert, through a key that is not a string, a value
-//! nested past `conversion::MAX_VALUE_DEPTH` levels or a value of any other
-//! kind, is that record's error, named `Metadata error` with the
-//! conversion's own words, and is found before the record takes a generated
-//! id.
+//! nested past `conversion::MAX_VALUE_DEPTH` levels, counting the record's
+//! mapping as level one, or a value of any other kind, is that record's
+//! error, named `Metadata error` with the conversion's own words, and is
+//! found before the record takes a generated id.
 
 use super::HNSWIndex;
 use crate::conversion::{metadata_value, python_dict_to_value_map};
 use crate::PyEngineError;
 use numpy::{
-    PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray2, PyUntypedArray, PyUntypedArrayMethods,
+    PyArray, PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray2, PyUntypedArray,
+    PyUntypedArrayMethods,
 };
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PySequence, PyString};
@@ -114,7 +115,7 @@ fn record_id(item: Option<Bound<PyAny>>) -> Result<Option<String>, String> {
 /// The two keys a sparse vector mapping carries.
 const SPARSE_VECTOR_KEYS: [&str; 2] = ["dims", "values"];
 
-/// A sparse vector out of a mapping `{"dims": [...], "values": [...]}`.
+/// A sparse vector out of a dict `{"dims": [...], "values": [...]}`.
 ///
 /// The dims are read as integers and held to the width of a term id, the
 /// values as numbers, from a list or a one dimensional array of either. The
@@ -126,7 +127,7 @@ const SPARSE_VECTOR_KEYS: [&str; 2] = ["dims", "values"];
 pub(super) fn extract_sparse_vector(value: &Bound<PyAny>) -> Result<SparseVector, String> {
     let dict = value.cast::<PyDict>().map_err(|_| {
         format!(
-            "'sparse' must be a mapping {{'dims': [...], 'values': [...]}}, got {}",
+            "'sparse' must be a dict {{'dims': [...], 'values': [...]}}, got {}",
             value
                 .get_type()
                 .name()
@@ -289,12 +290,13 @@ impl<'py> Rows<'py> {
 
 /// `array` as a C-ordered array of the same values: `array` itself where it
 /// is one, and NumPy's `ascontiguousarray` of it otherwise, so its slice
-/// holds its rows one after another whatever its layout in memory, a
-/// Fortran-ordered or a strided array among them. `add` and `search` read a
-/// two dimensional array through this.
-pub(super) fn c_ordered<'py, T: numpy::Element>(
-    array: &Bound<'py, PyArray2<T>>,
-) -> PyResult<Bound<'py, PyArray2<T>>> {
+/// holds its values in row order whatever its layout in memory, a
+/// Fortran-ordered, a strided or a reversed array among them. `add`,
+/// `search` and `query` read an array's buffer only where it is C-ordered,
+/// and read this copy of it where it is not.
+pub(super) fn c_ordered<'py, T: numpy::Element, D: numpy::ndarray::Dimension>(
+    array: &Bound<'py, PyArray<T, D>>,
+) -> PyResult<Bound<'py, PyArray<T, D>>> {
     if array.is_c_contiguous() {
         return Ok(array.clone());
     }
@@ -302,7 +304,7 @@ pub(super) fn c_ordered<'py, T: numpy::Element>(
     let copy = py
         .import(pyo3::intern!(py, "numpy"))?
         .call_method1(pyo3::intern!(py, "ascontiguousarray"), (array,))?;
-    Ok(copy.cast_into::<PyArray2<T>>()?)
+    Ok(copy.cast_into::<PyArray<T, D>>()?)
 }
 
 /// Every value of `values` narrowed to `f32`, the rounding `extract::<f32>`
@@ -342,13 +344,13 @@ fn metadata_error(e: PyErr) -> String {
 }
 
 /// A record's metadata entry, read by the one rule every shape keeps: a
-/// mapping converted key by key, a string kept under `text`, any other value
+/// dict converted key by key, a string kept under `text`, any other value
 /// kept under `value`, and `None` as no metadata. Every value is held to
 /// `conversion::metadata_value`'s rule, so the converted value is a string
 /// exactly where the entry is one. An entry that does not convert, through a
 /// key that is not a string, a value nested past
-/// `conversion::MAX_VALUE_DEPTH` levels or a value the rule refuses, is the
-/// record's error.
+/// `conversion::MAX_VALUE_DEPTH` levels, counting the record's mapping as
+/// level one, or a value the rule refuses, is the record's error.
 fn metadata_entry(entry: &Bound<PyAny>) -> Result<HashMap<String, Value>, String> {
     if entry.is_none() {
         return Ok(HashMap::new());
@@ -614,7 +616,7 @@ impl HNSWIndex {
         // the same rule.
         for (field, singular) in [
             ("ids", "id"),
-            (metadata_field, "metadata mapping"),
+            (metadata_field, "metadata entry"),
             ("sparse", "sparse vector"),
             ("texts", "text"),
         ] {
@@ -1053,13 +1055,15 @@ impl HNSWIndex {
     /// One record's vector, checked and processed for the space, with a
     /// failure returned as words `add` reports against the record.
     ///
-    /// The two NumPy branches read their rows straight out of the buffer and
-    /// hold each to the same `Collection::screen_vector`, since a NaN that
+    /// The NumPy branch reads the values out of the array's buffer, or out of
+    /// a C-ordered copy where the array is not one, and every branch holds
+    /// the vector to the same `Collection::screen_vector`, since a NaN that
     /// reaches the graph degrades every later query rather than only the one
     /// that carried it.
     fn extract_single_vector_safe(&self, data: &Bound<PyAny>) -> Result<Vec<f32>, String> {
         let vector = if let Ok(array1d) = data.cast::<PyArray1<f32>>() {
-            array1d
+            c_ordered(array1d)
+                .map_err(|e| format!("NumPy access error: {}", e))?
                 .readonly()
                 .as_slice()
                 .map_err(|e| format!("NumPy access error: {}", e))?

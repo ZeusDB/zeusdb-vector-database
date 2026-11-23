@@ -1500,9 +1500,9 @@ impl Arm {
 
 /// Failures a test arms on a journal directory. A failing write lands half
 /// its bytes first, which is what a device that fills part way leaves.
-/// `dir_syncs` fails a sync of the directory's own entries, and `full_syncs`
+/// `dir_syncs` fails a sync of the directory's own entries, `full_syncs`
 /// a sync of a file's data and length together, which a segment's header
-/// takes.
+/// takes, and `removes` the deletion of a segment.
 #[derive(Debug, Default)]
 struct Faults {
     writes: Arm,
@@ -1511,6 +1511,7 @@ struct Faults {
     creates: Arm,
     dir_syncs: Arm,
     full_syncs: Arm,
+    removes: Arm,
     /// The segment the last sync reached, by its number.
     last_synced: AtomicUsize,
 }
@@ -1560,6 +1561,9 @@ impl JournalDir for FaultyDir {
         }))
     }
     fn remove_segment(&self, number: u64) -> std::io::Result<()> {
+        if self.faults.removes.trips() {
+            return Err(injected());
+        }
         self.inner.remove_segment(number)
     }
     fn sync(&self) -> std::io::Result<()> {
@@ -1690,6 +1694,31 @@ fn started(dir: Box<dyn JournalDir>) -> JournalWriter {
 
 fn message(error: Error) -> String {
     error.to_string()
+}
+
+/// A segment a checkpoint cannot delete stays in the journal and in
+/// `segments`, and keeps its length in `journal_bytes`, so `journal_bytes`
+/// is the length of every segment the journal holds.
+#[test]
+fn a_segment_a_checkpoint_cannot_delete_keeps_its_length_in_journal_bytes() {
+    let (_tmp, storage) = journal_storage();
+    let (dir, faults) = faulty(&storage);
+    let mut writer = started(dir);
+    writer.append(OperationKind::Insert, b"one").unwrap();
+    writer.append(OperationKind::Insert, b"two").unwrap();
+    writer.commit(CommitMode::Sync).unwrap();
+    let reached = writer.sequence_reached();
+    faults.removes.arm(0, 1);
+    writer.roll_to(base(LIVE + 1, reached)).unwrap();
+    let dir = storage.journal_dir();
+    let held = dir.segments().unwrap();
+    let lengths: u64 = held
+        .iter()
+        .map(|number| dir.read_segment(*number).unwrap().len() as u64)
+        .sum();
+    assert_eq!(held.len(), 2);
+    assert_eq!(writer.segments(), 2);
+    assert_eq!(writer.journal_bytes(), lengths);
 }
 
 /// A fresh writer holds no segment and appends nothing until the checkpoint

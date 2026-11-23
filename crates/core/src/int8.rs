@@ -17,14 +17,13 @@
 //! code `-128` is never written, so the codes are symmetric and a negated
 //! vector encodes to negated codes.
 //!
-//! A dimension whose sample holds only zeros gets a scale of one, so that
-//! it decodes to zero and a later non-zero value in it rounds to zero as
-//! well rather than saturating. That dimension carries nothing the sample
-//! could see, and a scale of one is the least surprising value for it. A
-//! dimension whose largest magnitude is so small that dividing it by 127
-//! rounds to zero in single precision takes a scale of one for the same
-//! reason, so every scale a fit produces is positive and a codec built from
-//! the scales again is the codec fitted.
+//! A dimension whose sample holds only zeros gets a scale of one, so it
+//! decodes to zero, and a later value in it is coded at that scale. That
+//! dimension carries nothing the sample could see, and a scale of one is
+//! the least surprising value for it. A dimension whose largest magnitude
+//! is so small that dividing it by 127 rounds to zero in single precision
+//! takes a scale of one for the same reason, so every scale a fit produces
+//! is positive and a codec built from the scales again is the codec fitted.
 //!
 //! # What is exact
 //!

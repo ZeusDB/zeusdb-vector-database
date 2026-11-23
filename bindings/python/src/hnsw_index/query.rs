@@ -1,6 +1,6 @@
 //! Reading a query out of Python, and writing its page and its plan back.
 //!
-//! A query is a list of arms, each a mapping naming one query on one space,
+//! A query is a list of arms, each a dict naming one query on one space,
 //! a filter every arm shares, the page size, the candidates each arm
 //! contributes and the fusion. What leaves `parse_query` is owned Rust
 //! holding no Python object, so the search runs with the interpreter lock
@@ -135,7 +135,7 @@ impl HNSWIndex {
     ) -> Result<ParsedQuery, PyEngineError> {
         let arms: Vec<Bound<PyAny>> = arms.extract().map_err(|_| {
             type_error(format!(
-                "arms must be a list of mappings, one per arm, got {}",
+                "arms must be a list of dicts, one per arm, got {}",
                 type_name(arms)
             ))
         })?;
@@ -160,12 +160,12 @@ impl HNSWIndex {
         })
     }
 
-    /// One arm: a mapping naming exactly one of `vector`, `sparse` or
+    /// One arm: a dict naming exactly one of `vector`, `sparse` or
     /// `text`, with the options that query takes and nothing else.
     fn parse_arm(&self, arm: &Bound<PyAny>, position: usize) -> Result<ParsedArm, PyEngineError> {
         let dict = arm.cast::<PyDict>().map_err(|_| {
             type_error(format!(
-                "arms[{}] must be a mapping naming one of 'vector', 'sparse' or 'text', \
+                "arms[{}] must be a dict naming one of 'vector', 'sparse' or 'text', \
                  got {}",
                 position,
                 type_name(arm)
@@ -276,14 +276,17 @@ impl HNSWIndex {
 /// either float width.
 fn dense_vector(value: &Bound<PyAny>, position: usize) -> Result<Vec<f32>, PyEngineError> {
     if let Ok(array) = value.cast::<PyArray1<f32>>() {
-        return Ok(array.readonly().as_slice()?.to_vec());
+        return Ok(super::input::c_ordered(array)?
+            .readonly()
+            .as_slice()?
+            .to_vec());
     }
     if let Ok(array) = value.cast::<PyArray1<f64>>() {
         #[expect(
             clippy::cast_possible_truncation,
             reason = "a value narrowed to the f32 the index stores, not an offset, a count, an index or an id"
         )]
-        return Ok(array
+        return Ok(super::input::c_ordered(array)?
             .readonly()
             .as_slice()?
             .iter()
@@ -322,7 +325,7 @@ fn parse_idf(dict: &Bound<PyDict>, position: usize) -> Result<IdfScope, PyEngine
     }
 }
 
-/// The fusion a query names: nothing, the name, or a mapping with the name
+/// The fusion a query names: nothing, the name, or a dict with the name
 /// and the constant.
 fn parse_fusion(value: Option<&Bound<PyAny>>) -> Result<Fusion, PyEngineError> {
     let Some(value) = value.filter(|value| !value.is_none()) else {
@@ -352,7 +355,7 @@ fn parse_fusion(value: Option<&Bound<PyAny>>) -> Result<Fusion, PyEngineError> {
         (kind, k)
     } else {
         return Err(type_error(format!(
-            "fusion must be 'rrf' or a mapping {{'type': 'rrf', 'k': 60.0}}, got {}",
+            "fusion must be 'rrf' or a dict {{'type': 'rrf', 'k': 60.0}}, got {}",
             type_name(value)
         )));
     };

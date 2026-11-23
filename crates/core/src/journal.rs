@@ -2783,15 +2783,18 @@ impl JournalWriter {
             length: SEGMENT_HEADER_BYTES as u64,
         });
         *self.lock_slot() = Some(file);
-        let mut doomed: Vec<u64> = self.others.drain(..).map(|o| o.number).collect();
+        // Each segment the checkpoint holds, by its number, with its length,
+        // which one that cannot be deleted keeps in `journal_bytes`.
+        let mut doomed: Vec<(u64, u64)> =
+            self.others.drain(..).map(|o| (o.number, o.bytes)).collect();
         if let Some(old) = old {
-            doomed.push(old.number);
+            doomed.push((old.number, old.length));
         }
         self.boundary_offset = SEGMENT_HEADER_BYTES as u64;
         self.follow(number, base);
         self.poisoned = None;
         doomed.sort_unstable();
-        for (n, segment) in doomed.into_iter().enumerate() {
+        for (n, (segment, bytes)) in doomed.into_iter().enumerate() {
             if let Err(error) = self.dir.remove_segment(segment) {
                 warn!(target: LOG_TARGET, operation = "journal_segment_kept",
                     journal = %self.path.display(),
@@ -2801,7 +2804,7 @@ impl JournalWriter {
                 );
                 self.others.push(Other {
                     number: segment,
-                    bytes: 0,
+                    bytes,
                     stale: true,
                 });
             }

@@ -16,6 +16,7 @@ loads the directory again.
 
 import gc
 import json
+import os
 import shutil
 
 import numpy as np
@@ -640,3 +641,68 @@ def test_deep_metadata_comes_back_after_a_replay_and_its_checkpoint(tmp_path, le
     loaded = VectorDatabase().load(str(path))
     for record in loaded.get_records(["k", "u"], return_vector=False):
         assert record["metadata"] == {"k": value}, record["id"]
+
+
+def kept_under(entry):
+    """The metadata a record whose entry `entry` is not a dict comes back
+    with."""
+    return {"text": entry} if isinstance(entry, str) else {"value": entry}
+
+
+@pytest.mark.parametrize("levels, innermost", [(126, 1), (127, None)],
+                         ids=["a-scalar-at-level-128", "a-list-at-level-128"])
+def test_every_entry_add_takes_comes_back_after_a_replay_and_its_checkpoint(tmp_path, levels,
+                                                                            innermost):
+    """Every metadata entry add() takes is journaled, comes back after a
+    replay, and comes back again after a checkpoint of the replayed index and
+    a load of it: a str, an int, and a list at level 128 and one a level
+    deeper, each where add() takes it."""
+    entries = {"s": "a str", "i": 7, "at": lists(levels, innermost),
+               "past": lists(levels + 1, innermost)}
+    path = tmp_path / "entries.zdb"
+    index = VectorDatabase().create("hnsw", dim=2, expected_size=10)
+    index.journal_to(str(path))
+    taken = {}
+    for record_id, entry in entries.items():
+        if index.add({"id": record_id, "values": [0.1, 0.2], "metadata": entry}).is_success():
+            taken[record_id] = entry
+    assert {"s", "i", "at"} <= set(taken), sorted(taken)
+    del index
+    gc.collect()
+
+    replayed = VectorDatabase().load(str(path))
+    assert len(replayed) == len(taken)
+    for record_id, entry in taken.items():
+        assert replayed.get_records(record_id)[0]["metadata"] == kept_under(entry), record_id
+    replayed.checkpoint()
+    del replayed
+    gc.collect()
+    loaded = VectorDatabase().load(str(path))
+    assert len(loaded) == len(taken)
+    for record_id, entry in taken.items():
+        assert loaded.get_records(record_id)[0]["metadata"] == kept_under(entry), record_id
+
+
+# ------------------------------------------------------------
+# journal_bytes counts a segment a checkpoint cannot delete
+# ------------------------------------------------------------
+@pytest.mark.skipif(os.name != "nt", reason="an open file stops its deletion on Windows alone")
+def test_journal_bytes_counts_a_segment_a_checkpoint_cannot_delete(tmp_path):
+    """A segment a checkpoint cannot delete, being one another handle holds
+    open without leave to delete it, stays in the journal, is counted in
+    journal_segments, and adds its length to journal_bytes, which is the
+    length of every segment together. The journal's Rust tests hold the same
+    on every system."""
+    path = tmp_path / "kept.zdb"
+    index = build(20)
+    index.journal_to(str(path))
+    add(index, 20, 40)
+    [segment] = sorted(journal_of(path).glob("*.zdbseg"))
+    with open(segment, "rb"):
+        index.checkpoint()
+        stats = index.get_stats()
+        held = sorted(journal_of(path).glob("*.zdbseg"))
+        lengths = sum(each.stat().st_size for each in held)
+    assert len(held) == 2, held
+    assert stats["journal_segments"] == "2", stats["journal_segments"]
+    assert int(stats["journal_bytes"]) == lengths, (stats["journal_bytes"], lengths)

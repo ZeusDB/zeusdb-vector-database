@@ -421,6 +421,51 @@ def test_a_created_at_that_is_not_an_rfc_3339_time_is_replaced_at_the_load(tmp_p
 
 
 # ============================================================================
+# A SAVED_AT BELOW 5.0.0 THAT IS NOT AN RFC 3339 TIME
+# ============================================================================
+
+def with_saved_at(name, tmp_path, saved_at):
+    """A copy of the fixture `name` whose manifest records `saved_at`, and the
+    directory in it to load."""
+    path = opened_copy(name, tmp_path)
+    (path / "manifest.json").write_text(json.dumps(dict(manifest(path), saved_at=saved_at),
+                                                   indent=2), encoding="utf-8", newline="\n")
+    return path
+
+
+@pytest.mark.parametrize("name, how", [
+    ("v4.0.0-raw-l2", {}), ("v4.0.0-journaled-text", {"checkpoint_only": True}),
+], ids=["unjournaled", "journaled-checkpoint-only"])
+def test_a_saved_at_that_is_not_an_rfc_3339_time_reads_as_none_below_5_0_0(tmp_path, name, how):
+    """A directory below 5.0.0 whose manifest records saved_at as anything
+    but an RFC 3339 time opens with identity's saved_at None beside the
+    snapshot it records, since that manifest records no save time."""
+    path = with_saved_at(name, tmp_path, "yesterday")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        index = VectorDatabase().load(str(path), **how)
+    assert index.identity["snapshot"] is not None
+    assert index.identity["saved_at"] is None
+    del index
+    gc.collect()
+
+
+def test_a_journaled_upgrade_reports_the_time_of_its_own_save(tmp_path):
+    """A journaled directory below 5.0.0 that opens for writing upgrades at
+    its load, and identity's saved_at is the time its manifest records for
+    that save."""
+    path = with_saved_at("v4.0.0-journaled-text", tmp_path, "yesterday")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        index = VectorDatabase().load(str(path))
+    written = manifest(path)
+    assert written["format_version"] == "5.0.0"
+    assert index.identity["saved_at"] == written["saved_at"] != "yesterday"
+    del index
+    gc.collect()
+
+
+# ============================================================================
 # THE LARGEST GENERATION
 # ============================================================================
 

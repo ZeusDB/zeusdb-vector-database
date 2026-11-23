@@ -615,9 +615,9 @@ impl Identity {
 /// the manifest of the directory `snapshot` names records as its save, and
 /// the journal sequence that manifest records under `identity`.
 ///
-/// `saved_at` is `None` where `snapshot` is. `sequence` is 0 where the
-/// directory records none, which is every directory below format 5.0.0 and
-/// every collection never saved.
+/// `saved_at` is `None` where `snapshot` is, or where that manifest records
+/// no RFC 3339 time. `sequence` is 0 where the directory records none, which
+/// is every directory below format 5.0.0 and every collection never saved.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IdentityRecord {
     pub identity: Identity,

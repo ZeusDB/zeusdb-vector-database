@@ -9,7 +9,7 @@ import math
 import numpy as np
 import pytest
 from zeusdb_vector_database import VectorDatabase
-from helpers import assert_vectors_close, layouts
+from helpers import assert_vectors_close, layouts, vector_layouts
 
 # ------------------------------------------------------------
 # Test 3: Format 1 - Single Object
@@ -972,7 +972,7 @@ def test_a_record_refused_for_its_metadata_takes_no_generated_id():
 
 
 def test_every_shape_reads_a_metadata_entry_the_same_way():
-    """A mapping is the record's metadata, a string is kept under `text`, any
+    """A dict is the record's metadata, a string is kept under `text`, any
     other value under `value`, and `None` is no metadata, in each of the four
     shapes that carry metadata."""
     entries = [{"k": 1}, "plain words", 42, [1, 2], None]
@@ -1110,6 +1110,34 @@ def test_a_two_dimensional_array_is_read_by_rows_whatever_its_layout(dtype):
             assert added.ids == ["vec_1", "vec_2", "vec_3"], (name, shape, added.errors)
             stored = [index.get_records([i], return_vector=True)[0]["vector"] for i in added.ids]
             assert stored == rows.astype(np.float32).tolist(), (name, shape)
+
+
+# ------------------------------------------------------------
+# A one dimensional array is read by its values whatever its layout
+# ------------------------------------------------------------
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_a_one_dimensional_array_is_read_by_its_values_whatever_its_layout(dtype):
+    """add() stores a one dimensional array as NumPy defines its values,
+    whether it is a column, a reversed view or a stepped view, in every
+    shape that takes one vector."""
+    values = [1.0, 2.0, 3.0, 4.0]
+    for name, array in vector_layouts(np.array(values, dtype=dtype)).items():
+        for shape in ("single object", "list of records", "list batch", "bare",
+                      "list of vectors"):
+            index = VectorDatabase().create("hnsw", dim=4, space="l2", expected_size=10)
+            if shape == "single object":
+                added = index.add({"id": "x", "values": array})
+            elif shape == "list of records":
+                added = index.add([{"id": "x", "vector": array}])
+            elif shape == "list batch":
+                added = index.add({"ids": ["x"], "vectors": [array]})
+            elif shape == "bare":
+                added = index.add(array)
+            else:
+                added = index.add([array])
+            assert added.is_success(), (name, shape, added.errors)
+            [stored] = index.get_records(added.ids, return_vector=True)
+            assert stored["vector"] == values, (name, shape)
 
 
 # ------------------------------------------------------------
@@ -1301,6 +1329,55 @@ def test_deep_metadata_update_comes_back_after_a_save_and_a_load(tmp_path):
     index.save(str(tmp_path / "updated.zdb"))
     loaded = VectorDatabase().load(str(tmp_path / "updated.zdb"))
     assert loaded.get_records("u")[0]["metadata"]["k"] == value
+
+
+# ------------------------------------------------------------
+# A metadata entry that is not a dict is held to the depth it is kept at
+# ------------------------------------------------------------
+def _kept_under(entry):
+    """The metadata a record whose entry `entry` is not a dict comes back
+    with."""
+    return {"text": entry} if isinstance(entry, str) else {"value": entry}
+
+
+@pytest.mark.parametrize("levels, innermost", [(126, 1), (127, None)],
+                         ids=["a-scalar-at-level-128", "a-list-at-level-128"])
+def test_an_entry_that_is_not_a_dict_is_held_to_the_depth_of_the_value_it_is_kept_as(
+        levels, innermost):
+    """A metadata entry that is not a dict is kept under `value`, so it is
+    held to the depth a field's value is held to. A list entry that reaches
+    level 128 there is taken in every shape, and one a level deeper is
+    refused where it is written, in the words a field of a dict that deep is
+    refused in."""
+    for shape in METADATA_SHAPES:
+        index = VectorDatabase().create("hnsw", dim=2, expected_size=10)
+        field = add_with_metadata(index, shape, "f", {"value": _lists(levels + 1, innermost)})
+        assert field.errors == [f"Vector f: {DEPTH_WORDS}"], (shape, field.errors)
+        added = add_with_metadata(index, shape, "k", _lists(levels, innermost))
+        assert added.is_success(), (shape, added.errors)
+        deeper = add_with_metadata(index, shape, "d", _lists(levels + 1, innermost))
+        assert deeper.errors == [f"Vector d: {DEPTH_WORDS}"], (shape, deeper.errors)
+
+
+@pytest.mark.parametrize("levels, innermost", [(126, 1), (127, None)],
+                         ids=["a-scalar-at-level-128", "a-list-at-level-128"])
+def test_every_entry_add_takes_comes_back_after_a_save_and_a_load(tmp_path, levels, innermost):
+    """Every metadata entry add() takes comes back after a save and a load: a
+    str, an int, and a list at level 128 and one a level deeper, each where
+    add() takes it."""
+    entries = {"s": "a str", "i": 7, "at": _lists(levels, innermost),
+               "past": _lists(levels + 1, innermost)}
+    index = VectorDatabase().create("hnsw", dim=2, expected_size=10)
+    taken = {}
+    for record_id, entry in entries.items():
+        if index.add({"id": record_id, "values": [0.1, 0.2], "metadata": entry}).is_success():
+            taken[record_id] = entry
+    assert {"s", "i", "at"} <= set(taken), sorted(taken)
+    index.save(str(tmp_path / "entries.zdb"))
+    loaded = VectorDatabase().load(str(tmp_path / "entries.zdb"))
+    assert len(loaded) == len(taken)
+    for record_id, entry in taken.items():
+        assert loaded.get_records(record_id)[0]["metadata"] == _kept_under(entry), record_id
 
 
 # ------------------------------------------------------------

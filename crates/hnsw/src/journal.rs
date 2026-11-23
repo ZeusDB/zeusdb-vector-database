@@ -1241,9 +1241,9 @@ impl Recovery {
                 reason = reason.as_str(),
                 format_version = self.format_version.as_str(),
                 replayed = self.replayed,
-                "The directory was opened read only, since it holds a value past the bound on \
-                 a vector's norm; nothing on the medium changed, and every change, checkpoint \
-                 and save is refused"
+                "The directory was opened read only, since it holds a value past its bound; \
+                 nothing on the medium changed, and every change, checkpoint and save is \
+                 refused"
             );
             return;
         }

@@ -6,7 +6,7 @@ import pytest
 import struct
 
 import numpy as np
-from helpers import artefact_digest, layouts
+from helpers import artefact_digest, layouts, vector_layouts
 from zeusdb_vector_database import VectorDatabase
 
 # ------------------------------------------------------------
@@ -1392,6 +1392,36 @@ def test_a_query_batch_is_read_by_rows_whatever_its_layout(dtype):
         pages = index.search(batch, top_k=1)
         assert [page[0]["id"] for page in pages] == ["a", "b", "c"], name
         assert [page[0]["score"] for page in pages] == [0.0, 0.0, 0.0], name
+
+
+# ------------------------------------------------------------
+# A one dimensional query is read by its values whatever its layout
+# ------------------------------------------------------------
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_a_one_dimensional_query_is_read_by_its_values_whatever_its_layout(dtype):
+    """search() reads a one dimensional query as NumPy defines its values,
+    whether it is a column, a reversed view or a stepped view, and finds
+    what the same values as a list find."""
+    rows = np.arange(12, dtype=np.float32).reshape(3, 4) + 1
+    index = VectorDatabase().create("hnsw", dim=4, space="l2", expected_size=10)
+    assert index.add({"ids": ["a", "b", "c"], "embeddings": rows}).is_success()
+    for name, query in vector_layouts(rows[1].astype(dtype)).items():
+        page = index.search(query, top_k=1)
+        assert [(hit["id"], hit["score"]) for hit in page] == [("b", 0.0)], name
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_a_one_dimensional_dense_arm_is_read_by_its_values_whatever_its_layout(dtype):
+    """query() and explain() read a dense arm's one dimensional array as
+    NumPy defines its values, whether it is a column, a reversed view or a
+    stepped view, and query() finds what the same values as a list find."""
+    rows = np.arange(12, dtype=np.float32).reshape(3, 4) + 1
+    index = VectorDatabase().create("hnsw", dim=4, space="l2", expected_size=10)
+    assert index.add({"ids": ["a", "b", "c"], "embeddings": rows}).is_success()
+    listed = index.query(arms=[{"vector": rows[1].tolist()}], top_k=1)
+    for name, vector in vector_layouts(rows[1].astype(dtype)).items():
+        assert index.query(arms=[{"vector": vector}], top_k=1) == listed, name
+        assert index.explain([{"vector": vector}], top_k=1)["arms"], name
 
 
 # ------------------------------------------------------------
