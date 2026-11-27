@@ -14,7 +14,6 @@
 use super::insert::MutationGuard;
 use super::{Collection, QuantizationConfig, StorageMode, MAX_LAYER};
 use crate::{calibrate_rerank_from_sample, RerankCalibration};
-use chrono::Utc;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use std::sync::atomic::Ordering;
@@ -22,7 +21,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, info, instrument, trace, warn};
 use zeusdb_vector_core::{
-    Error, FittedRef, Int8Codec, Operation, OperationKind, Position, SeededRng, Values,
+    Error, FittedRef, Int8Codec, Operation, OperationKind, Position, SeededRng, Timestamp, Values,
     VectorGraph, Withdrawal, JOURNAL_MAX_PAYLOAD, PQ,
 };
 
@@ -119,7 +118,7 @@ impl Collection {
         // for the first time, and the stamp travels in the training's record,
         // so a replay installs the stamp the record carries and reads no
         // clock.
-        let completed_at = Utc::now().to_rfc3339();
+        let completed_at = Timestamp::now().to_rfc3339();
         let trained = self.fit_training(config)?;
         // The record carries everything the fit produced and commits alone,
         // before anything is installed. A record the sink refuses trains

@@ -257,7 +257,7 @@ pub(crate) fn holder_record(mode: LockMode) -> String {
         std::process::id(),
         host_name(),
         mode.name(),
-        chrono::Utc::now().to_rfc3339()
+        zeusdb_vector_core::Timestamp::now().to_rfc3339()
     )
 }
 
@@ -1657,7 +1657,7 @@ mod tests {
         assert_eq!(lines[2], "mode exclusive");
         let since = lines[3].strip_prefix("since ").unwrap();
         assert!(
-            chrono::DateTime::parse_from_rfc3339(since).is_ok(),
+            zeusdb_vector_core::Timestamp::parse_rfc3339(since).is_some(),
             "{since}"
         );
     }

@@ -12,14 +12,13 @@ use super::{
     QuantizationScheme, Space, SparseSpace, StorageMode, TextLayer, DEFAULT_SPACE, MAX_LAYER,
 };
 use crate::locks::{order, MutexAt, RwLockAt};
-use chrono::Utc;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tracing::{debug, error, info, trace};
 use zeusdb_vector_core::{
-    validate_indexed_fields, ColumnStore, Error, SizedMap, SpaceName, VectorGraph, PQ,
+    validate_indexed_fields, ColumnStore, Error, SizedMap, SpaceName, Timestamp, VectorGraph, PQ,
 };
 use zeusdb_vector_sparse::{PostingsIndex, SparseConfig};
 use zeusdb_vector_text::{TermDictionary, Tokenizer};
@@ -924,7 +923,7 @@ impl Collection {
             lineage: MutexAt::new(order::LINEAGE, super::Lineage::default()),
             training_ids: RwLockAt::new(order::TRAINING_IDS, Vec::new()),
             training_threshold_reached: AtomicBool::new(false),
-            created_at: RwLockAt::new(order::CREATED_AT, Utc::now().to_rfc3339()),
+            created_at: RwLockAt::new(order::CREATED_AT, Timestamp::now().to_rfc3339()),
             overgrowth_warned: AtomicBool::new(false),
             stopped: OnceLock::new(),
         }

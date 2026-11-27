@@ -629,9 +629,11 @@ class VectorDatabase:
 
         A directory below format 5.0.0 whose manifest records created_at as
         anything but an RFC 3339 time opens with its saved_at in its place,
-        or with the time of the load where that is not one either. A
-        RuntimeWarning names both values, index.recovery reports them under
-        "replaced", and the next save writes the value taken.
+        or with the time of the load where that is not one either. A time
+        whose offset's minus is U+2212, or whose second is 60 in any minute,
+        is read as one as well. A RuntimeWarning names both values,
+        index.recovery reports them under "replaced", and the next save
+        writes the value taken.
 
         Example:
             >>> vdb = VectorDatabase()

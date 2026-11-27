@@ -616,12 +616,13 @@ impl Identity {
 /// the journal sequence that manifest records under `identity`.
 ///
 /// `saved_at` is `None` where `snapshot` is, or where that manifest records
-/// no RFC 3339 time. `sequence` is 0 where the directory records none, which
-/// is every directory below format 5.0.0 and every collection never saved.
+/// no time `Timestamp::parse_rfc3339` reads. `sequence` is 0 where the
+/// directory records none, which is every directory below format 5.0.0 and
+/// every collection never saved.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IdentityRecord {
     pub identity: Identity,
-    /// The manifest's `saved_at`, an RFC 3339 time.
+    /// The manifest's `saved_at`, a time `Timestamp::parse_rfc3339` reads.
     pub saved_at: Option<String>,
     /// The identity's `sequence` in that manifest.
     pub sequence: u64,
@@ -1431,7 +1432,7 @@ pub struct Collection {
     /// Timestamp when the index was created, in RFC 3339.
     ///
     /// Restored from `manifest.json` by the loader. `new_empty` stamps
-    /// `Utc::now()` because it has nothing better to start from, and until the
+    /// `Timestamp::now()` because it has nothing better to start from, and until the
     /// loader wrote the saved value back over it a load reset the field, so a
     /// save of a loaded index recorded the load as the creation.
     created_at: RwLockAt<String>,

@@ -727,7 +727,7 @@ impl LogRotation {
             LogRotation::Never => String::new(),
             // tracing-appender formats a DAILY rotation as `{base}.{YYYY-MM-DD}`
             // against the UTC date.
-            LogRotation::Daily => format!(".{}", chrono::Utc::now().format("%Y-%m-%d")),
+            LogRotation::Daily => format!(".{}", zeusdb_vector_core::Timestamp::now().to_date()),
         }
     }
 }

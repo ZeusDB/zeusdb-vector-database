@@ -1848,7 +1848,7 @@ Every save records what the directory is in `manifest.json`, and an index report
 | `generation` | How many saves the index had made when it wrote, or read, its last directory. A new index is at 0, its first save writes 1, and each save writes one more |
 | `snapshot` | The id of the directory the index last saved or read, drawn at that save, or `None` before the first |
 | `parent` | The `snapshot` that directory was saved from, or `None` on a first save |
-| `saved_at` | The time, in RFC 3339, that directory's manifest records as its save, or `None` where `snapshot` is `None` or that manifest records no such time |
+| `saved_at` | The time that directory's manifest records as its save, which a save writes in RFC 3339, or `None` where `snapshot` is `None` or that manifest records no time a load reads |
 | `sequence` | The journal sequence that directory's manifest records under `identity`, or 0 where it records none |
 
 ```python

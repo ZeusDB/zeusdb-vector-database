@@ -1345,9 +1345,9 @@ impl HNSWIndex {
     /// - `snapshot`: the id of the directory the index last saved or read,
     ///   drawn at that save, or `None`.
     /// - `parent`: the snapshot that directory was saved from, or `None`.
-    /// - `saved_at`: the time, in RFC 3339, that directory's manifest
-    ///   records as its save, or `None` where `snapshot` is `None` or that
-    ///   manifest records no such time.
+    /// - `saved_at`: the time that directory's manifest records as its
+    ///   save, which a save writes in RFC 3339, or `None` where `snapshot` is
+    ///   `None` or that manifest records no time a load reads.
     /// - `sequence`: the journal sequence that directory's manifest records
     ///   under `identity`, or 0 where it records none.
     ///

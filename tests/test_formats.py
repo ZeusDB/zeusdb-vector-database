@@ -378,7 +378,7 @@ def loaded_with_warnings(path):
 ])
 def test_a_created_at_that_is_not_an_rfc_3339_time_is_replaced_at_the_load(tmp_path, name,
                                                                           saved_at):
-    """A directory below 5.0.0 whose created_at is not an RFC 3339 time opens
+    """A directory below 5.0.0 whose created_at is no time a load reads opens
     with its saved_at in its place, or with the time of the load where its
     saved_at is not one either. A save of it, and the upgrade a journaled
     directory takes at its load, write a manifest the next load opens with
@@ -438,7 +438,7 @@ def with_saved_at(name, tmp_path, saved_at):
 ], ids=["unjournaled", "journaled-checkpoint-only"])
 def test_a_saved_at_that_is_not_an_rfc_3339_time_reads_as_none_below_5_0_0(tmp_path, name, how):
     """A directory below 5.0.0 whose manifest records saved_at as anything
-    but an RFC 3339 time opens with identity's saved_at None beside the
+    but a time a load reads opens with identity's saved_at None beside the
     snapshot it records, since that manifest records no save time."""
     path = with_saved_at(name, tmp_path, "yesterday")
     with warnings.catch_warnings():

@@ -70,17 +70,16 @@ test-support = ["zeusdb-vector-core/pause-points", "zeusdb-vector-hnsw/pause-poi
 # Every version is the workspace's, declared once in the root Cargo.toml with
 # the reason for each pin. The index is zeusdb-vector-hnsw, taken by path,
 # the engine's floor it stands on is zeusdb-vector-core, taken the same way
-# for the error and filter types the entry points name, and this crate holds
-# what touches Python. Nothing here serialises to disk, forks or draws a
-# random number; the crates that do that are the index's. chrono stays for
-# the date the rotating log file is named by.
+# for the error and filter types the entry points name and the date the
+# rotating log file is named by, and this crate holds what touches Python.
+# Nothing here serialises to disk, forks or draws a random number; the
+# crates that do that are the index's.
 [dependencies]
 zeusdb-vector-core = { workspace = true }
 zeusdb-vector-hnsw = { workspace = true }
 pyo3 = { workspace = true }
 numpy = { workspace = true }
 serde_json = { workspace = true }
-chrono = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true }

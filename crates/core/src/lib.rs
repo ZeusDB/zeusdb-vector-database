@@ -1,7 +1,8 @@
 //! The engine's floor.
 //!
 //! What every index crate stands on, and it names nothing of Python: the
-//! error type, the checksum, the seeded generator, the filter language and
+//! error type, the checksum, the clock and the spellings of the times the
+//! engine writes and reads, the seeded generator, the filter language and
 //! the column store that answers it, the distance kernels, the product
 //! quantizer, the scalar codec, the graph with its dump format, the seam every index sits
 //! behind, being the index trait, the admit family and the persistence traits
@@ -51,6 +52,7 @@ mod admit;
 mod allocations;
 mod bitmap;
 mod checksum;
+mod clock;
 mod columns;
 mod distance;
 mod error;
@@ -78,6 +80,7 @@ mod test_vectors;
 pub use admit::{Admit, And, Candidates};
 pub use bitmap::Bitmap;
 pub use checksum::checksum_of;
+pub use clock::Timestamp;
 pub use columns::{validate_indexed_fields, ColumnParts, ColumnStore, Selection};
 pub use distance::{
     norm_f64, not_finite_words, past_bound_words, raw_distance, screen, CodeKernel, CosineDist,

@@ -3666,7 +3666,7 @@ fn load_locked(
 
     // The load's own time, taken once, so a repair that reads the checkpoint
     // again takes the same value wherever the load takes it.
-    let loaded_at = chrono::Utc::now().to_rfc3339();
+    let loaded_at = zeusdb_vector_core::Timestamp::now().to_rfc3339();
     let Checkpoint {
         index: mut restored_index,
         manifest,
@@ -4106,12 +4106,13 @@ fn read_checkpoint(
             .and_then(|record| record.sequence)
             .filter(|_| major >= SEGMENTED_FORMAT_MAJOR)
             .unwrap_or(0);
-        // A save records an RFC 3339 time and a 5.x manifest is held to one,
-        // so a value below 5.x that is not one is no save time.
+        // A save records an RFC 3339 time and a 5.x manifest is held to one
+        // that `Timestamp::parse_rfc3339` reads, so a value below 5.x that it
+        // does not read is no save time.
         restored_index.set_lineage(&IdentityRecord {
             identity,
             saved_at: Some(manifest.saved_at.clone())
-                .filter(|value| chrono::DateTime::parse_from_rfc3339(value).is_ok()),
+                .filter(|value| zeusdb_vector_core::Timestamp::parse_rfc3339(value).is_some()),
             sequence,
         });
     }
@@ -4136,9 +4137,11 @@ fn read_checkpoint(
 /// [`check_manifest_fields`] has already held a 5.x manifest to. So a
 /// `created_at` below 5.x that is not one is replaced, by the manifest's
 /// `saved_at` where that is an RFC 3339 time and by `loaded_at` otherwise,
-/// and the save after the load writes a manifest its own load reads.
+/// and the save after the load writes a manifest its own load reads. An RFC
+/// 3339 time here is one `Timestamp::parse_rfc3339` reads, which reads
+/// U+2212 as an offset's minus and a second of 60 in any minute as well.
 fn restored_created_at(manifest: &IndexManifest, loaded_at: &str) -> (String, Option<Replaced>) {
-    let is_time = |value: &str| chrono::DateTime::parse_from_rfc3339(value).is_ok();
+    let is_time = |value: &str| zeusdb_vector_core::Timestamp::parse_rfc3339(value).is_some();
     if is_time(&manifest.created_at) {
         return (manifest.created_at.clone(), None);
     }
@@ -4172,7 +4175,8 @@ fn restored_created_at(manifest: &IndexManifest, loaded_at: &str) -> (String, Op
 /// is read
 ///
 /// `zeusdb_version` is not empty, `created_at` and `saved_at` are RFC 3339
-/// times, `index_type` is `HNSW`, and `storage_mode` is one a save records.
+/// times as `Timestamp::parse_rfc3339` reads them, `index_type` is `HNSW`,
+/// and `storage_mode` is one a save records.
 /// `has_quantization` says whether `files_included` names
 /// `quantization.json`. `files_included` and `file_digests` name the same
 /// files, none of them one no 5.0.0 save writes. `files_excluded` names
@@ -4192,7 +4196,7 @@ fn check_manifest_fields(dir: &dyn Dir, manifest: &IndexManifest) -> Result<(), 
         ("created_at", &manifest.created_at),
         ("saved_at", &manifest.saved_at),
     ] {
-        if chrono::DateTime::parse_from_rfc3339(value).is_err() {
+        if zeusdb_vector_core::Timestamp::parse_rfc3339(value).is_none() {
             return invalid(format!(
                 "records {} as '{}', which is not an RFC 3339 time",
                 field, value
@@ -5499,11 +5503,10 @@ fn save_quantization_config(
         let (subvectors, bits) = config.scheme.pq_shape().unwrap_or((1, 8));
 
         // When the codebook was fitted, taken from the index rather than from
-        // the clock. This used to be `Utc::now()`, so the field recorded the
-        // save and moved every time a trained index was saved again. `None` on
-        // an index that never trained, and also on one loaded from a directory
-        // written before the index carried the value; see the field on
-        // `Collection`.
+        // the clock, since the clock's time here would be the save's and would
+        // move every time a trained index was saved again. `None` on an index
+        // that never trained, and also on one loaded from a directory written
+        // before the index carried the value; see the field on `Collection`.
         let training_completed_at = index.training_completed_at();
 
         // CAPTURE TRAINING STATE:

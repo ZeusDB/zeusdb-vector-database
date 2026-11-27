@@ -23,11 +23,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
-use chrono::{DateTime, Utc};
 use zeusdb_vector_core::{
-    pause_arm, pause_disarm, IdfScope, KillPoint, PanicPoint, Pause, PauseAt, PQ,
+    pause_arm, pause_disarm, IdfScope, KillPoint, PanicPoint, Pause, PauseAt, Timestamp, PQ,
 };
 use zeusdb_vector_sparse::{SparseConfig, Weighting};
 use zeusdb_vector_text::SimpleTokenizer;
@@ -708,14 +707,14 @@ fn training_is_stamped_with_the_stamp_it_is_handed() {
 
     // Through the trigger, on the insert that fills the training set.
     let triggered = Collection::build(declare(), Some(config.clone()));
-    let before = Utc::now();
+    let before = SystemTime::now();
     let added = triggered.add_records(training_records(), vec![], false);
     assert_eq!(added.total_errors, 0, "{:?}", added.errors);
     assert!(triggered.is_quantized());
     let stamp = triggered.training_completed_at().unwrap();
-    let stamped = DateTime::parse_from_rfc3339(&stamp).unwrap();
-    assert!(stamped >= before - chrono::Duration::seconds(1));
-    assert!(stamped <= Utc::now() + chrono::Duration::seconds(1));
+    let stamped = Timestamp::parse_rfc3339(&stamp).unwrap();
+    assert!(stamped >= Timestamp::from(before - Duration::from_secs(1)));
+    assert!(stamped <= Timestamp::from(SystemTime::now() + Duration::from_secs(1)));
 
     // Handed a stamp, on a collection holding the same records raw, as the
     // loader assembles one.

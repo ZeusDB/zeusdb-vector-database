@@ -37,7 +37,6 @@ pause-points = ["zeusdb-vector-core/pause-points"]
 zeusdb-vector-core = { workspace = true }
 zeusdb-vector-sparse = { workspace = true }
 zeusdb-vector-text = { workspace = true }
-chrono = { workspace = true }
 rand = { workspace = true }
 rayon = { workspace = true }
 serde = { workspace = true }

@@ -385,7 +385,7 @@ pub(super) fn set_aside(journal: &dyn JournalDir, plan: &Plan<'_>) -> Result<Str
     if let Some(folder) = reusable(journal, plan) {
         return Ok(folder);
     }
-    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%S%3fZ");
+    let stamp = zeusdb_vector_core::Timestamp::now().to_compact();
     let folder = format!("{stamp}-{}", plan.first_set_aside());
     journal
         .create_quarantine(&folder)
@@ -426,7 +426,7 @@ pub(super) fn set_aside(journal: &dyn JournalDir, plan: &Plan<'_>) -> Result<Str
                 bytes: file.bytes.len() as u64,
             })
             .collect(),
-        repaired_at: chrono::Utc::now().to_rfc3339(),
+        repaired_at: zeusdb_vector_core::Timestamp::now().to_rfc3339(),
     };
     let json = serde_json::to_string_pretty(&report).map_err(|error| {
         SetAside::Write(Error::SerializeFailed {

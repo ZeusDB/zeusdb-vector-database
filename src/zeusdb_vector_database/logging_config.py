@@ -7,8 +7,11 @@ import logging
 import os
 import sys
 import json
+import calendar
 import datetime
 import errno
+import math
+import time
 from typing import Dict, Any
 from threading import Lock
 import shutil
@@ -482,6 +485,33 @@ def _log_setup_warnings(logger: logging.Logger, config: Dict[str, Any]) -> None:
         )
 
 
+# 1970-01-01T00:00:00Z, the instant a record's time is counted from.
+_UNIX_EPOCH = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+
+# 400 Gregorian years, in seconds. The calendar's dates, weekdays and leap
+# days repeat after them.
+_SECONDS_IN_400_YEARS = 146097 * 86400
+
+
+def _local_time(created):
+    """The local time of the record time created, as time.localtime gives
+    it. Where the C library cannot convert created, as Windows' cannot
+    before 1970, this converts the moment a whole number of 400-year periods
+    away that falls in the years 2370 to 2769, and gives it the year of
+    created. The calendar repeats after 400 years, so the date, the weekday
+    and the time of day are those of created, and the local offset is the
+    one the C library's rules give in that later year."""
+    try:
+        return time.localtime(created)
+    except (OSError, OverflowError):
+        seconds = math.floor(created)
+        periods = seconds // _SECONDS_IN_400_YEARS - 1
+        shifted = seconds - periods * _SECONDS_IN_400_YEARS
+        local = time.localtime(shifted)
+        offset = calendar.timegm(local) - shifted
+        return time.struct_time((local.tm_year + 400 * periods, *local[1:9], local.tm_zone, offset))
+
+
 def _create_formatter(config: Dict[str, Any]) -> logging.Formatter:
     """Create appropriate formatter based on configuration."""
     
@@ -504,10 +534,13 @@ def _create_formatter(config: Dict[str, Any]) -> logging.Formatter:
         
         format_string = ' - '.join(format_parts)
         
-        return logging.Formatter(
+        formatter = logging.Formatter(
             format_string,
             datefmt='%Y-%m-%d %H:%M:%S'
         )
+        # The record's local time, before 1970 as well, on every system.
+        formatter.converter = _local_time
+        return formatter
 
 class _JSONFormatter(logging.Formatter):
     """JSON formatter for production logging with proper timestamp handling.
@@ -522,7 +555,10 @@ class _JSONFormatter(logging.Formatter):
     
     def formatTime(self, record, datefmt=None):
         """Override to get proper microsecond precision (time.strftime ignores %f)."""
-        dt = datetime.datetime.utcfromtimestamp(record.created)
+        # The UTC time counted from the epoch, which datetime holds from year
+        # 1 to 9999 on every system. fromtimestamp asks the C library, which
+        # on Windows gives no UTC time more than 12 hours before 1970.
+        dt = _UNIX_EPOCH + datetime.timedelta(seconds=record.created)
         return f"{dt:%Y-%m-%dT%H:%M:%S}.{dt.microsecond:06d}Z"
     
     def format(self, record):

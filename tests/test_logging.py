@@ -1110,3 +1110,85 @@ def test_a_log_file_path_ending_in_a_backslash_names_a_file_on_posix(tmp_path):
     assert _entries(tmp_path) == ["logs\\"]
     written = (tmp_path / "logs\\").read_text(encoding="utf-8", errors="ignore")
     assert "HNSW index created successfully" in written, written[-600:]
+
+
+# ------------------------------------------------------------
+# The Python layer's JSON records where warnings are errors
+# ------------------------------------------------------------
+_JSON_RECORD_TIMES = r"""
+import logging
+import zeusdb_vector_database
+logger = logging.getLogger("zeusdb.vector")
+[formatter] = [handler.formatter for handler in logger.handlers]
+for created in (0.0, 951782400.0, 1764224869.76739, 1764224869.9999996):
+    record = logging.LogRecord("zeusdb.vector", logging.INFO, "script.py", 1, "a", None, None)
+    record.created = created
+    print(formatter.formatTime(record))
+logger.warning("a record")
+print("logged")
+"""
+
+# DeprecationWarning is an error where the Python layer's logging module
+# raises it, and nowhere else, so no other library's warning reaches the test.
+_AN_ERROR_IN_THE_LOGGING_MODULE = "error::DeprecationWarning:zeusdb_vector_database.logging_config"
+
+
+def test_the_python_layer_writes_its_json_records_where_warnings_are_errors(tmp_path):
+    """Where a DeprecationWarning raised in the Python layer's logging
+    module is an error, its JSON formatter still writes each record, and the
+    record's timestamp is its UTC time to the microsecond, followed by Z."""
+    code, out, err = _import_in(_JSON_RECORD_TIMES, tmp_path, ENVIRONMENT="development",
+                                ZEUSDB_LOG_LEVEL="info", ZEUSDB_LOG_FORMAT="json",
+                                ZEUSDB_LOG_CONSOLE="true",
+                                PYTHONWARNINGS=_AN_ERROR_IN_THE_LOGGING_MODULE)
+    assert code == 0, err[-2000:]
+    assert out.split() == ["1970-01-01T00:00:00.000000Z", "2000-02-29T00:00:00.000000Z",
+                           "2025-11-27T06:27:49.767390Z", "2025-11-27T06:27:50.000000Z",
+                           "logged"]
+    assert "--- Logging error ---" not in err, err[-2000:]
+    [record] = [entry for entry in _json_lines(err) if entry.get("logger") == "zeusdb.vector"]
+    assert record["message"] == "a record"
+    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z", record["timestamp"])
+
+
+# ------------------------------------------------------------
+# Record times the C library cannot convert
+# ------------------------------------------------------------
+_RECORD_TIMES_ON_EVERY_CLOCK = r"""
+import logging
+import zeusdb_vector_database
+logger = logging.getLogger("zeusdb.vector")
+[formatter] = [handler.formatter for handler in logger.handlers]
+for created in (-1.0, -14182940.5, -1577923200.0, -11644473600.0, 95617584000.0, 253402300799.0):
+    record = logging.LogRecord("zeusdb.vector", logging.INFO, "script.py", 1, "a", None, None)
+    record.created = created
+    print(formatter.formatTime(record, formatter.datefmt))
+record = logger.makeRecord("zeusdb.vector", logging.WARNING, "script.py", 1, "a record", None, None)
+record.created = -14182940.5
+logger.handle(record)
+print("logged")
+"""
+
+
+@pytest.mark.parametrize("form, times, written", [
+    ("json", ["1969-12-31T23:59:59.000000Z", "1969-07-20T20:17:39.500000Z",
+              "1920-01-01T00:00:00.000000Z", "1601-01-01T00:00:00.000000Z",
+              "5000-01-01T00:00:00.000000Z", "9999-12-31T23:59:59.000000Z"],
+     '"timestamp":"1969-07-20T20:17:39.500000Z"'),
+    ("human", ["1969-12-31 23:59:59", "1969-07-20 20:17:39", "1920-01-01 00:00:00",
+               "1601-01-01 00:00:00", "5000-01-01 00:00:00", "9999-12-31 23:59:59"],
+     "1969-07-20 20:17:39 - zeusdb.vector - WARNING - a record"),
+], ids=["json", "human"])
+def test_each_formatter_writes_a_record_time_the_c_library_cannot_convert(tmp_path, form, times,
+                                                                        written):
+    """Each formatter of the Python layer writes a record whose time is
+    before 1970 or past the C library's last year, as Windows' library
+    refuses both, on every system: the JSON one in UTC, and the human one in
+    local time, which TZ=UTC0 makes UTC here."""
+    code, out, err = _import_in(_RECORD_TIMES_ON_EVERY_CLOCK, tmp_path, ENVIRONMENT="development",
+                                ZEUSDB_LOG_LEVEL="info", ZEUSDB_LOG_FORMAT=form,
+                                ZEUSDB_LOG_CONSOLE="true", TZ="UTC0")
+    assert code == 0, err[-2000:]
+    assert out.split("\n")[:7] == times + ["logged"]
+    assert "--- Logging error ---" not in err, err[-2000:]
+    assert written in err, err[-2000:]

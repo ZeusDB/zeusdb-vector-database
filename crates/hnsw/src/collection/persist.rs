@@ -16,7 +16,6 @@ use crate::journal::{Durability, JournalPolicy, PastBound, Recovery};
 use crate::locks::ReadGuard;
 use crate::persistence::unmapped_record;
 use crate::RerankCalibration;
-use chrono::Utc;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
@@ -757,7 +756,7 @@ impl Collection {
         // for every artefact above and the directory size all of them add up
         // to.
         debug!(target: LOG_TARGET, operation = "save_phase3", "Writing the manifest");
-        let saved_at = Utc::now().to_rfc3339();
+        let saved_at = zeusdb_vector_core::Timestamp::now().to_rfc3339();
         let record = crate::persistence::ManifestRecord {
             identity: &identity,
             sequence,

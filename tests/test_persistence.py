@@ -2522,7 +2522,7 @@ def test_created_at_is_the_creation_not_the_load(tmp_path):
 
 
 def test_training_completed_at_is_the_training_not_the_save(tmp_path):
-    """It carried Utc::now() at save time, so it moved on every save."""
+    """It carried the time of the save, so it moved on every save."""
     vdb = VectorDatabase()
     config = {"type": "pq", "subvectors": 4, "bits": 8,
               "training_size": 1000, "storage_mode": "quantized_only"}
