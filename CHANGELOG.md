@@ -7,277 +7,153 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
+## [0.14.0] - 2026-11-27
 
 ### Added
 
-- **One index at a time writes a directory.** `<path>.zdblock` beside the directory takes the operating system's file lock. A journaled index holds it for as long as it lives, a save holds it for the save, and a load holds it shared while it reads. A second holder in this process or another raises `RuntimeError`, which names the holder only as another holder. Where the system lets a second handle read the lock file, the error quotes the last record an exclusive holder wrote there, being its process, its host, its mode and the moment, or says that the lock file records no holder, holds no readable record, or cannot be read, with the system's error. The host is the machine's DNS host name on Windows and the C library's host name on Linux and macOS. The system releases the lock when the holder's process ends, however it ends. Where the lock file cannot be locked, `journal_to()` and `save()` raise `RuntimeError` and write nothing.
-
-- **A journaled directory this process cannot write opens read only.** Where the medium or a missing permission refuses the first write a load needs, `load()` replays the journal in memory, writes nothing, and issues a `RuntimeWarning` naming the directory and the system's refusal. The index raises `RuntimeError` on every mutation, on `checkpoint()`, on `journal_to()` and on a save into the directory it was read from. A save into another directory writes a copy that opens writable.
+- **A load that replays the journal of a directory whose medium or permissions refuse its first write opens the index read only**, with a `RuntimeWarning`.
 
 - **`journal_segments`**, the number of segments the journal holds, in `get_stats()` on a journaled index.
 
-- **`backup(path)`** writes a copy of the index into the directory at `path` and returns the copy's identity, a dict of the six keys `identity` holds. The copy is a directory at format 5.0.0 that names no journal. Its generation is the next, its `snapshot` is its own, its `parent` is the index's `snapshot`, and its `sequence` is the sequence the index's journal has reached, or the index's own where it has none. The index's identity and journal do not change. Writes wait for the backup and searches run during it. It raises `RuntimeError` and writes nothing for the directory the index's journal sits beside or a read-only index was read from, for a directory with a journal beside it, for a path that holds a file or a folder of other files, and for a directory another holder locks.
+- **`backup(path)`** writes a copy of the index into another directory while searches run, and returns the copy's identity.
 
-- **`load(path, repair=True)`** loads a directory whose journal is damaged. It replays every whole call before the first call the damage touches, copies that call and every byte after it in the journal into `<path>.zdbjournal/quarantine/<UTC time>-<first sequence set aside>/` with a `repair.json` that describes them, cuts the journal there, and saves the directory. It raises `RuntimeError` where a sync of the quarantine, of the journal after the cut or of the quarantine once the repair's checkpoint lands fails, and a failed sync of the quarantine before the cut leaves the journal as it was. A `RuntimeWarning` names the damage, the records set aside and the folder. The next `load(path, repair=True)` completes a repair that stopped part way. A directory with no damage loads as it does without `repair`. On a medium that this process cannot write, the load replays the kept calls in memory, sets nothing aside and opens the index read only. `repair=True` with `checkpoint_only=True` raises `ValueError`.
+- **`load(path, repair=True)`** opens a directory whose journal a plain `load()` refuses as damaged, keeps every whole call before the damage, and sets the rest aside in the journal's `quarantine` folder where it opens the index writable.
 
-- **`recovery`**, a dict that describes what the load that built the index did, being the format it read, the records it replayed, withdrew and skipped, the damage it found, the checkpoint it took and why, whether it opened the index read only and why, what a repair set aside, and each value it replaced. It is `None` on an index made in the process.
+- **`recovery`** reports what the load that built the index did, among it the records it replayed, the damage it found and whether it opened the index read only.
 
-- **`identity` holds `saved_at` and `sequence`**, the time the manifest of the directory `snapshot` names records for its save, and the journal sequence that directory holds.
+- **`identity` holds `saved_at` and `sequence`**, the save time that the manifest of the directory `snapshot` names records, and the journal sequence it records under `identity`.
 
-- **A directory holding a feature this release does not know, which its manifest marks `read_only`, opens read only.** `load()` reads every record, issues a `RuntimeWarning` naming the feature, and sets `recovery["read_only"]`, with a `read_only_reason` that names the feature. The index raises `RuntimeError` naming the feature on every mutation, on `save()` into any directory, and on `checkpoint()`, `journal_to()` and `backup()`. Where such a directory's journal holds a record of a kind this release does not know, `load()` raises `RuntimeError` naming the feature, the kind and the sequence, and `checkpoint_only=True` opens the directory as its last save left it.
+- **A directory that holds an unknown feature marked `read_only` opens read only**, with a `RuntimeWarning` naming the feature, where no other feature or journal record refuses it.
 
-- **`add()` refuses a record the graph has no room for**, with `RuntimeError`, before the record takes an internal id or reaches the journal. The graph addresses 2,147,483,648 nodes and as many wide upper lists, and 4,294,967,295 upper list words and as many upper list slots. A record is admitted where the most its insertion can add to each, at the level drawn for it, fits beside what the records the call admitted before it can add. Where the record fits on its own, the message says that the call is too large to place at once and that the records go in across smaller calls. Where it does not, the message says that the graph is full and names `compact()`. A recovery holds each insert record to the same room.
-
-- **A sparse space holds at most 4,294,967,294 nonzeros in its forward store**, a removed record's among them until `compact()`. `add()` refuses a record that would take the store past them with `RuntimeError` naming the space, before the record takes an internal id, and `load()` refuses a sparse space whose records hold more.
-
-- **A text space stores a term of at most 4,294,967,295 bytes.** `add()` refuses a record that carries a longer term with `RuntimeError`, before the term takes an id.
-
-- **CPython 3.15.** The package supports CPython 3.15, and its metadata lists every supported version, 3.10 to 3.15, as a classifier on PyPI. One wheel for each platform installs on each of these versions.
+- **The package supports CPython 3.15**, and its metadata names each supported version from 3.10 to 3.15.
 
 ### Changed
 
-- **The journal is a directory of segments.** `journal_to(path)` opens `<path>.zdbjournal`, and `journal_path` names it. Each segment is named for the first sequence it holds, and its header names the collection and the checkpoint it follows. The journal moves to a new segment at the first commit after the active one passes 64 MiB. A checkpoint starts a new segment and deletes the old ones once its save has committed. `journal_bytes` is the length of every segment together.
+- **A journaled index holds `<path>.zdblock` for its whole life and a save holds it while it writes**, so another index that opens, saves or journals the directory by that path meanwhile raises `RuntimeError`.
 
-- **Every call that changes a journaled index ends its records with a commit record.** A recovery replays the records of committed calls, and cuts the records that no commit follows as a torn tail.
+- **The graph and the sparse and text spaces refuse what passes their ceilings.** `add()` names in `errors` a record the graph or a sparse space has no room for, or that carries a text term too long to store, `compact()`, `rebuild()` and `rebuild_with_quantization()` raise `RuntimeError` where the rebuilt graph has no room and keep the graph and every record, and `load()` raises `RuntimeError` for a directory whose records the graph has no room for, or whose sparse space passes its ceilings.
 
-- **A commit whose sync fails withdraws its call.** The journal writes an abort record after the call's records, or cuts the segment back to the last commit where the abort cannot be written. `add()` reports every record of the call as an error, and any other mutation raises `RuntimeError`. Every mutation after it is refused the same way, naming `checkpoint()`, until a checkpoint commits, and the checkpoint runs even where the old segment does not sync. Under `"interval"`, a failed sync of the policy's thread withdraws and refuses the next call, and neither a `backup()` nor a `checkpoint()` whose save fails clears it. The journal syncs a full segment before it starts the next one, and where that sync fails, every later mutation is refused until a checkpoint commits. The journal syncs its directory once it creates a segment and once a checkpoint deletes the segments it holds, and where that sync fails, every later mutation is refused until a checkpoint commits, and the `checkpoint()` or `journal_to()` that meets the failure raises `RuntimeError`. Where the next segment cannot be started and its removal cannot be synced, every later mutation is refused the same way. A `checkpoint()` that moves its directory into place and cannot sync the folder it sits in raises `RuntimeError`, and every later mutation is refused until a checkpoint commits. `journal_to()` raises `RuntimeError` where the journal's directory or the folder it sits in cannot be synced, and the index takes no journal. A `load()` that keeps a journal syncs the journal's directory, the directory it reads and the folder that directory sits in before it records anything, and raises `RuntimeError` where one of those syncs fails, or opens the index read only where the medium refuses the sync. A `load()` whose journal holds an abort takes a checkpoint before it records anything.
+- **The journal is a directory of segments, `<path>.zdbjournal`**, and a checkpoint that succeeds deletes the segments it supersedes where the system lets it.
 
-- **A journaled directory saved by 0.13.0 or earlier is written again at 5.0.0 when it opens.** `load()` replays its journal file, saves the directory with a journal of segments that carries the sequence on, and deletes `<path>.zdbwal`. `checkpoint_only=True` opens the directory as it stood at its last save and changes neither it nor its journal.
+- **A recovery replays a call only where its commit record is in the journal, from a journal this release writes.**
 
-- **A child forked from the process that journals an index refuses every mutation of that index** with `RuntimeError`, and leaves the parent's journal and lock as they are.
+- **The records of a commit that fails to sync are not applied, and after a crash they come back only where the journal could neither withdraw nor cut them.** The journaled index then refuses every change until a checkpoint commits.
 
-- **The docstrings of `load()`, `journal_to()`, `checkpoint()` and `journal_path`** describe the journal of segments, the lock and the read-only load.
+- **A load that replays a journaled directory 0.13.0 or earlier saved, and opens it writable, writes it again at 5.0.0**, with a journal of segments in place of its `<path>.zdbwal`.
 
-- **An `add()` with `overwrite=True` that replaces a record the index holds records its removal and its records as one call.** The call admits each record first, then appends the removal record, the records and one commit, and removes the replaced records only after the commit. A record that admission refuses keeps the record it names.
+- **A child forked from the process that journals an index, while no call on that index runs, refuses every mutation of that index**, and leaves the parent's journal and lock as they are.
 
-- **The journal record of a training holds the codebook or the scales and the rerank calibration that the training fitted**, and commits before the index installs them. A recovery installs what the record holds. A journal that 0.11.0 to 0.13.0 wrote replays as those releases replayed it.
+- **A recovery of a journal this release writes installs each committed training as it was trained.**
 
-- **A call made while a failed commit's refusal stands is refused before it takes an internal id or draws a level.**
+- **`save()` and `journal_to()` refuse a path that holds a file or a folder of other files, before they write anything.**
 
-- **`save()`, `journal_to()` and `backup()` refuse a path that holds a file, or a folder that holds entries and no `manifest.json`**, with `RuntimeError`, before they write anything. An empty folder and a directory that an earlier save wrote are taken as before.
+- **A load refused for journal damage that a repair handles names `repair=True`.**
 
-- **The refusal of a corrupt journal names `repair=True`**, the record and the byte where the repair cuts, and the records that it sets aside.
+- **A save writes each record's vector, codes or scalar row once**, in a graph dump whose regions carry checksums, with the raw vectors a product quantized index keeps in `vectors.bin`.
 
-- **The docstrings of `load()` and `identity`** describe `repair`, `recovery` and the two new keys.
+- **`ZEUSDB_LOAD_REBUILD_GRAPH=1` rebuilds a 5.0.0 directory's graph from the rows its dump holds.**
 
-- **A save writes each record's stored vector, code or scalar row once, in the graph dump.** The dump is version 2, with a 128 byte header, an identity region, a rows region and a topology region that each carry a checksum of their own, and a trailer. `vectors.bin` holds the raw vectors that a trained product quantized index keeps beside its codes under `quantized_with_raw`.
+- **`metadata.json` is compact JSON that lists only the records that hold a field.**
 
-- **`load()` reads a 5.0.0 directory's rows from its graph dump.** It raises `RuntimeError` naming the dump and the check where the dump's length, header, identity region or rows region fails a check, or where a raw graph's row, or a scalar quantized `cosine` row's inverse norm, holds a NaN or an infinity, and `FileNotFoundError` where the directory lacks the dump. Where the topology region alone fails, it rebuilds the graph from the rows the dump holds and sets `recovery["graph_rebuilt"]`.
+- **`load()` opens a directory below format 4.0.0 whose id counter passes the last internal id**, and `add()` then refuses every record.
 
-- **`ZEUSDB_LOAD_REBUILD_GRAPH=1` rebuilds the graph from the rows the dump holds**, which the load verifies first.
+- **A panic inside the engine stops the index**, and that call and every later call on the index raise `RuntimeError`.
 
-- **`metadata.json` is compact JSON that names each record holding a field, in increasing internal id.** A load gives every other record an empty entry, and raises `RuntimeError` for a file that names a record outside `mappings.bin`, or names one record twice.
+- **Metadata comes back with its keys in code point order** from every call that returns it.
 
-- **`quantization.json` holds the declaration and the training state.** A load ignores `memory_stats` and `pq_config` where a file holds them.
+- **`create()` raises the engine's refusal of an argument unchanged, and an unsupported `space` raises `ValueError` from `create()` and `load()`.**
 
-- **`manifest.json` holds the twelve fields that 0.5.0 to 0.13.0 read, `features`, `identity`, `file_digests` and, for a journaled index, `journal`.** `total_size_mb` is the lengths that `file_digests` records, added.
+- **A negative count or size that reaches the engine raises `ValueError` naming the argument.**
 
-- **`load()` holds each field of a 5.x `manifest.json` to the directory**, being the release and the two times it records, the index type, the storage mode, `has_quantization`, `quantization_trained`, the three file lists, `total_vectors` against the `vector_count` of `config.json`, and `total_size_mb` against the lengths `file_digests` records. A field that disagrees with the directory raises `RuntimeError` naming the field and both values.
+- **`add()` raises `TypeError` or `ValueError` before it inserts anything for an input of none of its shapes or a malformed list or batch**, and names in `errors` each record it cannot read.
 
-- **`load()` raises `ValueError` for a product quantized `quantization.json` whose `training_size` is below 1000 or whose `max_training_vectors` is below its `training_size`**, as `create()` does, at every format version.
+- **`add()` raises `TypeError` for a batch whose `ids`, metadata, `sparse` or `texts` is anything but a list, `None` among them.**
 
-- **The docstrings of `load()` and `recovery`** describe the read-only load of a directory holding a feature marked `read_only`, and the docstring of `save()` names the writers a save runs.
+- **A record's metadata holds only JSON values, and every shape of `add()` reads it the same way.** A `dict` is the metadata, a string is kept under `text`, another JSON value under `value`, and `None` is none. A float of another type, such as a `numpy.longdouble`, is held only where a `float64` holds it exactly. `add()` names in `errors` a record whose metadata it cannot hold, and `update_metadata()` and a filter raise `TypeError` or `ValueError` for such a value.
 
-- **`compact()`, `rebuild()` and `rebuild_with_quantization()` raise `RuntimeError` where the replacement graph has no room for the records the index holds**, and keep the graph, the configuration it was built with and every record. The message says that the rebuilt graph is full. A recovery passes over the journal record of such a call. A training whose rebuild has no room fails with the graph's message after the words `Failed to rebuild with quantization:`.
+- **`create()` raises `TypeError` for an `index_type`, an `indexed_fields`, a field name or a `quantization_config` key of the wrong type**, and for a `quantization_config` that is not a `dict`.
 
-- **`load()` reads `metadata.json` straight into the index's per-record metadata**, one allocation for a record's fields and one for each string value, and sizes it once, to the larger of the records the directory holds and the reservation its declared size makes when an index is created.
+- **`create()` raises `ValueError` for a `quantization_config` key its type does not read**, unless the key belongs to the other type and is `None`.
 
-- **The refusal of a directory whose restored record count differs from `config.json` says where the load took the records from**, being the graph dump, the rows the graph dump holds, or the stores it rebuilt the graph from with the count each holds, or that the directory holds none to rebuild from.
+- **`add()` names in `errors` a record whose id is not a string or holds a lone surrogate, and a record whose id is `None` takes a generated id.**
 
-- **`load()` raises `RuntimeError` for a directory whose `quantization.json` records no trained codebook and whose `pq_codes.bin` holds codes**, naming how many records are coded.
+- **An unfiltered `search()` scores every record where the index holds a stranded node and fewer records than the larger of its `ef_search` and its `top_k`.**
 
-- **`load()` holds the `vectors.bin` and `pq_codes.bin` of a directory below format 4.0.0 to `mappings.bin`**, as it holds those of 4.0.0. It raises `RuntimeError` for an entry that names a record `mappings.bin` does not hold or has a width other than the declared one, and for a record with no vector where the directory keeps every record's raw vector.
+- **Neighbour selection keeps a candidate that lies exactly as far from a kept neighbour as from the new record and is not a copy of the new record's vector or codes**, which changes the graph and the pages of vectors whose distances tie.
 
-- **Where `load()` rebuilds the graph from a directory's stores, it raises `RuntimeError` for a record that `mappings.bin` does not hold.**
+- **`add()`, `search()` and `query()` refuse a vector of an `l2`, `dot` or `l1` index whose Euclidean norm passes 2^62.**
 
-- **`load()` opens a directory below format 4.0.0 whose `id_counter` passes 4,294,967,294 with the counter at 4,294,967,294**, and `add()` then refuses every record as it does on an index whose internal ids are exhausted. A recovery passes over a version 1 journal's insert record past that id. A directory at 4.0.0 or later whose `id_counter` passes it raises `ValueError`.
+- **`add()` and `query()` refuse a sparse value whose magnitude passes 2^40, and `create()` refuses a term weighting `k1` past 2^40.**
 
-- **A panic inside the engine stops the index.** The call that panics raises `RuntimeError` naming the call and what the panic said, and every later call on the index, `recovery`, `len()` and the properties among them, raises the same error, since the call that panicked may have left a change part made. No call reads or writes what the panic left. The journal stays as it is, and `load()` opens the directory with every call whose commit landed. A panic inside `create()` or `load()` raises `RuntimeError`.
+- **A load that restores a value past one of these bounds opens the index read only, and the index refuses a save into any directory.**
 
-- **A record's metadata holds its keys in code point order** in every call that returns it, being `search()`, `query()`, `get_records()`, `list()`, `get_metadata()` and `get_all_metadata()`, and so do the dicts that `get_all_metadata()`, `get_stats()`, `get_performance_info()` and `benchmark_concurrent_reads()` return. The order is the same in every process and across a save and a load.
+- **The README** gives the reranked search times and calibrated fetches that this release measures, the fetch that each measured dataset needs to reach the calibration's recall target and where the rerank ceiling binds, and states the default `ef_search` of every metric, what `count()` and `get_records(strict=True)` do, which index carries each key of `get_stats()`, every key of `identity`, the shapes of a query plan and how the logging setup reads its variables.
 
-- **`create()` raises the error the engine raises, `ValueError` or `TypeError`, in the engine's words.** An unsupported `space` raises `ValueError` from `create()` and from `load()`.
+- **`save()`, `checkpoint()`, `backup()` and `journal_to()` sync the directories they write, on Windows as on Linux and macOS, and raise `RuntimeError` where that sync fails.**
 
-- **A negative count or size raises `ValueError` naming the argument**, in the words `<name> cannot be negative, got <value>`. This holds for `dim`, `m`, `ef_construction` and `expected_size` at `create()`, `top_k`, `ef_search` and `rerank` at `search()`, `top_k` and `fetch` at `query()` and `explain()` and an arm's `ef_search` and `rerank`, `number` and `offset` at `list()`, `interval_ms` at `journal_to()` and `load()`, the three values of `rebuild()`, and `query_count` and `max_threads` at `benchmark_concurrent_reads()`.
+- **A journal record that panics as it is applied makes `load()` raise `RuntimeError`**, and `load(repair=True)` opens the index without that record or any after it.
 
-- **`add()` raises before it inserts anything for an input it cannot read.** It raises `TypeError` for an input that is none of its formats and for a list holding an item that is neither a record dict nor a vector. It raises `ValueError` for a dict with no `vectors`, `embeddings` or `values` key, for `values` that is not a list, and for a two dimensional array whose rows are not the index's dimension. It raises `TypeError` naming the key for a batch whose metadata is not a list, a tuple among them, as it does for `ids`, `sparse` and `texts`, and for a batch whose vectors are neither a list nor a two dimensional array.
+- **`init_logging()` needs no argument and `init_file_logging()` needs only the folder.** Where `RUST_LOG` is unset, a `level` it cannot read as a level name or a filter, a misspelt level name among them, raises `ValueError`, before logging is set up `init_file_logging()` raises `OSError` for a folder it cannot make or a log file it cannot open, and a refused call leaves logging as it was.
 
-- **Every shape of `add()` reads a record's metadata entry the same way.** A mapping is the record's metadata, a string is kept under `text`, any other value is kept under `value`, and `None` is no metadata.
+- **`ZEUSDB_LOG_LEVEL=off`, `none` or `silent` runs the engine at the default level.**
 
-- **`AddResult`'s repr prints its shape as Python writes it**, `shape=(2, 2)` or `shape=None`.
+- **`ZEUSDB_LOG_FILE` set to a path that names a folder, such as `.` or `logs/`, writes no file**, and the `file` target falls back to stderr, as for a log file it cannot open.
 
-- **The docstrings of `add()`, `search()`, `count()`, `list()`, `get_quantization_info()`, `shrink_to_fit()`, `compact()`, `backup()`, `query()`, `add_metadata()`, `save()`, `create()` and `is_logging_initialized()`, and of `AddResult.ids`, describe what each does**, among them each space's default `ef_search` and the fetch of `search()`, the cost of `count()`, how `add()` reads metadata, and the calls that release the interpreter.
-
-- **A search with no filter, on an index that holds fewer records than its search width and a graph node that a removal left, scores every record the index holds**, one distance a record, and returns the nearest `top_k` of them wherever they lie in the graph. `query()` and `explain()` report that arm as exact.
-
-- **The graph keeps a candidate neighbour that lies exactly as far from a kept neighbour as from the new record.** On vectors whose distances tie, as integer vectors' often do, the graph and the pages a search returns differ from those 0.13.0 builds.
-
-- **`add()` refuses a record of an `l2`, `dot` or `l1` index whose vector has a Euclidean norm past 2^62.** `errors` names the record, its norm and the bound, and the records around it go in. `search()` and each dense arm of `query()` raise `ValueError` naming the norm and the bound for such a query, and a batch names the query's position. A `cosine` index takes any finite vector.
-
-- **A directory that holds a value past that bound opens read only**, being a stored vector of an `l2`, `dot` or `l1` index whose Euclidean norm passes 2^62, a codebook value past 2^62, or a scalar scale past the largest one that vectors within the bound fit. `load()` reads every record, writes nothing, issues a `RuntimeWarning` naming the value, its file and the bound, and sets `recovery["read_only"]`, with a `read_only_reason` in the same words. `add()` reports each record as an error in those words, and every other mutation, `save()` into any directory, `checkpoint()`, `journal_to()` and `backup()` raise `RuntimeError` in them. Searches run.
-
-- **A journaled directory below format 5.0.0 whose identity records the largest generation a manifest can hold opens read only.** `load()` replays the journal in memory, writes nothing, issues a `RuntimeWarning` naming the generation, and sets `recovery["read_only"]`, with a `read_only_reason` in the same words. `add()` reports each record as an error in those words, and every other mutation, `save()` into any directory, `checkpoint()`, `journal_to()` and `backup()` raise `RuntimeError` in them.
-
-- **`load()` replaces a `created_at` that is not an RFC 3339 time in the manifest of a directory below format 5.0.0.** It takes the manifest's `saved_at`, or the time of the load where `saved_at` is not one either, and issues a `RuntimeWarning` naming the value recorded and the value taken. `recovery["replaced"]` lists each value a load replaced as a dict of `file`, `field`, `recorded`, `taken` and `detail`, and is empty where the load replaced none. The next save writes the value taken.
-
-- **The docstrings of `load()`, `add()`, `search()` and `recovery`** describe the bound on a vector's norm, the read-only load of a directory past it and of a journaled directory at the largest generation, and the replaced `created_at`.
-
-- **`add()` refuses a record whose sparse vector holds a value with a magnitude past 2^40**, and `query()` raises `ValueError` for a sparse arm whose vector holds one. `errors` names the record, and both name the value's index, the value and the bound. A value that is not finite is refused as before. A vector supplied to a space with a text layer is held to the bound before that space's own rule.
-
-- **`create()` refuses a term weighting `k1` past 2^40** with `ValueError`, naming the parameter, its value and the rule. A `k1` that is not finite or is below zero is refused in the words it was.
-
-- **A directory that holds a sparse value with a magnitude past 2^40, or a term weighting `k1` past 2^40, opens read only**, as a directory past the bound on a vector's norm does. `load()` reads every record, writes nothing, issues a `RuntimeWarning` naming the value, its file and the bound, and sets `recovery["read_only"]`, with a `read_only_reason` in the same words. `add()` reports each record as an error in those words, and every other mutation, `save()` into any directory, `checkpoint()`, `journal_to()` and `backup()` raise `RuntimeError` in them. Searches run.
-
-- **The docstrings of `create()`, `load()`, `add()` and `recovery`** describe the bound on a sparse value and the read-only load of a directory past it.
-
-- **The README** gives the reranked search times and calibrated fetches that this release measures, the fetch that each measured dataset needs to reach the calibration's recall target, and where the rerank ceiling binds.
+- **`add()` reads a `float64` two dimensional array by rows, and `add()`, `search()`, `query()` and `explain()` read a Fortran-ordered, strided or reversed array as NumPy defines it.**
 
 ### Fixed
 
-- **`load()` refuses a journal whose segments follow another checkpoint of the same index**, with a `RuntimeError` naming both checkpoints, and replays none of it. A segment from another checkpoint that holds nothing past the directory's sequence is passed over, and deleted by a load that can write.
+- **A generated id never names a record the index holds.**
 
-- **The records of a call whose commit failed are not replayed after a crash**, once its abort record or its cut has landed.
+- **A record's metadata comes back as `add()` kept it after a save, a load and a journal replay**, its floats bit for bit and its values nested as deep as `add()` takes.
 
-- **A second index, in this process or another, cannot open, save or journal a directory that a journaled index holds.**
+- **The `"interval"` policy's thread syncs once an interval however the system wakes it.**
 
-- **An append that fails part way leaves no bytes in the journal.** The writer cuts the segment back to where the record began, and where the cut fails it records nothing more until a checkpoint. A text index interns a term only after the term's `Intern` record is appended, so a failed append leaves the dictionary as it was.
+- **A scalar quantizer gives a dimension whose scale rounds to zero a usable scale**, so the directory a save writes loads.
 
-- **A failed sync of the `"interval"` policy's thread refuses nothing once a checkpoint that replaced its segment commits.** A checkpoint waits for a sync of the thread that is under way before it starts the new segment, and the thread starts none until the new segment is in place.
-
-- **The refusal a failed sync of the `"interval"` policy's thread gives names the journal once.**
-
-- **The `"interval"` policy's thread syncs once an interval however the system wakes it**, and at once when the index is dropped.
-
-- **A `checkpoint()` whose save fails leaves `get_stats()["journal_sequence"]` at the sequence the directory holds.**
-
-- **`save()`, `checkpoint()` and `backup()` raise `RuntimeError` where a directory the save wrote, or the folder the saved directory moves into, cannot be synced.** A save syncs every directory it writes, the folders of a sparse space among them, before the directory moves into place, and syncs the folder after the move and before it deletes `<path>.zdbold`. Where the folder cannot be synced, the new directory is in place and the one it replaced stays at `<path>.zdbold` until the next save. A save into a folder that does not exist yet syncs each folder it creates in the folder above it, and where one of those syncs fails, it raises `RuntimeError` with the folders it created removed.
-
-- **On Windows, a save and a journal flush each directory they sync**, through a handle opened with write access, as they sync it on Linux and macOS. On a filesystem that refuses a directory's flush, such as some network shares, a save, `checkpoint()` and `journal_to()` raise `RuntimeError`, and a `load()` that keeps a journal raises `RuntimeError` or opens the index read only.
-
-- **A thread that the interpreter ends during shutdown, while the thread takes the interpreter back after a long call, does not crash the process.** Long calls into the engine, such as a search, a save or a load, release the interpreter while they run and take it back at the end. The binding is built with PyO3 0.29.3, which handles a thread that is ended at that point.
-
-- **An overwrite keeps every record that it replaces when its commit fails**, live and after a crash, and when the process stops between its removal record and its records.
-
-- **A training whose journal record fails to commit trains nothing, live or after a crash.** The first call after the checkpoint trains.
-
-- **A recovery installs the codebook or the scales that each training's journal record holds.**
-
-- **A scalar quantizer fitted to a dimension whose largest magnitude divided by 127 rounds to zero gives that dimension a scale of 1.0**, so the directory that a save writes loads.
-
-- **A save into a folder of other files leaves the files where they are**, and so do `journal_to()` and `backup()`.
-
-- **`load()` raises `RuntimeError` naming the arena for a directory whose graph does not fit the graph's ceilings.**
-
-- **`compact()` rewrites every posting list of a sparse space**, whatever the number of distinct dimensions it holds.
-
-- **A refused record of a batch of parallel lists leaves the other records to go in.** `errors` names it as `Vector <id>: <cause>`, by its id, or by `item_<position>` where the batch gives no id.
-
-- **A record whose metadata does not convert is refused and named in `errors`, in every shape**, after the words `Metadata error`, where a key is not a string or a value nests more than 128 levels deep. It takes no generated id, and the records around it go in.
-
-- **`add()` reads a `float64` two dimensional array**, narrowing each value to `float32` as `search()` does.
+- **A refused record of a batch of parallel lists leaves the other records to go in.**
 
 - **`AddResult.vector_shape` is the number of records the input holds and the index's dimension.**
 
-- **`search()` raises `ValueError` with `Search vector cannot be empty` for an empty list, tuple or one dimensional array**, and `Batch cannot be empty` for a two dimensional array with no rows.
+- **The engine reads `err` in `ZEUSDB_LOG_LEVEL` as `error` and `init_logging(level="warning")` as `warn`**, and the automatic setup gives it the Python default in place of an unrecognised `ZEUSDB_LOG_LEVEL` or `ZEUSDB_LOG_FORMAT`.
 
-- **`get_quantization_info()` raises the error it meets while it builds its dict.**
+- **A call that waits for a writer lets other Python threads run.**
 
-- **`init_logging()` takes no argument and `init_file_logging()` takes the folder alone**, with `None` as the default of each other argument.
+- **A search under a filter returns `top_k` records wherever the graph reaches as many that the filter admits.**
 
-- **An unrecognised `ZEUSDB_LOG_LEVEL` runs the Python and Rust layers at the same default level.**
+- **A record that duplicates another record's vector or codes keeps the neighbours the selection picks past that copy.**
 
-- **A call that waits for a writer lets other Python threads run.** `get_stats()` and every call that does more than a constant amount of work release the interpreter while they run, and `len()`, `contains()` and the property getters release it only to wait for a writer.
+- **`query()` and `explain()` price a dense arm by the search it runs.**
 
-- **A search under a filter returns `top_k` records wherever the graph reaches as many that the filter admits, at every `ef_search`.** Its traversal goes on until it holds `ef_search` records the filter admits or has visited every candidate it reaches. A search with no filter on an index that holds removed records runs the same way.
+- **Under `cosine`, a nonzero vector whose squares overflow or underflow a `float32` is stored at unit length, and a query is normalized the same way.**
 
-- **A record whose vector or product quantized codes equal those of a record the index holds keeps the neighbours the selection picks past that copy**, and so does a record that scores alike with one the index holds against every other record, such as a scalar quantized cosine record whose codes are another's doubled. The copies of one vector or of one set of codes take one place in a list.
-
-- **`query()` and `explain()` price a dense arm with no filter, on an index whose every graph node holds a record, from the traversal that arm runs.**
-
-- **Under `cosine`, a vector whose squares overflow or underflow a `float32` is stored at unit length**, and a query is normalized the same way. The norm of such a vector is taken in `float64`, and every other vector stores the values it stored before.
-
-- **`load()` raises `RuntimeError` for a product quantized directory whose codebook holds a NaN or an infinity**, naming `pq_centroids.bin`, the subvector, the centroid and the value's place, at every format version.
-
-- **`load()` raises `RuntimeError` for a codebook in which a centroid's squared norm, or the squared distance between two centroids of a subvector, is not finite, and for a scalar scale for which 254 times the scale is not finite.** The message names `pq_centroids.bin` or `int8_scales.zdbint8` and the place.
-
-- **`load()` builds the graph again from a directory's records where its version 1 graph dump holds a NaN or an infinity in a raw row or as a scalar quantized `cosine` row's inverse norm**, and sets `recovery["graph_rebuilt"]`.
-
-- **`load()` raises `RuntimeError` for a scalar quantized `cosine` directory whose `int8_rows.zdbint8` holds a NaN or an infinity as an inverse norm**, naming the file and the record.
-
-- **A journal record whose install panics while `load()` replays it counts as a record that cannot be applied.** `load()` raises `RuntimeError` naming the record, its segment and what the panic said, and `load(path, repair=True)` sets the record's call and every byte after it aside, as damage of kind `apply`.
+- **A refusal of a vector, a query, a sparse value or a fusion's `k` holding a finite `float64` that a `float32` holds as an infinity names that value.**
 
 - **Product quantizer training seeds all centroids also when the sum of the squared seeding distances is not finite.**
 
-- **On a product quantized index, the exact scan scores a record as the traversal scores it.** On an index that keeps codes alone, and on one that keeps raw vectors beside them under `rerank=0`, the scan scores each record with the traversal's own kernel and query table. A filtered search that takes the scan and an unfiltered search give a record the same score, bit for bit, and two records the same order. A search that reranks scores each record from its raw vector on every path.
+- **On a product quantized index, the exact scan and the traversal give a record the same score on the page, reranked or not.**
 
-- **On a `cosine` index that keeps raw vectors, the rerank calibration ranks the codes of its sample with the traversal's own kernel and query table**, so it measures the depth at which the search reaches the true neighbours. The calibration of an `l2` index does not change. A loaded index keeps the calibration it saved.
+- **On a `cosine` index that keeps raw vectors, the rerank calibration ranks its sample's codes as the traversal ranks them.**
 
-- **`get_stats()` prices the value lookup of each dictionary column and the product quantized codes at the hash table each one holds, with the slots that removals leave in it.** `index_bookkeeping_memory_mb` and `total_memory_mb` now follow the tables the index holds. A lookup is priced at its table's buckets, as every other table is, and `clear()` gives the new table of codes the size the old table held.
+- **`get_stats()` prices each dictionary column's value lookup and the product quantized codes at the hash table each one holds.**
+
+- **A `bm25` arm under `idf="corpus"` counts rarity over the records its filter admits, whether or not the filter's fields are declared.**
+
+- **`import zeusdb_vector_database` succeeds where the engine cannot open its log file**, and the engine's records go to stderr.
+
+- **`import zeusdb_vector_database` succeeds where the working folder has been removed and `ZEUSDB_LOG_FILE` is a relative path.**
+
+- **`bits=None` and `storage_mode=None` take their defaults**, as `None` does for every other key of a quantization config but `type`.
 
 ### Internal
 
-- Every workflow job names its runner image. The jobs that ran on `ubuntu-latest` run on `ubuntu-24.04`, and the Windows wheel is built on `windows-2025-vs2026` in place of `windows-latest`. These are the images each job ran on for 0.13.0. A change of runner image is a change to a workflow file.
+- **Every tool the release workflow installs has an exact version and is checked against a published hash.**
 
-- Every tool the release workflow installs has an exact version and is checked against a published hash. Python tools install from files under `.github/requirements/` with `--require-hashes`, uv has a fixed version and archive checksum, each CPython is an exact build that uv installs, and each container image is pinned by digest.
-
-- The release workflow builds the wheels and the source distribution with maturin 1.15.0 from a clean build, and `.github/scripts/build-linux-wheel.sh` builds each Linux wheel inside its pinned image. `uv.lock` names maturin 1.15.0, and the CI lint job fails when it and `.github/requirements/maturin.txt` name different versions.
-
-- Each Linux wheel build installs patchelf 0.19.1.0 from `.github/requirements/patchelf.txt` with maturin and mounts it into the pinned image, where maturin uses it to copy the libraries a musllinux wheel needs into the wheel. `.github/scripts/build-linux-wheel.sh` keeps rustup at the version it installs or the image carries.
-
-- Each wheel job uploads its wheels and their digests as soon as it records the digests. One audit job checks all six wheels against the stable ABI, and the publish job refuses any file other than six wheels and one source distribution.
-
-- The audit job lists the libraries each wheel bundles and the libraries each ELF file in a wheel needs, with `.github/scripts/wheel_libraries.py`. It fails a musllinux wheel that bundles no library, or that needs a library other than musl's `libc.so` that it does not carry.
-
-- The release workflow publishes to PyPI from a stable version tag. A dispatch run or a prerelease tag builds and checks every file and stops before the publish job. The `check-version` job and the GitHub Release job fail when `CHANGELOG.md` holds no section for the tag.
-
-- CI runs the Python suite on CPython 3.15.1 in `test-python` and on CPython 3.10.22 in `test-python-floor`. The release workflow installs and imports each wheel on CPython 3.10 and 3.15.
-
-- `test-rust` links the Rust tests against the libpython of CPython 3.15.1, which uv installs.
-
-- CI runs the Rust tests and the Python suite on arm64, in `test-rust-arm64` and `test-python-arm64` on `ubuntu-24.04-arm` and in `test-rust-macos` and `test-python-macos` on `macos-15`. Each job runs the steps of `test-rust` or `test-python` with the uv archive and the CPython 3.15.1 build of its runner.
-
-- A change to the documentation files that `.github/scripts/documentation_only.py` lists passes every CI job and skips the build and test steps. The Rust build cache is keyed by the runner image as well.
-
-- `sparse-scale.yml` runs the sparse index's three checks against brute force at scale, on a pull request that touches the sparse or core crate, weekly and by hand.
-
-- `.gitattributes` holds every `*.sh` file to LF line endings.
-
-- Every offset into the graph's upper list arenas, a sparse space's forward store and a text space's dictionary is converted with `try_from`, and a value past its width stops the call.
-
-- Each call into the engine runs inside one function that catches a panic and stops the index. Five points of an insert and a training can inject a panic under the `test-support` feature, which the wheel does not enable.
-
-- The binding's `test-support` feature compiles a pause at the start of the part of each call that runs with the interpreter released and at the five points of an insert and a training, and the private class `_engine._Pause` that arms it. The wheel does not enable it. `tests/test_interpreter.py` uses the pause to check that `get_stats()` and `add()` release the interpreter for their work and that each read of a guard releases it only to wait for a writer. CI and the lock order workflow run that module and `tests/test_overlap.py` on a build with the feature after the rest of the suite, and each install check of the release workflow fails a wheel whose `_engine` holds `_Pause`.
-
-- `tests/test_overlap.py` holds a search at the start of the part it runs with the interpreter released, and checks that an add, a `remove_point()`, an `add_metadata()` and a `compact()` made while the search is held complete without an error and that the search then answers.
-
-- Under the core crate's `pause-points` feature, each point a crash test aborts at can also hold the thread a test arms there. `zeusdb-vector-hnsw` has a `pause-points` feature of its own, which adds the point between the two phases of an insert, and the binding's `test-support` feature turns on both.
-
-- The concurrency checks of the Python suite run until each thread reaches its count, and each wait in them ends at a limit that only a hung run reaches. The Rust tests hold an insert, a save, a backup, a clear and each close-up at a pause or a hook while other threads run. A hook in the lock wrappers, compiled in the tests alone, shows that a thread waits at a guard the held write holds, and once the write lets go the test reads the thread's answer past any later wait. The interval thread's syncs are counted through the test storage once the thread has stopped.
-
-- The tests of the `"interval"` policy's thread read, through marks compiled in the tests alone, the thread's holds of its state at its wait for the interval and whether a checkpoint's roll waits for the thread's sync, and wake the thread with nothing changed.
-
-- The lock wrappers take a lock without waiting, for the reads made with the interpreter held.
-
-- The sparse index refuses a record at a position it holds as removed, before it writes anything, and its consistency check holds each posting list's count of removed postings to the postings on it whose record is removed.
-
-- The default Rust log filter quiets `rayon`, `pyo3` and `serde_json`, and a test holds each name to `Cargo.lock`.
-
-- Each crate turns on `clippy::cast_possible_truncation` for its library code, and each narrowing cast carries an `#[expect]` that states its bound.
-
-- The frame mutator and the graph dump mutator compile under the core crate's `test-support` feature and in its tests alone. The text crate's tests take the feature through a dev-dependency.
-
-- **A search, each phase of an insertion, the exact scan, the rerank, the rerank's calibration and the timing of a graph check the processor for AVX once**, and every distance each of them evaluates runs on the kernel that check chose. Every distance returns the bits it returned.
-
-- Every cargo command in CI, in the lock order workflow and in the release workflow fails where a crate of the workspace prints a warning, through `CARGO_BUILD_WARNINGS=deny`. The lint job also runs clippy on each library in the dev profile without the `test-support` feature, and on the wheel's release configuration for `x86_64-pc-windows-msvc`, `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`. The release workflow's build of the aarch64 manylinux wheel allows rustc's `linker_messages` lint for that target alone, since the linker of its pinned image reports a property of the standard library's metadata objects that it does not read.
-
-- Each crate manifest holds a description and takes the documentation address from the workspace, so `maturin sdist` prints no warning.
-
-- **The release workflow runs the Python suite on every wheel before it publishes.** The jobs `linux-suite`, `musllinux-suite`, `windows-suite` and `macos-suite` each check a wheel against the digest its build recorded, then run the suite on it with CPython 3.10.22 and 3.15.1, on the wheel's own processor and C library. The publish job needs all four. CI also runs the suite on musl, in `test-python-musl`.
+- **The release workflow runs the Python suite on each wheel, all but the two modules that need the `test-support` build, and publishes only after every run passes.**
 
 ### Format
 
-Every directory this release saves declares format version 5.0.0 and lists its features, and a 5.x manifest without its features is refused. A 5.0.0 directory holds its journal as a directory of segments, records as `identity.sequence` the last journal sequence its records include, and lists no `identity` feature, since every 5.0.0 directory holds one. This release reads 1.x, 2.x, 3.x, 4.x and 5.x, so a directory an earlier release saved opens here, and saving it again writes 5.0.0. A journaled directory at 3.0.0, 3.1.0 or 4.0.0 is written again at 5.0.0 when it opens. 0.5.0 to 0.13.0 refuse a 5.0.0 directory at the version check with a message naming the newer release, and 0.3.0 to 0.4.1, which read no format version, refuse it when they decode its `mappings.bin`. A 5.0.0 directory holds its graph dump at version 2, which holds each record's stored vector, code or scalar row, and its `metadata.json` names the records that hold a field. A directory at 1.x to 4.x opens with its version 1 dump read, and saving it again writes 5.0.0.
+Every directory this release saves declares format version 5.0.0, with its journal as a directory of segments and its graph dump at version 2. This release reads 1.x to 5.x, and 0.5.0 to 0.13.0 refuse a 5.0.0 directory at the version check.
 
 ## [0.13.0] - 2026-10-17
 

@@ -1002,7 +1002,7 @@ dependencies = [
 
 [[package]]
 name = "zeusdb-vector-core"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "rand",
  "rand_chacha",
@@ -1016,7 +1016,7 @@ dependencies = [
 
 [[package]]
 name = "zeusdb-vector-hnsw"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "chrono",
  "rand",
@@ -1031,7 +1031,7 @@ dependencies = [
 
 [[package]]
 name = "zeusdb-vector-python"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "chrono",
  "numpy",
@@ -1046,7 +1046,7 @@ dependencies = [
 
 [[package]]
 name = "zeusdb-vector-sparse"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "serde",
  "tempfile",
@@ -1056,7 +1056,7 @@ dependencies = [
 
 [[package]]
 name = "zeusdb-vector-text"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "serde",
  "zeusdb-vector-core",
