@@ -630,7 +630,7 @@ The `search()` method retrieves the top-k most similar vectors from the index gi
 
 | Parameter         | Type                            | Default   | Description                                                                 |
 |------------------|----------------------------------|-----------|-----------------------------------------------------------------------------|
-| `vector`         | `List[float]`, `List[List[float]]`, or `np.ndarray`  | *required* | The query vector (single: `List[float]` or 1D `np.ndarray`) or batch of query vectors (`List[List[float]]` or 2D `np.ndarray`). Must match the index dimension and contain only finite values. |
+| `vector`         | `List[float]`, `List[List[float]]`, or `np.ndarray`  | *required* | The query vector (single: `List[float]` or 1D `np.ndarray`) or batch of query vectors (`List[List[float]]` or 2D `np.ndarray`). Must match the index dimension and contain only finite values within the float32 range. |
 | `filter`         | `Dict[str, Any] \| None`         | `None`    | Optional metadata filter. Values may be a plain value for equality or a dict of operators, and `$and`, `$or` and `$not` compose them. See [Filter Operators](#-filter-operators-reference) and [Boolean composition](#-boolean-composition). |
 | `top_k`          | `int`                            | `10`      | Number of nearest neighbors to return, from 0 to 65,536. |
 | `ef_search`      | `int \| None`                    | see below | Search complexity parameter, from 0 to 131,072. Higher values improve accuracy at the cost of speed. |
@@ -2497,7 +2497,7 @@ sparse 50 22
 
 | Key | Means |
 |-----|-------|
-| `admit` | The shape the filter compiled to, and how many records it admits |
+| `admit` | The shape the filter compiled to, with `admitted` under `bitmap` and `sorted`, and `bound` under `bounded` |
 | `arms` | One entry per arm, carrying its space, kind, fetch, estimated cost and whether its page is exact |
 | `fusion` | The rule the pages combine under, or `None` for one arm |
 
@@ -2612,9 +2612,9 @@ python your_app.py
 | `ZEUSDB_LOG_LEVEL` | `trace`, `debug`, `info`, `warn`, `error` | `warn` (dev), `error` (prod) | Controls log verbosity. `warning` and `warn` are the same level, and the engine reads `critical`, `fatal`, `err` and `error` as `error`. An unrecognised name falls back to the default. |
 | `ZEUSDB_LOG_FORMAT` | `human`, `json` | `human` (dev), `json` (prod) | Output format |
 | `ZEUSDB_LOG_TARGET` | `stdout`, `stderr`, `file` | `stderr`, or `file` where `ZEUSDB_LOG_FILE` is set | Where logs go |
-| `ZEUSDB_LOG_FILE` | `/path/to/file.log` | `zeusdb.log` | Log file path, written exactly as given |
+| `ZEUSDB_LOG_FILE` | `/path/to/file.log` | `zeusdb.log` | Log file path, written as given. Where it names no file, such as `.`, the engine writes `zeusdb.log` in the working folder |
 | `ZEUSDB_LOG_ROTATION` | `daily`, `never` | `never` | With `daily`, a UTC date is appended to the file name |
-| `ZEUSDB_LOG_CONSOLE` | `true`, `false` | Auto-detected | Force console output |
+| `ZEUSDB_LOG_CONSOLE` | `true`, `false` | Auto-detected | `true` sends the Python layer's records to stderr, and `false` keeps them off it only where the Python layer writes a log file it can open. The engine's records follow `ZEUSDB_LOG_TARGET`, or go to stderr where the log file cannot be opened |
 | `ZEUSDB_DISABLE_AUTO_LOGGING` | `true`, `1`, `yes` | unset | Skip automatic configuration entirely |
 | `RUST_LOG` | standard `env_logger` syntax | unset | Overrides `ZEUSDB_LOG_LEVEL` for the Rust layer |
 
@@ -2671,7 +2671,7 @@ print("initialized:", success)
 vdb = zeusdb_vector_database.VectorDatabase()
 ```
 
-**Only the first initializer to run takes effect.** Both functions return `True` if they installed the subscriber and `False` if one was already installed, and raise `ValueError` for a level they cannot read, so calling both leaves the second with no effect and a `False` return. Before logging is set up, `init_file_logging()` raises `OSError` for a folder it cannot make or a log file it cannot open, and leaves logging as it was. `zeusdb_vector_database.is_logging_initialized()` reports whether either has run.
+**Only the first initializer to run takes effect.** Both functions return `True` if they installed the subscriber and `False` if one was already installed, and, where `RUST_LOG` is unset or does not parse, raise `ValueError` for a level they cannot read, so calling both leaves the second with no effect and a `False` return. Before logging is set up, `init_file_logging()` raises `OSError` for a folder it cannot make or a log file it cannot open, and leaves logging as it was. `zeusdb_vector_database.is_logging_initialized()` reports whether either has run.
 
 **The file target is drained at exit.** Records reach the file through a background writer, so a record emitted immediately before the process ends is still in flight when it ends. Importing the package registers the drain with `atexit`, which covers a normal exit and needs no call. `zeusdb_vector_database.shutdown_logging()` runs the same drain on demand and returns `True` if it drained a file appender, or `False` if there was nothing to drain, which is the answer for the `stdout` and `stderr` targets and for a second call. It closes the file, so records emitted after it are discarded. Nothing runs on `os._exit` or on a crash, and records still in flight at either are lost.
 

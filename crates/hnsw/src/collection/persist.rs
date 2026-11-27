@@ -238,7 +238,8 @@ impl Collection {
     /// The first value the collection holds past what the bound on a
     /// vector's norm or the bound on a sparse value allows, named with the
     /// file `sources` says it came from: under l2, dot or l1 a raw vector
-    /// whose norm passes `NORM_BOUND`, then a codebook value past 2^62, then
+    /// whose norm passes `NORM_BOUND`, a record's before that of a node no
+    /// record holds, then a codebook value past 2^62, then
     /// a scale past the largest one vectors within the bound fit, then a
     /// term weighting `k1` past `SPARSE_BOUND`, then a sparse value whose
     /// magnitude passes it. `None` for every collection this build writes,
@@ -260,9 +261,53 @@ impl Collection {
             let node_at = index.node_at();
             let graph = index.graph();
             let origin_ids = graph.origin_ids();
+            let replayed = |node: u32| {
+                origin_ids
+                    .get(node as usize)
+                    .is_some_and(|&internal_id| internal_id >= sources.counter)
+            };
+            let allowed = || {
+                format!(
+                    "2^62 ({:e}), the largest norm an index under {} takes",
+                    NORM_BOUND,
+                    self.dense().metric
+                )
+            };
+            // The nodes a record holds, so the pass after this one reads
+            // every other node once.
+            let mut held = vec![false; origin_ids.len()];
             for at in ids.slots() {
                 let Some(&node) = node_at.get(at) else {
                     continue;
+                };
+                if let Some(slot) = held.get_mut(node as usize) {
+                    *slot = true;
+                }
+                let Some(vector) = graph.raw_vector_at(node) else {
+                    continue;
+                };
+                let Screen::PastBound { norm } = screen(vector, true) else {
+                    continue;
+                };
+                return Some(PastBound {
+                    file: sources.file(replayed(node), sources.raw),
+                    detail: format!(
+                        "the vector of '{}', whose Euclidean norm is {:e}",
+                        ids.read_name(at).unwrap_or_default(),
+                        norm
+                    ),
+                    allowed: allowed(),
+                });
+            }
+            // A node no record holds keeps its vector, being the node of a
+            // record a removal or an overwrite left, and a save writes every
+            // node, so its vector is held to the bound as well.
+            for (node, &kept) in held.iter().enumerate() {
+                if kept {
+                    continue;
+                }
+                let Ok(node) = u32::try_from(node) else {
+                    break;
                 };
                 let Some(vector) = graph.raw_vector_at(node) else {
                     continue;
@@ -270,21 +315,13 @@ impl Collection {
                 let Screen::PastBound { norm } = screen(vector, true) else {
                     continue;
                 };
-                let replayed = origin_ids
-                    .get(node as usize)
-                    .is_some_and(|&internal_id| internal_id >= sources.counter);
                 return Some(PastBound {
-                    file: sources.file(replayed, sources.raw),
+                    file: sources.file(replayed(node), sources.raw),
                     detail: format!(
-                        "the vector of '{}', whose Euclidean norm is {:e}",
-                        ids.read_name(at).unwrap_or_default(),
+                        "the vector of a removed or replaced record, whose Euclidean norm is {:e}",
                         norm
                     ),
-                    allowed: format!(
-                        "2^62 ({:e}), the largest norm an index under {} takes",
-                        NORM_BOUND,
-                        self.dense().metric
-                    ),
+                    allowed: allowed(),
                 });
             }
         }

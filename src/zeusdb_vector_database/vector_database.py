@@ -536,20 +536,22 @@ class VectorDatabase:
         index on the same directory, in this process or another, raises
         RuntimeError (CollectionLocked). A journaled directory on a medium
         that refuses writes, or one this process has no permission to write,
-        opens read only with a RuntimeWarning: every record is replayed in
-        memory, nothing on the medium changes, add() names every record in
-        errors, every other change is refused with RuntimeError
-        (CollectionReadOnly), and save() into another directory copies it
-        somewhere writable. A directory holding a feature this build does
+        opens read only with a RuntimeWarning where the load replays its
+        journal: every record is replayed in memory, nothing on the medium
+        changes, add() names every record in errors, every other change is
+        refused with RuntimeError (CollectionReadOnly), and save() into
+        another directory copies it somewhere writable. A directory holding a
+        feature this build does
         not know, which its manifest marks read_only, opens read only the
         same way whatever the medium, where its journal holds no record of a
         kind this build does not know, and there add() names every record in
         errors, and every other change, every save, checkpoint(), journal_to()
         and backup() is refused with RuntimeError (FeatureReadOnly). A
         journaled directory below format 5.0.0 whose identity records the
-        largest generation a manifest can hold opens read only the same way,
-        since its upgrade is a save and no save can record the generation
-        after it, and add() names every record in errors, and every other
+        largest generation a manifest can hold opens read only the same way
+        where the load replays its journal, since that load's upgrade is a
+        save and no save can record the generation after it, and add() names
+        every record in errors, and every other
         change, save, checkpoint() and backup() is refused with RuntimeError
         naming that generation. A directory a release before 0.14.0 wrote
         from values past a bound, being a stored vector of an l2, dot or l1

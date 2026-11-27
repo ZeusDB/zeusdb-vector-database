@@ -80,8 +80,8 @@ pub use bitmap::Bitmap;
 pub use checksum::checksum_of;
 pub use columns::{validate_indexed_fields, ColumnParts, ColumnStore, Selection};
 pub use distance::{
-    norm_f64, past_bound_words, raw_distance, screen, CodeKernel, CosineDist, DistPQ, DotDist,
-    Int8Dist, Int8Metric, L1Dist, L2Dist, PqMetric, Screen, NORM_BOUND,
+    norm_f64, not_finite_words, past_bound_words, raw_distance, screen, CodeKernel, CosineDist,
+    DistPQ, DotDist, Int8Dist, Int8Metric, L1Dist, L2Dist, PqMetric, Screen, NORM_BOUND,
 };
 pub use error::{Error, Exception};
 pub use filter::{compile_filter, matches_filter, FieldLookup, Filter};

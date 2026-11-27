@@ -650,6 +650,37 @@ def test_a_directory_holding_a_value_past_the_bound_opens_read_only(tmp_path, na
     assert files_of(path.parent) == before
 
 
+# r5's node in the three raw fixtures, which 0.13.0 kept with its vector when
+# it removed r5.
+REMOVED_NODE = 5
+
+
+@pytest.mark.parametrize("name", ["v4.0.0-raw-l2", "v4.0.0-raw-dot", "v4.0.0-raw-l1"])
+def test_a_removed_records_vector_past_the_bound_opens_the_directory_read_only(tmp_path, name):
+    """0.13.0 kept the node of a record it removed, with its vector, and a
+    load keeps that node in the graph. Where that vector's Euclidean norm
+    passes 2^62, the directory holds a value past the bound as one holding a
+    live record's does: it opens read only with a RuntimeWarning naming the
+    vector, and no save writes it again."""
+    path = opened_copy(name, tmp_path)
+    set_in_version_1_row(path, REMOVED_NODE, 4, 1e19)
+    index, messages = loaded_with_warnings(path)
+    assert index.recovery["read_only"] is True, (index.recovery, messages)
+    reason = index.recovery["read_only_reason"]
+    assert reason.startswith("hnsw_index.zdbgraph holds the vector of a removed or replaced "
+                             "record, whose Euclidean norm is "), reason
+    assert reason.endswith(PAST_THE_BOUND), reason
+    [message] = messages
+    assert reason in message and "opened read only" in message, message
+    copy = tmp_path / "copy.zdb"
+    with pytest.raises(RuntimeError) as refusal:
+        index.save(str(copy))
+    assert reason in str(refusal.value)
+    del index
+    gc.collect()
+    assert not copy.exists()
+
+
 # ============================================================================
 # A SPARSE VALUE PAST THE BOUND ON ITS MAGNITUDE
 # ============================================================================

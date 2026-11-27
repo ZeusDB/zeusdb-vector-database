@@ -179,8 +179,13 @@ pub enum Error {
     SearchVectorEmpty,
     /// A query vector of the wrong width
     SearchVectorDimension { expected: usize, got: usize },
-    /// A query vector holding a NaN or an infinity
-    SearchVectorNotFinite { index: usize, value: f32 },
+    /// A query vector holding a NaN or an infinity, with the value the
+    /// caller gave there where a reader of the query read it
+    SearchVectorNotFinite {
+        index: usize,
+        value: f32,
+        given: Option<f64>,
+    },
     /// A record vector with no components
     VectorEmpty,
     /// A record vector of the wrong width
@@ -193,11 +198,13 @@ pub enum Error {
         expected: usize,
         got: usize,
     },
-    /// A vector in a query batch holding a NaN or an infinity
+    /// A vector in a query batch holding a NaN or an infinity, with the
+    /// value the caller gave there where a reader of the batch read it
     BatchVectorNotFinite {
         position: usize,
         index: usize,
         value: f32,
+        given: Option<f64>,
     },
     /// A NumPy array whose shape is not `(N, dim)`
     BatchArrayShape { dim: usize, shape: Vec<usize> },
@@ -1227,10 +1234,15 @@ impl fmt::Display for Error {
                 "Search vector dimension mismatch: expected {}, got {}",
                 expected, got
             ),
-            SearchVectorNotFinite { index, value } => write!(
+            SearchVectorNotFinite {
+                index,
+                value,
+                given,
+            } => write!(
                 f,
                 "Search vector contains invalid value at index {}: {}",
-                index, value
+                index,
+                crate::not_finite_words(*value, *given)
             ),
             SearchVectorPastBound { norm } => {
                 write!(f, "Search vector {}", crate::past_bound_words(*norm))
@@ -1259,10 +1271,13 @@ impl fmt::Display for Error {
                 position,
                 index,
                 value,
+                given,
             } => write!(
                 f,
                 "Vector {} in batch contains invalid value at index {}: {} (must be finite)",
-                position, index, value
+                position,
+                index,
+                crate::not_finite_words(*value, *given)
             ),
             BatchVectorPastBound { position, norm } => write!(
                 f,

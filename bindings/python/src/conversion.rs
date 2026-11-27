@@ -2,11 +2,8 @@
 //! index stores metadata in, and of a search page into the list of dicts
 //! Python receives.
 //!
-//! Both directions live here because both are needed in two places. The index
-//! reads Python metadata on the way in and writes it back on the way out, and
-//! the persistence loader writes it back too when it replays records through
-//! `add`. `persistence.rs` used to carry its own copy of the outward direction
-//! under the name `convert_json_value_to_python`, which is what this replaces.
+//! The index reads Python metadata on the way in, and writes it back on the
+//! way out, through the functions here. A load reads no Python object.
 //!
 //! These are free functions rather than methods. Nothing here reads any field
 //! of an index, so nothing here needs one.
@@ -91,9 +88,9 @@ pub(crate) fn python_dict_to_value_map(
 /// counting the record's mapping as level one. Each
 /// comes back as the value it was, so any other value is refused, naming
 /// where it sits: a type JSON does not hold with `TypeError`, and a float
-/// that is not finite or an integer outside that range with `ValueError`.
-/// A `numpy` integer, float or bool and a `str` subclass are read by their
-/// value, which comes back exact.
+/// that is not finite, an integer outside that range or a float a float64
+/// holds only rounded with `ValueError`. A `numpy` integer, float or bool and
+/// a `str` subclass are read by their value, which comes back exact.
 pub(crate) fn metadata_value(py_obj: &Bound<PyAny>) -> PyResult<Value> {
     convert_value(py_obj, 2, Rule::Metadata).map_err(Refused::into_error)
 }
@@ -133,6 +130,9 @@ enum Kind {
     NotFinite(String),
     /// An integer outside -2^63 to 2^63 - 1, as Python writes it.
     OutOfRange(String),
+    /// A float of a type other than Python's own that a float64 holds only
+    /// rounded, as Python writes it, with its type's Python name.
+    Rounded { value: String, type_name: String },
     /// A `str` holding a lone surrogate, which UTF-8 does not encode.
     Surrogate,
     /// A mapping's key that is not a `str`, as Python writes it, with its
@@ -200,6 +200,13 @@ impl Refused {
                  metadata value holds, so give it as a string.",
                 place, value
             )),
+            Kind::Rounded { value, type_name } => {
+                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "the value at {} is {}, of type {}, which a float64 holds only rounded, so \
+                     give it as a float or a string.",
+                    place, value, type_name
+                ))
+            }
             Kind::Surrogate => PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
                 "the value at {} is a str holding a lone surrogate, which a metadata value \
                  cannot hold, so remove it.",
@@ -339,7 +346,18 @@ fn convert_value(py_obj: &Bound<PyAny>, depth: usize, rule: Rule) -> Result<Valu
     }
     match rule {
         Rule::Metadata if is_other_float(py_obj)? => {
-            float_value(py_obj, py_obj.extract::<f64>()?, rule)
+            // Kept as a float64, so taken where that is its value and
+            // refused where a float64 holds it only rounded, as it may a
+            // `numpy.longdouble` wider than float64. A NaN equals nothing,
+            // so it goes on to the refusal of a float that is not finite.
+            let f = py_obj.extract::<f64>()?;
+            if !f.is_nan() && !py_obj.eq(f)? {
+                return Err(refused(Kind::Rounded {
+                    value: py_obj.str()?.to_string(),
+                    type_name: py_obj.get_type().name()?.to_string(),
+                }));
+            }
+            float_value(py_obj, f, rule)
         }
         Rule::Metadata => Err(refused(Kind::Type(py_obj.get_type().name()?.to_string()))),
         Rule::Declaration => Ok(Value::String(py_obj.to_string())),

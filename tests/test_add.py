@@ -5,6 +5,7 @@ import decimal
 import fractions
 import gc
 import math
+import numbers
 
 import numpy as np
 import pytest
@@ -1480,3 +1481,93 @@ def test_an_id_that_is_not_a_str_refuses_its_record(bad, words):
     added = index.add([{"id": None, "values": [0.1, 0.2]}, {"id": "a", "values": [0.3, 0.4]}])
     assert added.errors == []
     assert added.ids == ["vec_1", "a"]
+
+
+# ------------------------------------------------------------
+# A float that a float64 holds only rounded
+# ------------------------------------------------------------
+class Rounded:
+    """A real number held exactly, which a float64 may hold only rounded. It
+    registers as numbers.Real, as numpy's float types do."""
+
+    def __init__(self, numerator, denominator):
+        self.fraction = fractions.Fraction(numerator, denominator)
+
+    def __float__(self):
+        return float(self.fraction)
+
+    def __eq__(self, other):
+        try:
+            return fractions.Fraction(other) == self.fraction
+        except (TypeError, ValueError):
+            return NotImplemented
+
+    def __hash__(self):
+        return hash(self.fraction)
+
+    def __repr__(self):
+        return f"Rounded({self.fraction})"
+
+
+numbers.Real.register(Rounded)
+
+
+def test_a_float_a_float64_holds_only_rounded_is_refused():
+    """A metadata value comes back as the value it was. A float of another
+    type that a float64 holds only rounded cannot, so add() refuses its
+    record with ValueError, naming its place, its value and its type, and one
+    a float64 holds exactly is read by its value and comes back equal to it."""
+    index = VectorDatabase().create("hnsw", dim=2, expected_size=10)
+    rounded = index.add({"id": "third", "values": [0.1, 0.2], "metadata": {"x": Rounded(1, 3)}})
+    assert rounded.errors == [
+        "Vector third: Metadata error: ValueError: the value at key 'x' is Rounded(1/3), of type "
+        "Rounded, which a float64 holds only rounded, so give it as a float or a string."
+    ], rounded.errors
+    exact = index.add({"id": "half", "values": [0.1, 0.2],
+                       "metadata": {"x": Rounded(1, 2), "y": np.float32(0.1)}})
+    assert exact.is_success(), exact.errors
+    [record] = index.get_records("half")
+    assert record["metadata"] == {"x": 0.5, "y": float(np.float32(0.1))}
+
+
+@pytest.mark.skipif(np.finfo(np.longdouble).nmant <= np.finfo(np.float64).nmant,
+                    reason="numpy.longdouble is no wider than float64 here")
+def test_a_longdouble_a_float64_holds_only_rounded_is_refused():
+    """Where numpy.longdouble is wider than float64, a value of it that a
+    float64 holds only rounded is refused, naming its place, and one a
+    float64 holds exactly comes back equal to it."""
+    third = np.longdouble(1) / np.longdouble(3)
+    assert np.longdouble(float(third)) != third
+    index = VectorDatabase().create("hnsw", dim=2, expected_size=10)
+    rounded = index.add({"id": "third", "values": [0.1, 0.2], "metadata": {"x": third}})
+    assert rounded.total_errors == 1, rounded.errors
+    assert "the value at key 'x'" in rounded.errors[0], rounded.errors
+    assert "which a float64 holds only rounded" in rounded.errors[0], rounded.errors
+    exact = index.add({"id": "half", "values": [0.1, 0.2], "metadata": {"x": np.longdouble(0.5)}})
+    assert exact.is_success(), exact.errors
+    assert index.get_records("half")[0]["metadata"] == {"x": 0.5}
+
+
+# ------------------------------------------------------------
+# A finite value past what a float32 holds
+# ------------------------------------------------------------
+def test_add_names_a_value_past_the_float32_range_as_given():
+    """A finite value past what a float32 holds is refused, and add() names
+    it as the caller gave it, in every shape that reads a list or a float64
+    array. A NaN or an infinity given is named as it was."""
+    given = "contains invalid value at index 0: 1e39, which a float32 holds as inf"
+    shapes = {
+        "single object": ({"id": "a", "values": [1e39, 0.0]}, f"Vector a: Vector {given}"),
+        "list of records": ([{"id": "a", "values": [1e39, 0.0]}], f"Vector a: Vector {given}"),
+        "list batch": ({"ids": ["a"], "vectors": [[1e39, 0.0]]}, f"Vector a: Vector {given}"),
+        "float64 array batch": ({"ids": ["a"], "vectors": np.array([[1e39, 0.0]])},
+                                f"Vector a: {given} (must be finite)"),
+        "bare float64 array": (np.array([[1e39, 0.0]]), f"Vector row_0: {given} (must be finite)"),
+        "an infinity given": ({"id": "a", "values": [math.inf, 0.0]},
+                              "Vector a: Vector contains invalid value at index 0: inf"),
+    }
+    index = VectorDatabase().create("hnsw", dim=2, expected_size=10)
+    for shape, (data, error) in shapes.items():
+        added = index.add(data)
+        assert added.errors == [error], (shape, added.errors)
+    assert len(index) == 0

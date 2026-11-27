@@ -33,6 +33,16 @@ def _autolog_disabled() -> bool:
     )
 
 
+def _or_none(read):
+    """What read() gives, or None where it raises OSError, as os.getcwd()
+    and os.path.abspath of a relative path do where the working folder is
+    gone."""
+    try:
+        return read()
+    except OSError:
+        return None
+
+
 def _auto_configure_logging():
     """
     Smart auto-configuration that handles the 3 key scenarios:
@@ -339,12 +349,17 @@ def _configure_python_logging(config: Dict[str, Any]):
             handlers.append(file_handler)
             
         except (OSError, PermissionError) as e:
-            # ENHANCEMENT: Gather detailed error context
+            # ENHANCEMENT: Gather detailed error context. The working folder
+            # is read in a guard, since where it is gone os.getcwd() raises
+            # and so does os.path.abspath of a relative path, and a field it
+            # cannot give reads 'unknown'.
+            absolute_path = _or_none(lambda: os.path.abspath(log_file_path))
+            parent_dir = log_dir if log_dir else _or_none(os.getcwd)
             error_context = {
                 'attempted_path': log_file_path,
-                'absolute_path': os.path.abspath(log_file_path),
-                'parent_dir': log_dir if log_dir else os.getcwd(),
-                'parent_dir_exists': os.path.exists(log_dir) if log_dir else True,
+                'absolute_path': absolute_path if absolute_path is not None else 'unknown',
+                'parent_dir': parent_dir if parent_dir is not None else 'unknown',
+                'parent_dir_exists': parent_dir is not None and os.path.exists(parent_dir),
                 'parent_dir_writable': None,
                 'disk_space_available': None,
                 'error_type': type(e).__name__,

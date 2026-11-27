@@ -101,7 +101,11 @@ impl DenseSpace {
                     value = value,
                     "Search vector contains invalid value"
                 );
-                return Err(Error::SearchVectorNotFinite { index, value });
+                return Err(Error::SearchVectorNotFinite {
+                    index,
+                    value,
+                    given: None,
+                });
             }
             Screen::PastBound { norm } => {
                 error!(

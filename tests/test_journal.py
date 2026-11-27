@@ -706,3 +706,35 @@ def test_journal_bytes_counts_a_segment_a_checkpoint_cannot_delete(tmp_path):
     assert len(held) == 2, held
     assert stats["journal_segments"] == "2", stats["journal_segments"]
     assert int(stats["journal_bytes"]) == lengths, (stats["journal_bytes"], lengths)
+
+
+# ------------------------------------------------------------
+# An empty segment a checkpoint cannot remove gives way at the next one
+# ------------------------------------------------------------
+@pytest.mark.skipif(os.name != "nt", reason="an open file stops its deletion on Windows alone")
+def test_an_empty_segment_a_checkpoint_cannot_remove_gives_way_at_the_next_checkpoint(tmp_path):
+    """A checkpoint with no change since the last one replaces the empty
+    segment that one left. Where another handle holds that segment open
+    without leave to delete it, the checkpoint raises, the segment stays in
+    the journal and in journal_segments and journal_bytes, and the journal
+    takes nothing more. Once the handle is closed, the next checkpoint
+    removes it, and the index takes changes again and keeps them. The
+    journal's Rust tests hold the same on every system."""
+    path = tmp_path / "namesake.zdb"
+    index = build(20)
+    index.journal_to(str(path))
+    add(index, 20, 40)
+    index.checkpoint()
+    [segment] = sorted(journal_of(path).glob("*.zdbseg"))
+    assert segment.stat().st_size == SEGMENT_HEADER_BYTES
+    with open(segment, "rb"):
+        with pytest.raises(RuntimeError, match="could not give way"):
+            index.checkpoint()
+        stats = index.get_stats()
+    assert stats["journal_segments"] == "1", stats["journal_segments"]
+    assert stats["journal_bytes"] == str(SEGMENT_HEADER_BYTES), stats["journal_bytes"]
+    index.checkpoint()
+    add(index, 40, 60)
+    del index
+    gc.collect()
+    assert len(VectorDatabase().load(str(path))) == 60

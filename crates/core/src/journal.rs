@@ -2270,15 +2270,19 @@ impl JournalWriter {
             first_sequence: number,
         });
         if let Err(error) = file.write_all(&header).and_then(|()| file.sync_all()) {
+            let length = file.length().unwrap_or(0);
             drop(file);
-            let left = match self
-                .dir
-                .remove_segment(number)
-                .and_then(|()| self.dir.sync())
-            {
-                Ok(()) => Left::Nothing,
+            let left = match self.dir.remove_segment(number) {
+                Ok(()) => match self.dir.sync() {
+                    Ok(()) => Left::Nothing,
+                    Err(cause) => Left::Abandoned {
+                        cause: cause.to_string(),
+                        kept: None,
+                    },
+                },
                 Err(cause) => Left::Abandoned {
                     cause: cause.to_string(),
+                    kept: Some(length),
                 },
             };
             return Err(fail("write the header of", error, left));
@@ -2623,7 +2627,8 @@ impl JournalWriter {
     /// which holds no record, so that the checkpoint's roll gives way to it.
     /// The other is a segment whose header failed and whose removal could
     /// not be made durable, which may come back after a power loss naming
-    /// sequences the full segment would go on to hold.
+    /// sequences the full segment would go on to hold. One that stands is
+    /// counted until the checkpoint's roll removes it.
     fn roll_if_full(&mut self) {
         let Some(active) = &self.active else {
             return;
@@ -2673,7 +2678,14 @@ impl JournalWriter {
                      checkpoint() succeeds."
                 ));
             }
-            Left::Abandoned { cause } => {
+            Left::Abandoned { cause, kept } => {
+                if let Some(bytes) = kept {
+                    self.others.push(Other {
+                        number,
+                        bytes,
+                        stale: false,
+                    });
+                }
                 warn!(target: LOG_TARGET, operation = "journal_segment_abandoned",
                     journal = %self.path.display(),
                     error = %error,
@@ -2703,14 +2715,19 @@ impl JournalWriter {
     /// and delete every segment that checkpoint holds.
     ///
     /// The checkpoint names the sequence the writer has reached, so the new
-    /// segment begins at the next one. An empty active segment named for
-    /// the same sequence gives way first. The new segment's header and the
-    /// directory's entries are synced before anything is deleted, and the
-    /// directory's entries again after. A segment that will not be deleted
-    /// is left, since a later open deletes it, and logged. Where the new
-    /// segment cannot be created the writer takes nothing more, since
-    /// records appended under the old checkpoint would be refused by the
-    /// next open, and a later checkpoint tries again.
+    /// segment begins at the next one. A segment the writer holds under that
+    /// name holds no record, being the empty active segment of the
+    /// checkpoint before or one an earlier roll could not remove, and it
+    /// gives way first. One that will not be removed stays among the
+    /// segments the writer counts and the roll is refused, so the writer
+    /// takes nothing more and a later checkpoint's roll removes it. The new
+    /// segment's header and the directory's entries are synced before
+    /// anything is deleted, and the directory's entries again after. A
+    /// segment the checkpoint holds that will not be deleted is left, since a
+    /// later open deletes it, and logged. Where the new segment cannot be
+    /// created the writer takes nothing more, since records appended under
+    /// the old checkpoint would be refused by the next open, and a later
+    /// checkpoint tries again.
     ///
     /// A sync of the directory that fails stops the writer until a later
     /// checkpoint's roll lands, and the roll returns the failure. One after
@@ -2731,8 +2748,19 @@ impl JournalWriter {
             .as_ref()
             .is_some_and(|a| a.number == number && a.length == SEGMENT_HEADER_BYTES as u64);
         if empty_namesake {
+            // Closed before its removal, since a segment open for writing
+            // cannot be deleted on Windows, and counted among the others
+            // until the removal lands.
             *self.lock_slot() = None;
-            self.active = None;
+            if let Some(active) = self.active.take() {
+                self.others.push(Other {
+                    number,
+                    bytes: active.length,
+                    stale: false,
+                });
+            }
+        }
+        if let Some(at) = self.others.iter().position(|o| o.number == number) {
             if let Err(error) = self.dir.remove_segment(number) {
                 let reason = format!(
                     "the empty segment numbered {number} could not give way to the checkpoint's \
@@ -2745,6 +2773,7 @@ impl JournalWriter {
                     error: reason,
                 });
             }
+            self.others.remove(at);
         }
         let file = match self.create_segment(number, base).map_err(|boxed| *boxed) {
             Ok(file) => file,
@@ -2767,7 +2796,17 @@ impl JournalWriter {
                     error: reason,
                 });
             }
-            Err(NotCreated { error, .. }) => {
+            Err(NotCreated { error, left, .. }) => {
+                if let Left::Abandoned {
+                    kept: Some(bytes), ..
+                } = left
+                {
+                    self.others.push(Other {
+                        number,
+                        bytes,
+                        stale: false,
+                    });
+                }
                 self.poisoned = Some(format!(
                     "the segment naming the checkpoint at sequence {} could not be created \
                      ({error}), so the journal takes nothing more until checkpoint() succeeds.",
@@ -2922,9 +2961,11 @@ enum Left {
         cause: String,
     },
     /// The segment, whose header did not reach the device and whose removal
-    /// could not be made durable, with that error. It may stand, or come
-    /// back after a power loss.
-    Abandoned { cause: String },
+    /// could not be made durable, with that error. `kept` is its length
+    /// where the removal failed, so it stands and the writer counts it until
+    /// a roll removes it, and `None` where it was removed and the sync after
+    /// failed, so it may come back after a power loss.
+    Abandoned { cause: String, kept: Option<u64> },
 }
 
 // ============================================================================

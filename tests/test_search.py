@@ -1439,3 +1439,29 @@ def test_explain_prices_a_dense_arm_at_its_own_ef_search():
         return index.explain([{"vector": [0.1] * 4, **arm}])["arms"][0]["cost_ns"]
 
     assert price(ef_search=1000) > price()
+
+
+# ------------------------------------------------------------
+# A finite value past what a float32 holds, in a query
+# ------------------------------------------------------------
+def test_search_query_and_explain_name_a_value_past_the_float32_range_as_given():
+    """search(), query() and explain() refuse a query holding a finite value
+    past what a float32 holds with ValueError, naming it as given, from a
+    list or a float64 array, alone or in a batch."""
+    index = VectorDatabase().create("hnsw", dim=2, expected_size=10)
+    index.add({"ids": ["a", "b"], "vectors": [[0.1, 0.2], [0.3, 0.4]]})
+    one = "Search vector contains invalid value at index 0: 1e39, which a float32 holds as inf"
+    batch = ("Vector 0 in batch contains invalid value at index 0: 1e39, which a float32 holds "
+             "as inf (must be finite)")
+    calls = {
+        "search, a list": (lambda: index.search([1e39, 0.0], top_k=1), one),
+        "search, a float64 array": (lambda: index.search(np.array([1e39, 0.0]), top_k=1), one),
+        "search, a batch list": (lambda: index.search([[1e39, 0.0]], top_k=1), batch),
+        "search, a float64 batch": (lambda: index.search(np.array([[1e39, 0.0]]), top_k=1), batch),
+        "query": (lambda: index.query(arms=[{"vector": [1e39, 0.0]}]), one),
+        "explain": (lambda: index.explain(arms=[{"vector": [1e39, 0.0]}]), one),
+    }
+    for name, (call, words) in calls.items():
+        with pytest.raises(ValueError) as refusal:
+            call()
+        assert str(refusal.value) == words, (name, str(refusal.value))

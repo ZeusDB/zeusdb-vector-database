@@ -1140,6 +1140,16 @@ pub fn norm_f64(values: &[f32]) -> f64 {
         .sqrt()
 }
 
+/// The words a refusal names a component with that the check of a vector
+/// found not finite: the value the caller gave, where it is finite and a
+/// float32 holds it as an infinity, and the value the check read otherwise.
+pub fn not_finite_words(value: f32, given: Option<f64>) -> String {
+    match given {
+        Some(given) if given.is_finite() => format!("{given:e}, which a float32 holds as {value}"),
+        _ => value.to_string(),
+    }
+}
+
 /// What a refusal for a norm past [`NORM_BOUND`] says after it names the
 /// vector, in the form of the refusal of a value that is not finite.
 pub fn past_bound_words(norm: f64) -> String {

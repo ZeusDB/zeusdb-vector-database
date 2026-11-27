@@ -1679,3 +1679,27 @@ def test_a_cosine_query_whose_sum_of_squares_underflows_scores_as_its_direction(
                      ).is_success()
     [hit] = index.search([3e-23, 0.0, 0.0, 0.0], top_k=1)
     assert hit["id"] == "x" and abs(hit["score"]) < 1e-6, hit
+
+
+# ------------------------------------------------------------
+# A sparse value and a fusion constant past what a float32 holds
+# ------------------------------------------------------------
+def test_a_sparse_value_and_a_fusion_constant_past_the_float32_range_are_named_as_given():
+    """A sparse value and the k of a fusion are read as float32 as well, and
+    a finite one past what a float32 holds is refused naming it as given, in
+    add() and in query()."""
+    index = VectorDatabase().create("hnsw", dim=2, space="l2", expected_size=10, sparse={})
+    index.add({"id": "s0", "values": [0.1, 0.2], "sparse": {"dims": [1], "values": [1.0]}})
+    added = index.add({"id": "s", "values": [0.1, 0.2],
+                       "sparse": {"dims": [1], "values": [1e39]}})
+    assert added.errors == [
+        "Vector s: 'sparse' value at index 0 is 1e39, which a float32 holds as inf"
+    ], added.errors
+    with pytest.raises(ValueError) as refusal:
+        index.query(arms=[{"sparse": {"dims": [1], "values": [1e39]}}])
+    assert str(refusal.value) == (
+        "arms[0] 'sparse' value at index 0 is 1e39, which a float32 holds as inf")
+    with pytest.raises(ValueError) as refusal:
+        index.query(arms=[{"vector": [0.1, 0.2]}, {"sparse": {"dims": [1], "values": [1.0]}}],
+                    fusion={"type": "rrf", "k": 1e39})
+    assert str(refusal.value) == "fusion['k'] is 1e39, which a float32 holds as inf"

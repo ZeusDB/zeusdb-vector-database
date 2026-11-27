@@ -56,7 +56,7 @@ use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use tracing::{error, trace};
-use zeusdb_vector_core::{past_bound_words, Error, Screen, SparseVector};
+use zeusdb_vector_core::{not_finite_words, past_bound_words, Error, Screen, SparseVector};
 
 /// A record's sparse half as it arrived: nothing, a vector of term ids and
 /// weights, or a text the space's text layer counts.
@@ -169,9 +169,15 @@ pub(super) fn extract_sparse_vector(value: &Bound<PyAny>) -> Result<SparseVector
             })
         })
         .collect::<Result<Vec<u32>, String>>()?;
-    let values: Vec<f32> = values
+    let given: Vec<f64> = values
         .extract()
         .map_err(|_| "'sparse' values must be a list of numbers".to_string())?;
+    let values = narrowed_finite(&given).map_err(|(index, given, held)| {
+        format!(
+            "'sparse' value at index {} is {:e}, which a float32 holds as {}",
+            index, given, held
+        )
+    })?;
     Ok(SparseVector { dims, values })
 }
 
@@ -259,6 +265,16 @@ impl<'py> Rows<'py> {
         }
     }
 
+    /// The value the caller gave at `component` of row `row`, where the
+    /// array is of `float64`, which [`Rows::flat`] narrows to the `f32` the
+    /// index stores, and `None` where it is of `float32`.
+    fn given(&self, row: usize, component: usize) -> Option<f64> {
+        match self {
+            Rows::F32(_) => None,
+            Rows::F64(array) => array.as_array().get([row, component]).copied(),
+        }
+    }
+
     /// Every value, row after row, whatever the array's layout in memory,
     /// refusing an array whose rows are not `dim` wide with
     /// `BatchArrayShape`. A C-ordered array is read in place, and any other
@@ -315,6 +331,61 @@ pub(super) fn c_ordered<'py, T: numpy::Element, D: numpy::ndarray::Dimension>(
 )]
 fn narrowed(values: &[f64]) -> Vec<f32> {
     values.iter().map(|&value| value as f32).collect()
+}
+
+/// Every value of `values` narrowed to `f32`, or the first, by index, that
+/// is finite and that a float32 holds as an infinity, with the value given
+/// and the infinity.
+pub(super) fn narrowed_finite(values: &[f64]) -> Result<Vec<f32>, (usize, f64, f32)> {
+    let held = narrowed(values);
+    match held
+        .iter()
+        .zip(values)
+        .position(|(held, given)| given.is_finite() && !held.is_finite())
+    {
+        Some(index) => Err((index, values[index], held[index])),
+        None => Ok(held),
+    }
+}
+
+/// The value the caller gave at `index` of `vector`, a list, a tuple or a
+/// one dimensional array, read as a float64, where it reads as one.
+pub(super) fn given_at(vector: &Bound<PyAny>, index: usize) -> Option<f64> {
+    vector.get_item(index).ok()?.extract::<f64>().ok()
+}
+
+/// `error` with the value the caller gave where it is a refusal of a query
+/// value that is not finite, read from `vector`, the query or the batch the
+/// caller handed over, for its words to name. Any other error is returned as
+/// it is.
+pub(super) fn with_given(mut error: Error, vector: &Bound<PyAny>) -> Error {
+    match &mut error {
+        Error::SearchVectorNotFinite { index, given, .. } => *given = given_at(vector, *index),
+        Error::BatchVectorNotFinite {
+            position,
+            index,
+            given,
+            ..
+        } => {
+            *given = vector
+                .get_item(*position)
+                .ok()
+                .and_then(|row| given_at(&row, *index));
+        }
+        _ => {}
+    }
+    error
+}
+
+/// The value the caller gave at `index` of the first dense arm of `arms`
+/// whose value there is not finite as a float32. The check of a query's
+/// arms takes them in order and stops at the first it refuses, so that is
+/// the arm a refusal at `index` names.
+pub(super) fn refused_arm_value(arms: &Bound<PyAny>, index: usize) -> Option<f64> {
+    arms.try_iter().ok()?.flatten().find_map(|arm| {
+        let given = given_at(&arm.get_item("vector").ok()?, index)?;
+        (!narrowed(&[given])[0].is_finite()).then_some(given)
+    })
 }
 
 /// Whether `value` is shaped as one vector: a sequence other than a string,
@@ -625,8 +696,7 @@ impl HNSWIndex {
             };
             let Ok(list) = item.cast::<PyList>() else {
                 let tail = if field == "ids" {
-                    "so any other type is discarded whole and every record takes a generated id"
-                        .to_string()
+                    "and with 'ids' left out every record takes a generated id".to_string()
                 } else if field == metadata_field {
                     "with None for a record that carries no metadata".to_string()
                 } else {
@@ -829,7 +899,7 @@ impl HNSWIndex {
                         "Vector {}: contains invalid value at index {}: {} (must be finite)",
                         label(),
                         component,
-                        value
+                        not_finite_words(value, rows.given(i, component))
                     ));
                     rejected += 1;
                     continue;
@@ -1027,7 +1097,9 @@ impl HNSWIndex {
                     );
                     errors.push(format!(
                         "Vector row_{}: contains invalid value at index {}: {} (must be finite)",
-                        i, component, value
+                        i,
+                        component,
+                        not_finite_words(value, rows.given(i, component))
                     ));
                     continue;
                 }
@@ -1095,7 +1167,8 @@ impl HNSWIndex {
             Screen::NotFinite { index, value } => {
                 return Err(format!(
                     "Vector contains invalid value at index {}: {}",
-                    index, value
+                    index,
+                    not_finite_words(value, given_at(data, index))
                 ));
             }
             Screen::PastBound { norm } => {

@@ -8,7 +8,7 @@ forked, while no call on the index runs, from the process that opened a
 journal refuses every mutation with JournalForked, and closes its copy of
 the lock file just after the fork, so the lock stays with the parent.
 A journaled directory this process cannot write opens read only, with a
-RuntimeWarning.
+RuntimeWarning, where the load replays its journal.
 """
 
 import contextlib

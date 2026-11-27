@@ -1721,6 +1721,166 @@ fn a_segment_a_checkpoint_cannot_delete_keeps_its_length_in_journal_bytes() {
     assert_eq!(writer.journal_bytes(), lengths);
 }
 
+/// What a writer holds against the journal's directory: whether it counts
+/// every segment there and every byte of them, in the words of a test that
+/// gathers what it finds wrong.
+fn counts_every_segment(writer: &JournalWriter, storage: &FsStorage, problems: &mut Vec<String>) {
+    let dir = storage.journal_dir();
+    let held = dir.segments().unwrap();
+    let lengths: u64 = held
+        .iter()
+        .map(|number| dir.read_segment(*number).unwrap().len() as u64)
+        .sum();
+    if writer.segments() != held.len() {
+        problems.push(format!(
+            "segments is {} and the journal holds {:?}",
+            writer.segments(),
+            held
+        ));
+    }
+    if writer.journal_bytes() != lengths {
+        problems.push(format!(
+            "journal_bytes is {} and the segments hold {lengths}",
+            writer.journal_bytes()
+        ));
+    }
+}
+
+/// After a roll the writer refused, the roll of the next checkpoint at
+/// `next` lands and the writer appends under it, and the journal then holds
+/// the one segment that names it, holding that call.
+fn the_next_roll_lands(
+    mut writer: JournalWriter,
+    storage: &FsStorage,
+    next: SegmentBase,
+    mut problems: Vec<String>,
+) {
+    let reached = writer.sequence_reached();
+    if let Err(error) = writer.roll_to(next) {
+        problems.push(format!("the next roll was refused: {}", message(error)));
+    } else {
+        writer.append(OperationKind::Insert, b"two").unwrap();
+        writer.commit(CommitMode::Sync).unwrap();
+        drop(writer);
+        let loaded = load(storage);
+        if loaded.numbers != vec![reached + 1] {
+            problems.push(format!("the journal holds {:?}", loaded.numbers));
+        }
+        let expected = Expected {
+            collection_id: COLLECTION,
+            base: next,
+        };
+        let read = states(&loaded.read(&expected).unwrap());
+        if read != vec![(reached + 1, RecordState::Committed)] {
+            problems.push(format!("the journal reads back {read:?}"));
+        }
+    }
+    assert!(problems.is_empty(), "{problems:#?}");
+}
+
+/// The roll of a checkpoint that follows the last one with no commit
+/// between replaces the empty segment that one left. Where that segment
+/// cannot be removed it stays in the journal, in `segments` and in
+/// `journal_bytes`, the roll is refused and the writer takes nothing more,
+/// and the roll of the next checkpoint removes it and lands.
+#[test]
+fn an_empty_segment_a_roll_cannot_remove_gives_way_at_the_next_roll() {
+    let (_tmp, storage) = journal_storage();
+    let (dir, faults) = faulty(&storage);
+    let mut writer = started(dir);
+    writer.append(OperationKind::Insert, b"one").unwrap();
+    writer.commit(CommitMode::Sync).unwrap();
+    let reached = writer.sequence_reached();
+    writer.roll_to(base(LIVE + 1, reached)).unwrap();
+    faults.removes.arm(0, 1);
+    let reason = format!(
+        "the empty segment numbered {} could not give way to the checkpoint's (injected: the \
+         device refused it), so the journal takes nothing more until checkpoint() succeeds.",
+        reached + 1
+    );
+    assert_eq!(
+        message(writer.roll_to(base(LIVE + 2, reached)).unwrap_err()),
+        format!(
+            "Failed to roll the journal {}: {reason}",
+            storage.journal_path().display()
+        )
+    );
+    assert_eq!(
+        load(&storage).numbers,
+        vec![reached + 1],
+        "the empty segment stands"
+    );
+    let mut problems = Vec::new();
+    counts_every_segment(&writer, &storage, &mut problems);
+    assert_eq!(
+        refused_append(&mut writer, "the append after the refused roll"),
+        append_refusal(&storage, &reason)
+    );
+    the_next_roll_lands(writer, &storage, base(LIVE + 3, reached), problems);
+}
+
+/// A segment the roll of a checkpoint creates whose header does not reach
+/// the device, and whose removal fails, stays in the journal and is
+/// counted, and the writer takes nothing more. The roll of the next
+/// checkpoint removes it and lands.
+#[test]
+fn a_segment_a_checkpoint_abandons_gives_way_at_the_next_roll() {
+    abandoned_segment_gives_way(false);
+}
+
+/// The same of a segment a roll by size creates.
+#[test]
+fn a_segment_a_roll_by_size_abandons_gives_way_at_the_next_roll() {
+    abandoned_segment_gives_way(true);
+}
+
+/// A segment whose header and removal fail, in the roll of a checkpoint or
+/// in a roll by size, and the roll of the next checkpoint that removes it.
+fn abandoned_segment_gives_way(by_size: bool) {
+    if by_size {
+        set_segment_roll_bytes(200);
+    }
+    let (_tmp, storage) = journal_storage();
+    let (dir, faults) = faulty(&storage);
+    let mut writer = started(dir);
+    set_segment_roll_bytes(0);
+    if !by_size {
+        writer.append(OperationKind::Insert, b"one").unwrap();
+        writer.commit(CommitMode::Sync).unwrap();
+    }
+    faults.full_syncs.arm(0, 1);
+    faults.removes.arm(0, 1);
+    if by_size {
+        writer.append(OperationKind::Insert, &[1; 100]).unwrap();
+        writer.commit(CommitMode::Sync).unwrap();
+    } else {
+        let reached = writer.sequence_reached();
+        assert!(
+            writer.roll_to(base(LIVE + 1, reached)).is_err(),
+            "the roll whose segment's header failed is refused"
+        );
+    }
+    let reached = writer.sequence_reached();
+    assert_eq!(
+        faults.full_syncs.fail.load(Ordering::SeqCst),
+        0,
+        "the header failed"
+    );
+    assert_eq!(
+        faults.removes.fail.load(Ordering::SeqCst),
+        0,
+        "the removal failed"
+    );
+    assert!(
+        load(&storage).numbers.contains(&(reached + 1)),
+        "the abandoned segment stands"
+    );
+    let mut problems = Vec::new();
+    counts_every_segment(&writer, &storage, &mut problems);
+    refused_append(&mut writer, "the append after the abandoned segment");
+    the_next_roll_lands(writer, &storage, base(LIVE + 2, reached), problems);
+}
+
 /// A fresh writer holds no segment and appends nothing until the checkpoint
 /// it follows names one. Then a call is its records and a commit record
 /// naming the first of them, read back as committed, and a call that

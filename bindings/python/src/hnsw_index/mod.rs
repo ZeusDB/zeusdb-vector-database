@@ -192,6 +192,16 @@ pub struct HNSWIndex {
     recovery: Option<Recovery>,
 }
 
+/// `error` with the value the caller gave where it refuses a dense arm's
+/// value that is not finite, for its words to name. Any other error is
+/// returned as it is.
+fn arm_value_given(mut error: Error, arms: &Bound<PyAny>) -> Error {
+    if let Error::SearchVectorNotFinite { index, given, .. } = &mut error {
+        *given = input::refused_arm_value(arms, *index);
+    }
+    error
+}
+
 /// The queries a `search` call carries: one vector, processed for the space,
 /// or a batch of them.
 enum Queries {
@@ -616,13 +626,14 @@ impl HNSWIndex {
     /// Every shape reads a record's metadata entry the same way. A dict is
     /// the record's metadata, a string is kept under `text`, any other value
     /// is kept under `value`, and `None` is no metadata. A value is None, a
-    /// bool, an integer from -2^63 to 2^63 - 1, a finite float, a string, a
-    /// list of values or a dict with string keys, nested at most 128 levels
-    /// deep, counting the record's metadata as the first, and comes back as
-    /// the value it was. A record
+    /// bool, an integer from -2^63 to 2^63 - 1, a finite float that a float64
+    /// holds exactly, a string, a list of values or a dict with string keys,
+    /// nested at most 128 levels deep, counting the record's metadata as the
+    /// first, and comes back as the value it was. A record
     /// whose metadata holds anything else, or a key that is not a string, is
     /// counted and named the same way as a malformed vector, after the words
-    /// `Metadata error`, which say where the value sits.
+    /// `Metadata error`, which say where the value sits, or that it nests
+    /// deeper than 128 levels.
     ///
     /// # Where the interpreter lock is held
     ///
@@ -967,7 +978,9 @@ impl HNSWIndex {
 
                 // The width and value checks, then the processing every stored
                 // vector had. See `Collection::validate_query`.
-                let processed_query = inner.validate_query(query_vector)?;
+                let processed_query = inner
+                    .validate_query(query_vector)
+                    .map_err(|error| input::with_given(error, &vector))?;
 
                 trace!(
                     operation = "single_search",
@@ -989,7 +1002,8 @@ impl HNSWIndex {
                         params,
                     )?),
                 })
-            })?;
+            })
+            .map_err(|error| input::with_given(error, &vector))?;
             let result: Py<PyAny> = match pages {
                 Pages::One(hits) => PyList::new(py, hits_to_python(hits, py)?)?.into(),
                 Pages::Batch(batches) => {
@@ -1093,10 +1107,12 @@ impl HNSWIndex {
             let top_k = count(top_k, "top_k")?;
             let fetch = count_if_given(fetch, "fetch")?;
             let parsed = self.parse_query(arms, filter, top_k, fetch, fusion)?;
-            let page = py.detach(|| {
-                let arms = parsed.arms();
-                inner.query(&parsed.query(&arms))
-            })?;
+            let page = py
+                .detach(|| {
+                    let arms = parsed.arms();
+                    inner.query(&parsed.query(&arms))
+                })
+                .map_err(|error| arm_value_given(error, arms))?;
             let results_count = page.hits.len();
             let result = page_to_python(page.hits, py)?;
             debug!(
@@ -1161,10 +1177,12 @@ impl HNSWIndex {
             let top_k = count(top_k, "top_k")?;
             let fetch = count_if_given(fetch, "fetch")?;
             let parsed = self.parse_query(arms, filter, top_k, fetch, fusion)?;
-            let plan = py.detach(|| {
-                let arms = parsed.arms();
-                inner.explain(&parsed.query(&arms))
-            })?;
+            let plan = py
+                .detach(|| {
+                    let arms = parsed.arms();
+                    inner.explain(&parsed.query(&arms))
+                })
+                .map_err(|error| arm_value_given(error, arms))?;
             plan_to_python(&plan, py)
         })
     }

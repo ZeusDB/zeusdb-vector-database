@@ -349,9 +349,19 @@ fn parse_fusion(value: Option<&Bound<PyAny>>) -> Result<Fusion, PyEngineError> {
             .extract::<String>()
             .map_err(|_| type_error("fusion['type'] must be a str".to_string()))?;
         let k = present(dict, "k")?
-            .map(|k| k.extract::<f32>())
+            .map(|k| k.extract::<f64>())
             .transpose()
-            .map_err(|_| type_error("fusion['k'] must be a number".to_string()))?;
+            .map_err(|_| type_error("fusion['k'] must be a number".to_string()))?
+            .map(|k| {
+                super::input::narrowed_finite(&[k])
+                    .map(|held| held[0])
+                    .map_err(|(_, given, held)| {
+                        value_error(format!(
+                            "fusion['k'] is {given:e}, which a float32 holds as {held}"
+                        ))
+                    })
+            })
+            .transpose()?;
         (kind, k)
     } else {
         return Err(type_error(format!(

@@ -173,8 +173,9 @@ impl From<PyEngineError> for PyErr {
 /// locked, and a journaled index keeps it for its life, so a second holder is
 /// refused with `RuntimeError` (`CollectionLocked`). A journaled directory on
 /// a medium that refuses writes, or one this process has no permission to
-/// write, opens read only, with a `RuntimeWarning` naming the reason: every
-/// record is replayed in memory, nothing on the medium changes, `add()` names
+/// write, opens read only where the load replays its journal, with a
+/// `RuntimeWarning` naming the reason: every record is replayed in memory,
+/// nothing on the medium changes, `add()` names
 /// every record in `errors`, every other change is refused with
 /// `RuntimeError` (`CollectionReadOnly`), and `save` into another directory
 /// copies it. A directory holding a feature this build does not know, which
@@ -184,8 +185,9 @@ impl From<PyEngineError> for PyErr {
 /// every save, `checkpoint`, `journal_to` and `backup` is refused with
 /// `RuntimeError` (`FeatureReadOnly`). A journaled directory below
 /// format 5.0.0 whose identity records the largest generation a manifest can
-/// hold opens read only the same way, since its upgrade is a save and no save
-/// can record the generation after it: a `RuntimeWarning` names that
+/// hold opens read only the same way where the load replays its journal,
+/// since that load's upgrade is a save and no save can record the generation
+/// after it: a `RuntimeWarning` names that
 /// generation, `add()` names every record in `errors`, and every other
 /// change, save, `checkpoint` and `backup` is refused with `RuntimeError` in
 /// the same words. A directory holding a value past a

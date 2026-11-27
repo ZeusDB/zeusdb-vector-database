@@ -931,3 +931,66 @@ def test_an_unrecognised_format_runs_the_engine_at_the_default_it_names(tmp_path
     assert "HNSW index created successfully" not in err, err[-600:]
     written = log_file.read_text(encoding="utf-8", errors="ignore")
     assert "HNSW index created successfully" in written, written[-600:]
+
+
+# ------------------------------------------------------------
+# The import where the working folder cannot be read
+# ------------------------------------------------------------
+_GONE = r"""
+import os, sys
+gone = sys.argv[1]
+os.mkdir(gone)
+os.chdir(gone)
+os.rmdir(gone)
+import zeusdb_vector_database
+print("imported")
+"""
+
+_UNREADABLE = r"""
+import os
+def gone(*args):
+    raise FileNotFoundError(2, "No such file or directory")
+absolute = os.path.abspath
+def abspath(path):
+    if os.path.isabs(path):
+        return absolute(path)
+    gone()
+os.getcwd = gone
+os.path.abspath = abspath
+import zeusdb_vector_database
+print("imported")
+"""
+
+
+def _import_in(script, cwd, *args, **overrides):
+    """Run `script` with `args` in a fresh interpreter in `cwd`, with the
+    environment _run_script_with_logging_env gives one, and return its exit
+    code, stdout and stderr."""
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("ZEUSDB_") and k != "PYTEST_CURRENT_TEST"}
+    env.update(overrides)
+    proc = subprocess.run([sys.executable, "-c", script, *args], cwd=cwd, env=env,
+                          capture_output=True, text=True, timeout=300)
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows refuses to remove a process's working folder")
+def test_the_import_succeeds_where_the_working_folder_is_gone(tmp_path):
+    """A fresh interpreter whose working folder has been removed imports the
+    package with ZEUSDB_LOG_FILE a relative path, which names a file in a
+    folder that is gone."""
+    code, out, err = _import_in(_GONE, tmp_path, str(tmp_path / "gone"),
+                                ZEUSDB_LOG_FILE="zeusdb-gone.log")
+    assert code == 0 and out.strip() == "imported", err[-2000:]
+
+
+def test_the_import_succeeds_where_the_working_folder_cannot_be_read(tmp_path):
+    """Where the working folder is gone, POSIX's os.getcwd() raises
+    FileNotFoundError, and so does os.path.abspath of a relative path, which
+    reads it. A fresh interpreter in which both raise so, for a relative path
+    alone, imports the package with ZEUSDB_LOG_FILE a relative path that the
+    Python layer cannot open. This stands in for the removed folder on a
+    system that refuses to remove one."""
+    (tmp_path / "folder.log").mkdir()
+    code, out, err = _import_in(_UNREADABLE, tmp_path, ZEUSDB_LOG_FILE="folder.log")
+    assert code == 0 and out.strip() == "imported", err[-2000:]

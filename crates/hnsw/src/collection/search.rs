@@ -910,6 +910,7 @@ impl Collection {
                         position: i,
                         index: component,
                         value,
+                        given: None,
                     });
                 }
                 Screen::PastBound { norm } => {

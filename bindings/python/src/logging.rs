@@ -7,10 +7,11 @@
 //!
 //! - **Global and immutable**: After any initialization (auto or manual), the logging
 //!   configuration is process-global and cannot be changed. Subsequent `init_*` calls
-//!   will return `False` and have no effect, or raise `ValueError` for a level they
-//!   cannot read.
-//! - **File target**: `ZEUSDB_LOG_FILE` names the file that is written, exactly as
-//!   given (e.g. `app.log` writes `app.log`). Set `ZEUSDB_LOG_ROTATION=daily` to
+//!   will return `False` and have no effect, or, where `RUST_LOG` is unset or does not
+//!   parse, raise `ValueError` for a level they cannot read.
+//! - **File target**: `ZEUSDB_LOG_FILE` names the file that is written, as given
+//!   (e.g. `app.log` writes `app.log`), and a path that names no file writes `zeusdb.log`
+//!   in the working folder. Set `ZEUSDB_LOG_ROTATION=daily` to
 //!   bound disk growth, which appends a date (`app.log.2026-08-03`). The resolved
 //!   path is logged at startup either way. Rotation is also available through
 //!   `init_file_logging(log_dir, level, file_prefix)`, whose `file_prefix` is a
@@ -30,7 +31,7 @@
 //! - `ZEUSDB_LOG_LEVEL`: trace, debug, info, warn, error (default: warn)
 //! - `ZEUSDB_LOG_FORMAT`: human, json (default: human)
 //! - `ZEUSDB_LOG_TARGET`: stdout, stderr, file (default: stderr)
-//! - `ZEUSDB_LOG_FILE`: log file path, written exactly as given (default: zeusdb.log)
+//! - `ZEUSDB_LOG_FILE`: log file path, written as given, and `zeusdb.log` in the working folder where it names no file (default: zeusdb.log)
 //! - `ZEUSDB_LOG_ROTATION`: daily, never (default: never). daily appends a date to the file name
 //! - `ZEUSDB_DISABLE_AUTO_LOGGING`: true, 1 or yes to disable auto-init (for programmatic control)
 //! - `ZEUSDB_DISABLE_AUTOLOG`: deprecated alias for the above, honoured for compatibility
