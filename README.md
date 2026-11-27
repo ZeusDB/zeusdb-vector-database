@@ -2611,8 +2611,8 @@ python your_app.py
 |----------|---------|---------|-------------|
 | `ZEUSDB_LOG_LEVEL` | `trace`, `debug`, `info`, `warn`, `error` | `warn` (dev), `error` (prod) | Controls log verbosity. `warning` and `warn` are the same level, and the engine reads `critical`, `fatal`, `err` and `error` as `error`. An unrecognised name falls back to the default. |
 | `ZEUSDB_LOG_FORMAT` | `human`, `json` | `human` (dev), `json` (prod) | Output format |
-| `ZEUSDB_LOG_TARGET` | `stdout`, `stderr`, `file` | `stderr`, or `file` where `ZEUSDB_LOG_FILE` is set | Where logs go |
-| `ZEUSDB_LOG_FILE` | `/path/to/file.log` | `zeusdb.log` | Log file path, written as given. Where it names no file, such as `.`, the engine writes `zeusdb.log` in the working folder |
+| `ZEUSDB_LOG_TARGET` | `stdout`, `stderr`, `file` | `stderr`, or `file` where `ZEUSDB_LOG_FILE` is set and not empty | Where the engine's records go |
+| `ZEUSDB_LOG_FILE` | `/path/to/file.log` | `zeusdb.log` | Log file path, written as given. A path that names a folder, such as `.` or `logs/`, cannot be opened as the log file |
 | `ZEUSDB_LOG_ROTATION` | `daily`, `never` | `never` | With `daily`, a UTC date is appended to the file name |
 | `ZEUSDB_LOG_CONSOLE` | `true`, `false` | Auto-detected | `true` sends the Python layer's records to stderr, and `false` keeps them off it only where the Python layer writes a log file it can open. The engine's records follow `ZEUSDB_LOG_TARGET`, or go to stderr where the log file cannot be opened |
 | `ZEUSDB_DISABLE_AUTO_LOGGING` | `true`, `1`, `yes` | unset | Skip automatic configuration entirely |
@@ -2623,7 +2623,7 @@ Under `ZEUSDB_LOG_ROTATION=daily` with `ZEUSDB_LOG_FILE=logs/app.log`, two files
 #### Smart Environment Detection
 The system detects your environment and applies appropriate defaults:
 
-- **🏭 Production** (`ENVIRONMENT=production`, or Kubernetes or Docker markers): ERROR level, JSON format, to stderr unless `ZEUSDB_LOG_FILE` names a file
+- **🏭 Production** (`ENVIRONMENT=production`, or Kubernetes or Docker markers): ERROR level, JSON format, to stderr unless `ZEUSDB_LOG_FILE` names a file that can be opened
 - **💻 Development** (default): WARNING level, human format, console output
 - **🧪 Testing** (`ENVIRONMENT=testing`, `PYTEST_CURRENT_TEST`, or `pytest` imported): CRITICAL level, minimal output
 - **📓 Jupyter** (`JUPYTER_SERVER_ROOT`, `JPY_PARENT_PID`, or IPython imported): INFO level, human format
@@ -2671,7 +2671,7 @@ print("initialized:", success)
 vdb = zeusdb_vector_database.VectorDatabase()
 ```
 
-**Only the first initializer to run takes effect.** Both functions return `True` if they installed the subscriber and `False` if one was already installed, and, where `RUST_LOG` is unset or does not parse, raise `ValueError` for a level they cannot read, so calling both leaves the second with no effect and a `False` return. Before logging is set up, `init_file_logging()` raises `OSError` for a folder it cannot make or a log file it cannot open, and leaves logging as it was. `zeusdb_vector_database.is_logging_initialized()` reports whether either has run.
+**Only the first initializer to run takes effect.** Both functions return `True` if they installed the subscriber and `False` if one was already installed, and, where `RUST_LOG` is unset or does not parse, raise `ValueError` for a level they cannot read, so calling both leaves the second with no effect and, where it raises nothing, a `False` return. Before logging is set up, `init_file_logging()` raises `OSError` for a folder it cannot make or a log file it cannot open, and leaves logging as it was. `zeusdb_vector_database.is_logging_initialized()` reports whether either has run.
 
 **The file target is drained at exit.** Records reach the file through a background writer, so a record emitted immediately before the process ends is still in flight when it ends. Importing the package registers the drain with `atexit`, which covers a normal exit and needs no call. `zeusdb_vector_database.shutdown_logging()` runs the same drain on demand and returns `True` if it drained a file appender, or `False` if there was nothing to drain, which is the answer for the `stdout` and `stderr` targets and for a second call. It closes the file, so records emitted after it are discarded. Nothing runs on `os._exit` or on a crash, and records still in flight at either are lost.
 

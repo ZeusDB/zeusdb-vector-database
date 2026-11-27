@@ -8,6 +8,7 @@ import os
 import sys
 import json
 import datetime
+import errno
 from typing import Dict, Any
 from threading import Lock
 import shutil
@@ -41,6 +42,15 @@ def _or_none(read):
         return read()
     except OSError:
         return None
+
+
+def _names_a_folder(path):
+    """True where path names a folder and so no file: where its last part
+    is empty, '.' or '..', being a root, a drive or a path that ends in a
+    separator, or where it is a folder that exists. file_in_folder in
+    bindings/python/src/logging.rs keeps the same rule, so the two layers
+    refuse the same paths."""
+    return os.path.basename(path) in ('', os.curdir, os.pardir) or os.path.isdir(path)
 
 
 def _auto_configure_logging():
@@ -340,6 +350,12 @@ def _configure_python_logging(config: Dict[str, Any]):
         log_dir = os.path.dirname(log_file_path)
         
         try:
+            # A path that names a folder names no file. It is refused here,
+            # before any folder is made, and handled below as a file that
+            # cannot be opened.
+            if _names_a_folder(log_file_path):
+                raise IsADirectoryError(errno.EISDIR, os.strerror(errno.EISDIR), log_file_path)
+
             # Ensure directory exists
             if log_dir:
                 os.makedirs(log_dir, exist_ok=True)

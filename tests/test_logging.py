@@ -1,5 +1,6 @@
 """Logging configuration through environment variables, exercised in subprocesses."""
 
+import errno
 import os
 import re
 import sys
@@ -994,3 +995,118 @@ def test_the_import_succeeds_where_the_working_folder_cannot_be_read(tmp_path):
     (tmp_path / "folder.log").mkdir()
     code, out, err = _import_in(_UNREADABLE, tmp_path, ZEUSDB_LOG_FILE="folder.log")
     assert code == 0 and out.strip() == "imported", err[-2000:]
+
+
+# ------------------------------------------------------------
+# A log file path that names a folder
+# ------------------------------------------------------------
+_CREATE_AND_DRAIN = r"""
+import zeusdb_vector_database as z
+z.VectorDatabase().create("hnsw", dim=2, expected_size=10)
+z.shutdown_logging()
+print("created")
+"""
+
+_A_PATH_THAT_NAMES_A_FOLDER = [".", "..", "logs/", "logs/.", "logs/..", "a/b/..", "{tmp}/outdir/",
+                               "{tmp}/deep/..", "{tmp}/existing", "{root}"]
+if os.name == "nt":
+    _A_PATH_THAT_NAMES_A_FOLDER.append("logs\\")
+
+
+def _entries(folder):
+    """Every file and folder under `folder`, as paths relative to it."""
+    return sorted(os.path.relpath(os.path.join(here, name), folder)
+                  for here, folders, files in os.walk(folder) for name in folders + files)
+
+
+def _engine_warnings_of_the_log_file(records):
+    """The fields of each warning the engine wrote of the file it could
+    not open."""
+    return [record["fields"] for record in records if record["level"] == "WARN"
+            and record["fields"].get("operation") == "logging_init_file"]
+
+
+@pytest.mark.parametrize("rotation", ["never", "daily"])
+@pytest.mark.parametrize("value", _A_PATH_THAT_NAMES_A_FOLDER)
+def test_a_log_file_path_that_names_a_folder_writes_no_file(tmp_path, value, rotation):
+    """ZEUSDB_LOG_FILE naming a folder, being a path whose last part is
+    empty, '.' or '..', a root or a folder that exists, names no file. Under
+    either rotation neither layer makes or writes anything for it: the
+    Python layer records that it could not create the log file, and the
+    engine warns, naming that folder, and writes its records to stderr, each
+    giving the cause that the path is a directory."""
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    (tmp_path / "existing").mkdir()
+    root = os.path.splitdrive(str(tmp_path))[0] + os.sep
+    given = value.replace("{tmp}", str(tmp_path)).replace("{root}", root)
+    before = _entries(tmp_path)
+    code, out, err = _import_in(_CREATE_AND_DRAIN, cwd, ENVIRONMENT="development",
+                                ZEUSDB_LOG_LEVEL="info", ZEUSDB_LOG_FORMAT="json",
+                                ZEUSDB_LOG_FILE=given, ZEUSDB_LOG_ROTATION=rotation)
+    assert code == 0 and out.strip() == "created", err[-2000:]
+    assert _entries(tmp_path) == before
+    records = _engine_records(err)
+    warned = _engine_warnings_of_the_log_file(records)
+    assert [fields["error"] for fields in warned] == ["is a directory"], err[-2000:]
+    reported = warned[0]["log_file"].removeprefix("\\\\?\\")
+    assert reported == given or os.path.samefile(reported, os.path.join(cwd, given)), warned
+    messages = [record["fields"].get("message") for record in records]
+    assert "HNSW index created successfully" in messages, err[-2000:]
+    refused = (f"Could not create log file '{given}': "
+               f"[Errno {errno.EISDIR}] {os.strerror(errno.EISDIR)}")
+    python = [entry["message"] for entry in _json_lines(err) if "logger" in entry]
+    assert any(message.startswith(refused) for message in python), python
+
+
+@pytest.mark.parametrize("value", [".", "logs/", "logs/.."])
+def test_the_engine_alone_writes_no_file_for_a_log_file_path_that_names_a_folder(tmp_path, value):
+    """Where a handler on the root logger keeps the Python layer from
+    attaching its own, the engine alone reads ZEUSDB_LOG_FILE, and a path
+    that names a folder still makes and writes nothing: the engine warns
+    and writes its records to stderr."""
+    script = ("import logging\nlogging.getLogger().addHandler(logging.NullHandler())\n"
+              + _CREATE_AND_DRAIN)
+    code, out, err = _import_in(script, tmp_path, ENVIRONMENT="development",
+                                ZEUSDB_LOG_LEVEL="info", ZEUSDB_LOG_FORMAT="json",
+                                ZEUSDB_LOG_FILE=value)
+    assert code == 0 and out.strip() == "created", err[-2000:]
+    assert _entries(tmp_path) == []
+    records = _engine_records(err)
+    warned = _engine_warnings_of_the_log_file(records)
+    assert [fields["error"] for fields in warned] == ["is a directory"], err[-2000:]
+    messages = [record["fields"].get("message") for record in records]
+    assert "HNSW index created successfully" in messages, err[-2000:]
+
+
+def test_an_empty_log_file_path_is_read_as_unset(tmp_path):
+    """An empty ZEUSDB_LOG_FILE is read as unset by both layers: the target
+    stays stderr and nothing is written, and under ZEUSDB_LOG_TARGET=file
+    the engine writes zeusdb.log in the working folder and the Python layer
+    writes no file."""
+    script = _CREATE_AND_DRAIN + "import os\nprint(os.environ['ZEUSDB_LOG_TARGET'])\n"
+    code, out, err = _import_in(script, tmp_path, ENVIRONMENT="development",
+                                ZEUSDB_LOG_FILE="")
+    assert code == 0 and out.split() == ["created", "stderr"], err[-2000:]
+    assert _entries(tmp_path) == []
+    code, out, err = _import_in(script, tmp_path, ENVIRONMENT="development",
+                                ZEUSDB_LOG_LEVEL="info", ZEUSDB_LOG_FILE="",
+                                ZEUSDB_LOG_TARGET="file")
+    assert code == 0 and out.split() == ["created", "file"], err[-2000:]
+    assert _entries(tmp_path) == ["zeusdb.log"]
+    written = (tmp_path / "zeusdb.log").read_text(encoding="utf-8", errors="ignore")
+    assert "HNSW index created successfully" in written, written[-600:]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows reads a backslash as a separator")
+def test_a_log_file_path_ending_in_a_backslash_names_a_file_on_posix(tmp_path):
+    """On Linux and macOS a backslash is part of a name, so a
+    ZEUSDB_LOG_FILE that ends in one names a file in the working folder, and
+    both layers write it."""
+    code, out, err = _import_in(_CREATE_AND_DRAIN, tmp_path, ENVIRONMENT="development",
+                                ZEUSDB_LOG_LEVEL="info", ZEUSDB_LOG_FORMAT="json",
+                                ZEUSDB_LOG_FILE="logs\\")
+    assert code == 0 and out.strip() == "created", err[-2000:]
+    assert _entries(tmp_path) == ["logs\\"]
+    written = (tmp_path / "logs\\").read_text(encoding="utf-8", errors="ignore")
+    assert "HNSW index created successfully" in written, written[-600:]

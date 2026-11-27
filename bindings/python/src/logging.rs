@@ -7,11 +7,13 @@
 //!
 //! - **Global and immutable**: After any initialization (auto or manual), the logging
 //!   configuration is process-global and cannot be changed. Subsequent `init_*` calls
-//!   will return `False` and have no effect, or, where `RUST_LOG` is unset or does not
-//!   parse, raise `ValueError` for a level they cannot read.
+//!   will return `False` and have no effect, or raise `ValueError` for an empty
+//!   `log_dir` or, where `RUST_LOG` is unset or does not parse, for a level they
+//!   cannot read.
 //! - **File target**: `ZEUSDB_LOG_FILE` names the file that is written, as given
-//!   (e.g. `app.log` writes `app.log`), and a path that names no file writes `zeusdb.log`
-//!   in the working folder. Set `ZEUSDB_LOG_ROTATION=daily` to
+//!   (e.g. `app.log` writes `app.log`). A path that names a folder, such as `.` or
+//!   `logs/`, writes no file, and the target falls back to stderr as for a file it
+//!   cannot open. Set `ZEUSDB_LOG_ROTATION=daily` to
 //!   bound disk growth, which appends a date (`app.log.2026-08-03`). The resolved
 //!   path is logged at startup either way. Rotation is also available through
 //!   `init_file_logging(log_dir, level, file_prefix)`, whose `file_prefix` is a
@@ -31,7 +33,7 @@
 //! - `ZEUSDB_LOG_LEVEL`: trace, debug, info, warn, error (default: warn)
 //! - `ZEUSDB_LOG_FORMAT`: human, json (default: human)
 //! - `ZEUSDB_LOG_TARGET`: stdout, stderr, file (default: stderr)
-//! - `ZEUSDB_LOG_FILE`: log file path, written as given, and `zeusdb.log` in the working folder where it names no file (default: zeusdb.log)
+//! - `ZEUSDB_LOG_FILE`: log file path, written as given, and a path that names a folder writes no file (default, where unset or empty: zeusdb.log)
 //! - `ZEUSDB_LOG_ROTATION`: daily, never (default: never). daily appends a date to the file name
 //! - `ZEUSDB_DISABLE_AUTO_LOGGING`: true, 1 or yes to disable auto-init (for programmatic control)
 //! - `ZEUSDB_DISABLE_AUTOLOG`: deprecated alias for the above, honoured for compatibility
@@ -71,8 +73,10 @@
 //! ```
 
 use pyo3::prelude::*;
+use std::ffi::OsStr;
 use std::io;
 use std::io::IsTerminal;
+use std::path::Path;
 use std::sync::Once;
 use tracing::Subscriber;
 use tracing_appender::non_blocking::WorkerGuard;
@@ -647,7 +651,7 @@ fn create_json_file_layer<S>() -> Result<Box<dyn Layer<S> + Send + Sync + 'stati
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
-    let log_file = std::env::var("ZEUSDB_LOG_FILE").unwrap_or_else(|_| "zeusdb.log".to_string());
+    let log_file = log_file_setting();
 
     create_file_appender(&log_file).map(|(non_blocking, guard)| {
         store_worker_guard(guard);
@@ -675,7 +679,7 @@ fn create_human_file_layer<S>() -> Result<Box<dyn Layer<S> + Send + Sync + 'stat
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
-    let log_file = std::env::var("ZEUSDB_LOG_FILE").unwrap_or_else(|_| "zeusdb.log".to_string());
+    let log_file = log_file_setting();
 
     create_file_appender(&log_file).map(|(non_blocking, guard)| {
         store_worker_guard(guard);
@@ -746,6 +750,45 @@ fn configured_rotation() -> LogRotation {
     parse_rotation(&raw).unwrap_or(LogRotation::Never)
 }
 
+/// The value of `ZEUSDB_LOG_FILE`, or `zeusdb.log` where it is unset, empty
+/// or not Unicode
+///
+/// The Python layer reads an empty value as unset as well, so neither layer
+/// reads it as a path.
+fn log_file_setting() -> String {
+    std::env::var("ZEUSDB_LOG_FILE")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "zeusdb.log".to_string())
+}
+
+/// The folder and the name of the file `path` names, or `None` where it
+/// names a folder and so no file
+///
+/// A path names a folder where its last part is empty, `.` or `..`, read
+/// from its text before `Path::components` drops a trailing separator and a
+/// trailing `.`, where it holds no name, being a root or a drive, or where
+/// it is a folder that exists, beside which daily rotation would otherwise
+/// write a dated file. A bare name is in the working folder.
+/// `_names_a_folder` in `logging_config.py` keeps the same rule, so the two
+/// layers refuse the same paths.
+fn file_in_folder(path: &Path) -> Option<(&Path, &OsStr)> {
+    let text = path.as_os_str().as_encoded_bytes();
+    let last = text
+        .rsplit(|&byte| std::path::is_separator(char::from(byte)))
+        .next()
+        .unwrap_or_default();
+    if matches!(last, b"" | b"." | b"..") || path.is_dir() {
+        return None;
+    }
+    let name = path.file_name()?;
+    let directory = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    Some((directory, name))
+}
+
 /// Create a file appender for the file the caller named
 ///
 /// `ZEUSDB_LOG_FILE=app.log` writes `app.log` under the default rotation of
@@ -759,6 +802,10 @@ fn configured_rotation() -> LogRotation {
 /// `_FILE`. Rotation stays available for the callers who need disk growth
 /// bounded, under `ZEUSDB_LOG_ROTATION=daily`, where the date suffix is asked
 /// for rather than imposed.
+///
+/// A path that names a folder, by `file_in_folder`, names no file, so it is
+/// refused with the cause `is a directory` before any folder is made or file
+/// opened, as the Python layer refuses it.
 fn create_file_appender(
     log_file_path: &str,
 ) -> Result<
@@ -768,15 +815,8 @@ fn create_file_appender(
     ),
     String,
 > {
-    use std::borrow::Cow;
-    use std::path::Path;
-
-    let path = Path::new(log_file_path);
-
-    let (directory, filename) = match (path.parent(), path.file_name()) {
-        (Some(dir), Some(name)) if !dir.as_os_str().is_empty() => (dir, name.to_string_lossy()),
-        (_, Some(name)) => (Path::new("."), name.to_string_lossy()),
-        _ => (Path::new("."), Cow::from("zeusdb.log")),
+    let Some((directory, filename)) = file_in_folder(Path::new(log_file_path)) else {
+        return Err(io::ErrorKind::IsADirectory.to_string());
     };
 
     // A folder this process cannot make is returned as the cause the setup
@@ -793,7 +833,7 @@ fn create_file_appender(
     };
     let file_appender = tracing_appender::rolling::RollingFileAppender::builder()
         .rotation(rotation)
-        .filename_prefix(filename.into_owned())
+        .filename_prefix(filename.to_string_lossy().into_owned())
         .build(directory)
         .map_err(|error| {
             std::error::Error::source(&error)
@@ -808,25 +848,23 @@ fn create_file_appender(
 ///
 /// Emitted at startup so the destination is discoverable from the logs rather
 /// than by guessing. Under `daily` this carries the date suffix, which is the
-/// case where the resolved name differs from the one the caller typed.
+/// case where the resolved name differs from the one the caller typed. A path
+/// that names a folder is given as that folder, absolute where it exists,
+/// since no file is written for it.
 fn resolved_log_file_path() -> String {
-    use std::ffi::OsString;
-    use std::path::Path;
-
-    let configured = std::env::var("ZEUSDB_LOG_FILE").unwrap_or_else(|_| "zeusdb.log".to_string());
+    let configured = log_file_setting();
     let path = Path::new(&configured);
 
-    let mut filename = path
-        .file_name()
-        .map(|name| name.to_os_string())
-        .unwrap_or_else(|| OsString::from("zeusdb.log"));
+    let Some((directory, name)) = file_in_folder(path) else {
+        return match std::fs::canonicalize(path) {
+            Ok(folder) => folder.to_string_lossy().into_owned(),
+            Err(_) => configured,
+        };
+    };
+    let mut filename = name.to_os_string();
     filename.push(configured_rotation().filename_suffix());
 
-    match std::fs::canonicalize(
-        path.parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new(".")),
-    ) {
+    match std::fs::canonicalize(directory) {
         Ok(dir) => dir.join(&filename).to_string_lossy().into_owned(),
         // The directory could not be canonicalized, which is not a reason to
         // report the name the caller typed when rotation has changed it.
@@ -941,5 +979,48 @@ mod tests {
 
         // Should show state change (or already was initialized)
         assert!(now_initialized);
+    }
+
+    /// A path whose last part is empty, `.` or `..`, a root, a drive and a
+    /// folder that exists name a folder and so no file, and a path that ends
+    /// in a name names that file in its parent, or in the working folder
+    /// where it has none, on every system.
+    #[test]
+    fn a_path_that_names_a_folder_names_no_file() {
+        let folder = std::env::temp_dir().join(format!("zeusdb-log-folder-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let existing = folder.to_string_lossy().into_owned();
+        for text in [
+            ".",
+            "..",
+            "logs/",
+            "logs/.",
+            "logs/..",
+            "a/b/..",
+            "/",
+            existing.as_str(),
+        ] {
+            assert_eq!(file_in_folder(Path::new(text)), None, "{text}");
+        }
+        assert_eq!(
+            file_in_folder(Path::new("app.log")),
+            Some((Path::new("."), OsStr::new("app.log")))
+        );
+        assert_eq!(
+            file_in_folder(Path::new("logs/app.log")),
+            Some((Path::new("logs"), OsStr::new("app.log")))
+        );
+        // A backslash separates on Windows alone, and a drive is Windows' own.
+        if cfg!(windows) {
+            for text in ["logs\\", "logs\\.", "C:\\", "C:", "\\\\server\\share\\"] {
+                assert_eq!(file_in_folder(Path::new(text)), None, "{text}");
+            }
+        } else {
+            assert_eq!(
+                file_in_folder(Path::new("logs\\")),
+                Some((Path::new("."), OsStr::new("logs\\")))
+            );
+        }
+        std::fs::remove_dir(&folder).unwrap();
     }
 }
