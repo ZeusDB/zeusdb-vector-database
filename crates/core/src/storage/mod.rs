@@ -17,32 +17,43 @@
 //! [`Storage`] is the place one collection is kept. It owns how a save
 //! replaces the directory whole, being [`Storage::stage`] and
 //! [`Staged::commit`], how a killed save is undone, being
-//! [`Storage::recover`], and where the journal beside the directory lives.
+//! [`Storage::recover`], where the journal beside the directory lives, and
+//! the lock that keeps a second writer off the collection.
 //!
 //! [`Staged`] is the directory a save writes before the commit puts it in
 //! place. Dropped without a commit, it is removed.
 //!
-//! [`JournalFile`] is the journal, open to read and write.
+//! [`JournalDir`] is the journal, being a directory of segments with the
+//! `quarantine` folder a repair copies what it sets aside into, and
+//! [`JournalFile`] is one segment, open to read and write.
+//!
+//! [`LockGuard`] is a lock on the collection, held until it is dropped.
 //!
 //! # Why the journal is not an artefact
 //!
 //! The directory is replaced whole at every checkpoint and the journal stays
 //! open across that replacement, so the journal sits beside the directory
-//! rather than in it. Its writes are appends at the end, a cut back to a
-//! length and a header rewritten in place, which no artefact takes, and it
-//! is shared with the thread that syncs it on an interval. So it is a trait
-//! of its own, opened through [`Storage`].
+//! rather than in it. Its writes are appends at the end of its last segment
+//! and a cut back to a length, which no artefact takes, and the last segment
+//! is shared with the thread that syncs it on an interval. So it has traits
+//! of its own, reached through [`Storage`].
 //!
 //! # Errors
 //!
 //! The whole-artefact operations, the staging, the commit and the recovery
 //! return the engine's [`Error`], naming the artefact or the path, because
 //! every caller reports them the same way. The rest return the I/O error and
-//! the caller words it.
+//! the caller words it, so a caller can also tell a medium that refuses
+//! writes from any other failure; see [`refuses_writes`].
 
 mod fs;
 
-pub use fs::{FsDir, FsStorage, JOURNAL_SUFFIX};
+#[cfg(any(test, feature = "test-support"))]
+pub use fs::directory_sync_faults;
+pub use fs::{
+    close_lock_files_in_forked_child, hold_lock_files_for_fork, release_lock_files_after_fork,
+    FsDir, FsStorage, JOURNAL_SUFFIX, LEGACY_JOURNAL_SUFFIX, LOCK_SUFFIX, SEGMENT_SUFFIX,
+};
 
 use crate::error::Error;
 use std::io::{self, Read, Write};
@@ -75,9 +86,6 @@ pub trait Dir {
     /// Open the artefact `name` to be read as a stream.
     fn open(&self, name: &str) -> io::Result<Box<dyn Read>>;
 
-    /// Every byte the directory holds, under every prefix.
-    fn total_bytes(&self) -> io::Result<u64>;
-
     /// Where the artefact `name` is, as a message names it, or the directory
     /// itself where `name` is empty.
     fn locate(&self, name: &str) -> String;
@@ -96,7 +104,7 @@ pub trait ArtefactWriter: Write {
 }
 
 /// The place one collection is kept: its directory, the directory a save
-/// writes before it replaces that one, and the journal beside them.
+/// writes before it replaces that one, the journal beside them, and the lock.
 pub trait Storage {
     /// Put back a directory a save was killed in the middle of replacing,
     /// and say whether anything moved. A load runs this before it looks for
@@ -106,6 +114,12 @@ pub trait Storage {
     /// Whether a directory is in place.
     fn exists(&self) -> bool;
 
+    /// Whether a directory a save left aside is present, which
+    /// [`Storage::recover`] puts back where no directory is in place. A load
+    /// asks this and [`Storage::exists`] before it takes the lock, so a load
+    /// of nothing leaves no lock file behind.
+    fn aside_exists(&self) -> bool;
+
     /// The directory in place, to read.
     fn dir(&self) -> &dyn Dir;
 
@@ -113,24 +127,84 @@ pub trait Storage {
     /// for this save to write into.
     fn stage(&self) -> Result<Box<dyn Staged>, Error>;
 
-    /// Where the journal is, which its errors and its caller name.
+    /// What stands at the target that a save must not replace, being a
+    /// file, a folder holding entries and no `manifest.json`, a folder whose
+    /// `manifest.json` no save wrote or this process cannot read, or a folder
+    /// this process cannot list, as a phrase a refusal quotes. `None` where
+    /// nothing stands there, where an empty folder does, and where a folder
+    /// holding a manifest a save writes does, which is an index directory an
+    /// earlier save wrote. A save replaces the directory at its target whole,
+    /// so it asks this before anything is written. A target the system will
+    /// not describe at all is `None`, and the save's own first write meets
+    /// the same refusal.
+    fn foreign_target(&self) -> Option<String>;
+
+    /// Whether the folder the directory sits in takes a new entry, found by
+    /// creating the staging directory and removing it again. A load runs
+    /// this before the first write a checkpoint makes, and reads the I/O
+    /// error to tell a medium that refuses writes from any other failure.
+    fn probe_writable(&self) -> io::Result<()>;
+
+    /// Where the journal is, being the directory of its segments, which its
+    /// errors and its caller name.
     fn journal_path(&self) -> &Path;
 
     /// Whether `journal` names this collection's journal.
     fn names_journal(&self, journal: &Path) -> bool;
 
-    /// Whether the journal is present.
+    /// Whether the journal's directory is present.
     fn journal_exists(&self) -> bool;
 
-    /// The journal's bytes, whole.
-    fn read_journal(&self) -> io::Result<Vec<u8>>;
+    /// Create the journal's directory, or empty it of segments where it is
+    /// present. Any entry that is not a segment is left where it is.
+    fn create_journal(&self) -> io::Result<()>;
 
-    /// Create the journal with no bytes, replacing any journal there, open
-    /// to read and write.
-    fn create_journal(&self) -> io::Result<Box<dyn JournalFile>>;
+    /// The journal's directory of segments, owned, for a writer to keep.
+    fn journal_dir(&self) -> Box<dyn JournalDir>;
 
-    /// Open the journal there to read and write.
-    fn open_journal(&self) -> io::Result<Box<dyn JournalFile>>;
+    /// Where a journal of format version 1 sits, being one file beside the
+    /// directory, which a release before 0.14.0 wrote.
+    fn legacy_journal_path(&self) -> &Path;
+
+    /// Whether a journal of format version 1 is present.
+    fn legacy_journal_exists(&self) -> bool;
+
+    /// The journal of format version 1, whole.
+    fn read_legacy_journal(&self) -> io::Result<Vec<u8>>;
+
+    /// Remove the journal of format version 1, which an upgrade does once
+    /// its checkpoint holds every record the file held. The removal is made
+    /// durable by [`Storage::sync_in_place`], which the caller runs after
+    /// it, so a failed removal is told apart from a failed sync.
+    fn remove_legacy_journal(&self) -> io::Result<()>;
+
+    /// Make the directory in place durable, being the entries of every
+    /// directory under it, deepest first, its own, and those of the folder
+    /// it sits in, which also names the journal and the lock. A load runs
+    /// this before it changes the journal or takes a record, since a save in
+    /// an earlier process may have moved the directory into place without
+    /// its sync landing, and the journal's past is in that directory alone.
+    fn sync_in_place(&self) -> io::Result<()>;
+
+    /// Cut the journal of format version 1 to its first `len` bytes and make
+    /// the cut durable, which a repair does once its quarantine holds every
+    /// byte past `len`.
+    fn cut_legacy_journal(&self, len: u64) -> io::Result<()>;
+
+    /// Where the lock file is.
+    fn lock_path(&self) -> &Path;
+
+    /// Take the collection's lock in `mode`, without waiting, and record
+    /// `holder` in the lock file where the lock is exclusive. An exclusive
+    /// lock creates the folder the directory sits in where it is missing, as
+    /// the save that takes it would.
+    ///
+    /// A lock file that cannot be opened for writing, because the medium
+    /// refuses writes or a permission is missing, is opened to read and
+    /// locked shared, and the answer is [`Locked::ReadOnly`] with the
+    /// system's refusal. One that does not exist and cannot be created gives
+    /// that answer with no lock at all.
+    fn lock(&self, mode: LockMode, holder: &str) -> Result<Locked, LockFailure>;
 }
 
 /// The directory a save writes, which the commit puts in place whole.
@@ -140,22 +214,77 @@ pub trait Staged {
     fn dir(&self) -> &dyn Dir;
 
     /// Put the directory in place of the one there, whole, so a reader sees
-    /// the one or the other and never a mixture.
-    fn commit(self: Box<Self>) -> Result<(), Error>;
+    /// the one or the other and never a mixture. `between` is the point a
+    /// crash test aborts at between the two renames, being the save's or a
+    /// backup's.
+    fn commit(self: Box<Self>, between: crate::KillPoint) -> Result<(), Error>;
 }
 
-/// The journal, open to read and write.
+/// The journal, being a directory of segments, each a file named by the
+/// sequence of its first record.
 ///
-/// One file with a position. Records are written at its end and the header
-/// is rewritten at its start, so the writer moves the position itself. The
-/// writer and the thread that syncs on an interval share it, so every
-/// operation takes `&self`.
+/// It is owned by the writer that appends to it, so every operation takes
+/// `&self` and nothing borrows from the [`Storage`] it came from.
+pub trait JournalDir: Send + Sync + std::fmt::Debug {
+    /// Where the directory is, which a message names.
+    fn path(&self) -> &Path;
+
+    /// Every segment the directory holds, by the number its file is named
+    /// for, in increasing order. An entry not named as a segment is left
+    /// where it is and not listed.
+    fn segments(&self) -> io::Result<Vec<u64>>;
+
+    /// The segment `number`, whole.
+    fn read_segment(&self, number: u64) -> io::Result<Vec<u8>>;
+
+    /// Create the segment `number`, which must not exist yet, open to read
+    /// and write.
+    fn create_segment(&self, number: u64) -> io::Result<Box<dyn JournalFile>>;
+
+    /// Open the segment `number` to read and write.
+    fn open_segment(&self, number: u64) -> io::Result<Box<dyn JournalFile>>;
+
+    /// Remove the segment `number`.
+    fn remove_segment(&self, number: u64) -> io::Result<()>;
+
+    /// Make the directory's own entries durable, after a segment is created
+    /// or removed. A segment's own sync does not make its name durable, so
+    /// no record goes into a segment until this has succeeded after its
+    /// creation. The error is the system's.
+    fn sync(&self) -> io::Result<()>;
+
+    /// Where the segment `number` is, which a message names.
+    fn segment_path(&self, number: u64) -> std::path::PathBuf;
+
+    /// Create the folder `folder` under the journal's `quarantine` folder,
+    /// and the `quarantine` folder where it is missing. The first write a
+    /// repair makes, so the error is the system's, for the caller to tell a
+    /// medium that refuses writes from any other failure.
+    fn create_quarantine(&self, folder: &str) -> io::Result<()>;
+
+    /// The journal's `quarantine` folder as a directory of artefacts, each
+    /// named `<folder>/<file>`. A file written there is durable before the
+    /// write returns.
+    fn quarantine(&self) -> Box<dyn Dir>;
+
+    /// Every folder under the journal's `quarantine` folder, by name, in
+    /// name order, and none where it does not exist.
+    fn quarantine_folders(&self) -> io::Result<Vec<String>>;
+
+    /// Make the entries of the folder `folder` under `quarantine`, of
+    /// `quarantine` and of the journal's directory durable, and return the
+    /// first failure. The error is the system's.
+    fn sync_quarantine(&self, folder: &str) -> io::Result<()>;
+}
+
+/// One segment of the journal, open to read and write.
+///
+/// One file with a position. Records are written at its end, so the writer
+/// moves the position itself. The writer and the thread that syncs on an
+/// interval share it, so every operation takes `&self`.
 pub trait JournalFile: Send + Sync + std::fmt::Debug {
     /// Write `bytes` at the position and leave the position after them.
     fn write_all(&self, bytes: &[u8]) -> io::Result<()>;
-
-    /// Put the position at the first byte.
-    fn seek_start(&self) -> io::Result<()>;
 
     /// Put the position after the last byte.
     fn seek_end(&self) -> io::Result<()>;
@@ -171,4 +300,82 @@ pub trait JournalFile: Send + Sync + std::fmt::Debug {
 
     /// The file's length.
     fn length(&self) -> io::Result<u64>;
+}
+
+/// How a lock is held.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LockMode {
+    /// Beside other shared holders, and refused while anyone holds it
+    /// exclusive. A load takes it while it reads, where the file can be
+    /// locked.
+    Shared,
+    /// Alone. A journaled collection takes it for its life and a save for
+    /// the save.
+    Exclusive,
+}
+
+impl LockMode {
+    /// How the mode names itself in the lock file and in a message.
+    pub fn name(self) -> &'static str {
+        match self {
+            LockMode::Shared => "shared",
+            LockMode::Exclusive => "exclusive",
+        }
+    }
+}
+
+/// A lock on a collection, held until it is dropped.
+///
+/// Dropping it in the process that took the lock unlocks the lock file and
+/// then closes it, so the lock goes even while a child process still holds a
+/// copy of the file. A child forked from the holder shares the open file, and
+/// an unlock there would release the parent's lock, so the child closes its
+/// copy without unlocking it, which leaves the lock with the parent; see
+/// [`close_lock_files_in_forked_child`].
+pub trait LockGuard: Send + Sync + std::fmt::Debug {
+    /// The mode the lock is held in.
+    fn mode(&self) -> LockMode;
+}
+
+/// What taking a lock gave.
+#[derive(Debug)]
+pub enum Locked {
+    /// The lock, in the mode asked for.
+    Writable(Box<dyn LockGuard>),
+    /// The lock file could not be opened for writing, so whatever holds the
+    /// collection must not write to it. `guard` is a shared lock where the
+    /// lock file exists, and `reason` is the system's refusal.
+    ReadOnly {
+        guard: Option<Box<dyn LockGuard>>,
+        reason: io::Error,
+    },
+}
+
+/// Why a lock was not taken.
+#[derive(Debug)]
+pub enum LockFailure {
+    /// Another holder has it, in a mode that excludes this one. `holder` is
+    /// the phrase a refusal quotes, which names the holder only as another
+    /// holder, and quotes the last record an exclusive holder wrote in the
+    /// lock file as that record, or says the lock file records no holder,
+    /// holds no readable record or cannot be read, with the system's error.
+    /// Where Windows refuses the read because another handle holds the lock
+    /// exclusive, it says the system does not let a second handle read it.
+    Held { holder: String },
+    /// The filesystem answered the lock with an error of its own, so it
+    /// cannot lock.
+    Unavailable(io::Error),
+    /// The lock file could not be opened.
+    Failed(io::Error),
+}
+
+/// Whether `error` is the refusal a system gives for a medium that cannot
+/// be written or for a permission that is missing, being `EROFS`, `EACCES`
+/// and `EPERM` on Linux and macOS and `ERROR_WRITE_PROTECT` and
+/// `ERROR_ACCESS_DENIED` on Windows.
+pub fn refuses_writes(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ReadOnlyFilesystem | io::ErrorKind::PermissionDenied
+    )
 }

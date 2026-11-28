@@ -16,7 +16,7 @@ lacks the field, a nested object written without `eq`, and an operator name the
 index does not recognise.
 
 Then it covers boolean composition, which is `$and`, `$or` and `$not`. Everything
-above that point is a conjunction, because a filter is a mapping and all of its
+above that point is a conjunction, because a filter is a dict and all of its
 keys must hold. The filters at the end could not be written at all before those
 three keys existed.
 
@@ -249,7 +249,7 @@ def main():
     print("not (brand == acme) finds it:",
           "item_no_brand" in [h["id"] for h in hits({"$not": {"brand": "acme"}}, top_k=5)])
 
-    # And the filter for a missing field, which no operator can express.
+    # And the filter for a missing field.
     # `{"all": []}` is the empty conjunction, so it holds for every value the
     # field can carry and fails only where the field is absent.
     no_brand = {"$not": {"brand": {"all": []}}}
@@ -323,7 +323,7 @@ not (brand == acme) finds it: True
 records with no brand at all: ['item_nested', 'item_no_brand']
 
 too deep: Filter groups nest to 10 levels and "$or" would open level 11.
-reserved: "$or" is a reserved filter key and takes a list of filter mappings, for example {"$or": [{"lang": "en"}, {"lang": "es"}]}, but it was given a string.
+reserved: "$or" is a reserved filter key and takes a list of filters, for example {"$or": [{"lang": "en"}, {"lang": "es"}]}, but it was given a string.
 """
 
 if __name__ == "__main__":

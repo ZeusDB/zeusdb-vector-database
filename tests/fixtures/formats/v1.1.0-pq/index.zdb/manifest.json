@@ -1,0 +1,61 @@
+{
+  "format_version": "1.1.0",
+  "zeusdb_version": "0.11.0",
+  "created_at": "2026-10-22T08:44:27.129296300+00:00",
+  "saved_at": "2026-10-22T08:44:27.270311300+00:00",
+  "total_vectors": 999,
+  "index_type": "HNSW",
+  "has_quantization": true,
+  "quantization_trained": true,
+  "storage_mode": "quantized_active",
+  "files_included": [
+    "config.json",
+    "mappings.bin",
+    "metadata.json",
+    "quantization.json",
+    "pq_centroids.bin",
+    "pq_codes.bin",
+    "vectors.bin",
+    "hnsw_index.zdbgraph"
+  ],
+  "files_excluded": [],
+  "file_digests": {
+    "pq_codes.bin": {
+      "bytes": 9885,
+      "checksum": "ff4dd93d5d86db75"
+    },
+    "config.json": {
+      "bytes": 201,
+      "checksum": "951facdd8dc374a1"
+    },
+    "mappings.bin": {
+      "bytes": 14778,
+      "checksum": "256a4ed8ec6ef03a"
+    },
+    "vectors.bin": {
+      "bytes": 37857,
+      "checksum": "ad85d971f0ce4728"
+    },
+    "pq_centroids.bin": {
+      "bytes": 581,
+      "checksum": "4bfb374bc6c5000a"
+    },
+    "quantization.json": {
+      "bytes": 866,
+      "checksum": "cab7dc86e6956c86"
+    },
+    "hnsw_index.zdbgraph": {
+      "bytes": 147768
+    },
+    "metadata.json": {
+      "bytes": 15469,
+      "checksum": "614e6dbb5199dae5"
+    }
+  },
+  "total_size_mb": 0.21687030792236328,
+  "compression_info": {
+    "original_size_mb": 0.030487060546875,
+    "compressed_size_mb": 0.003810882568359375,
+    "compression_ratio": 8.0
+  }
+}

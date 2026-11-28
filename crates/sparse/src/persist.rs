@@ -76,7 +76,15 @@ pub(crate) fn encode_with(index: &PostingsIndex, id_of: &dyn Fn(usize) -> u32) -
         FrameEncoding::Engine,
         8 + index.live_nnz * NONZERO_BYTES + index.live * RECORD_HEADER_BYTES,
     );
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the slot count, at most MAX_INTERNAL_ID + 1, which is u32::MAX"
+    )]
     payload.extend((index.slot_count() as u32).to_le_bytes());
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the live count, at most the slot count"
+    )]
     payload.extend((index.live as u32).to_le_bytes());
     for (at, slot) in index.records.iter().enumerate() {
         if !slot.held() || index.dead.contains(at) {
@@ -84,6 +92,10 @@ pub(crate) fn encode_with(index: &PostingsIndex, id_of: &dyn Fn(usize) -> u32) -
         }
         let v = index.forward(*slot);
         payload.extend(id_of(at).to_le_bytes());
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a record's nonzero count, within the forward arena's ceiling MAX_FORWARD, below u32::MAX"
+        )]
         payload.extend((v.dims.len() as u32).to_le_bytes());
         for d in v.dims {
             payload.extend(d.to_le_bytes());
@@ -138,8 +150,10 @@ pub(crate) fn restore(
 /// it is held to its vector's rules as every record is and is not filed, and
 /// once the whole payload has been read the first such id is refused as
 /// [`Error::SparseRecordUnmapped`], with the space left for the caller to
-/// name. Nothing is sized from the slot count, which is the largest id and
-/// not a count of records.
+/// name. A record the forward arena's ceiling refuses is refused as
+/// [`Error::SparseForwardFull`], with the space left to name as well.
+/// Nothing is sized from the slot count, which is the largest id and not a
+/// count of records.
 pub(crate) fn decode(
     bytes: &[u8],
     config: &SparseConfig,
@@ -245,9 +259,15 @@ pub(crate) fn decode(
         };
         match walk.position_of(id as usize) {
             Some(at) => {
+                // A record the forward arena cannot take is refused as it is,
+                // with the space left for the caller to name, since the
+                // payload is whole and the arena is what is full.
                 index
                     .insert_record(Position::from_slot(at), vector)
-                    .map_err(|e| corrupt(format!("record {}: {}", id, e)))?;
+                    .map_err(|e| match e {
+                        Error::SparseForwardFull { .. } => e,
+                        e => corrupt(format!("record {}: {}", id, e)),
+                    })?;
                 index.count_slot(RecordId(id));
             }
             None => {
@@ -303,6 +323,7 @@ mod tests {
     use super::*;
     use crate::index::{Unlink, Weighting};
     use std::collections::HashMap;
+    use zeusdb_vector_core::test_support::{bounded, read_bound};
     use zeusdb_vector_core::{
         frame_fuzz, FsDir, Persist, Prepared, Restore, SparseVector, VectorIndex,
         FRAME_HEADER_BYTES,
@@ -400,6 +421,42 @@ mod tests {
         let back = decode(&bytes, empty.config(), &bounds(), "postings").unwrap();
         assert_eq!(back.len(), 0);
         assert_eq!(back.max_dim(), None);
+    }
+
+    /// An artefact whose records would take the forward arena past its
+    /// ceiling is refused as the arena being full, with the space left for
+    /// the caller to name, rather than as a damaged file, and the same
+    /// artefact restores at the ceiling the layout sets.
+    #[test]
+    fn a_restore_past_the_forward_ceiling_is_refused_as_the_arena_full() {
+        let index = filled();
+        let dir = tempfile::tempdir().unwrap();
+        let mut manifest = Manifest::default();
+        index
+            .write("spaces/s/", &FsDir::new(dir.path()), &mut manifest)
+            .unwrap();
+        let restore = || {
+            PostingsIndex::restore(
+                index.config(),
+                "spaces/s/",
+                &FsDir::new(dir.path()),
+                &manifest,
+                &bounds(),
+            )
+        };
+        assert_eq!(restore().unwrap().forward_len(), 250);
+        let _lowered = crate::index::tests::Lowered::to(249);
+        let Err(refused) = restore() else {
+            panic!("the restore took the arena past its ceiling");
+        };
+        assert!(
+            matches!(
+                refused,
+                Error::SparseForwardFull { ref space, held: 245, admitted: 0, nnz: 5, ceiling: 249 }
+                    if space.is_empty()
+            ),
+            "{refused:?}"
+        );
     }
 
     /// Every way the artefact can be damaged is refused with a decode error
@@ -559,7 +616,10 @@ mod tests {
     /// A seeded mutator over a valid artefact never panics the reader and
     /// never sizes an allocation from a field the payload has not earned,
     /// which is what the bounds above are for. The frame is repaired around
-    /// each mutation so the payload's reader sees it.
+    /// each mutation so the payload's reader sees it. Each read runs under
+    /// `bounded` at `read_bound` of the artefact's bytes, so such an
+    /// allocation is refused before it is made, whatever the machine could
+    /// grant.
     #[test]
     fn no_mutation_of_a_valid_artefact_panics_the_reader() {
         let index = filled();
@@ -571,9 +631,17 @@ mod tests {
             .unwrap_or(4_000usize);
         let mut accepted = 0usize;
         let mut past_frame = 0usize;
+        // The decoder reserves its slot table for every position below the
+        // slot count the payload names, which it holds to the caller's ids,
+        // so each read may also take a slot and a length for each position the
+        // caller holds.
+        let slot_table = std::mem::size_of::<crate::index::Slot>().max(std::mem::size_of::<f32>())
+            * bounds().ids_by_position.len();
         for _ in 0..cases {
             let blob = frame_fuzz::mutate(&mut rng, &good, FrameKind::SparsePostings);
-            match decode(&blob, index.config(), &bounds(), "p") {
+            match bounded(read_bound(blob.len()).saturating_add(slot_table), || {
+                decode(&blob, index.config(), &bounds(), "p")
+            }) {
                 Ok(restored) => {
                     accepted += 1;
                     // Whatever it accepted is a well formed index.

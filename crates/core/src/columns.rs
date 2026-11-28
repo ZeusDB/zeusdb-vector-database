@@ -52,6 +52,7 @@
 use crate::bitmap::Bitmap;
 use crate::error::Error;
 use crate::filter::{field_test_matches, FieldLookup, FieldTest, Filter, Presence};
+use crate::table::SizedMap;
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -116,7 +117,9 @@ enum Column {
         /// every `update_metadata` would grow its dictionary without bound.
         refs: Vec<u32>,
         free: Vec<u32>,
-        lookup: HashMap<Value, u32>,
+        /// Each held value's code, with the buckets of its table kept beside
+        /// it, which a release leaves.
+        lookup: SizedMap<Value, u32>,
     },
     /// High cardinality. One value a record, which is a second copy of that
     /// value, the first being the one `vector_metadata` holds.
@@ -136,7 +139,7 @@ impl Column {
             dict: Vec::new(),
             refs: Vec::new(),
             free: Vec::new(),
-            lookup: HashMap::new(),
+            lookup: SizedMap::new(),
         }
     }
 
@@ -175,6 +178,10 @@ impl Column {
                                     refs[code as usize] = 1;
                                     code
                                 }
+                                #[expect(
+                                    clippy::cast_possible_truncation,
+                                    reason = "a dictionary code, below the records held since a freed code is reused, so below MAX_INTERNAL_ID"
+                                )]
                                 None => {
                                     dict.push(value.clone());
                                     refs.push(1);
@@ -294,8 +301,10 @@ impl Column {
         }
     }
 
-    /// Every part of the column, each with its capacity, for
-    /// [`ColumnStore::layout`].
+    /// Every part of the column for [`ColumnStore::layout`], each vector with
+    /// its capacity, and the lookup with the bytes its table is priced at,
+    /// its length and its entries in the order of their codes. The lookup's
+    /// own capacity and order follow the map's seed, so neither is shown.
     #[cfg(any(test, feature = "test-support"))]
     fn layout(&self) -> Vec<(&'static str, usize, String)> {
         match self {
@@ -314,12 +323,21 @@ impl Column {
                 lookup,
             } => {
                 let shown: Vec<String> = dict.iter().map(Value::to_string).collect();
+                let mut entries: Vec<(u32, String)> = lookup
+                    .iter()
+                    .map(|(value, &code)| (code, value.to_string()))
+                    .collect();
+                entries.sort_unstable();
                 vec![
                     ("codes", codes.capacity(), format!("{codes:?}")),
                     ("dict", dict.capacity(), format!("{shown:?}")),
                     ("refs", refs.capacity(), format!("{refs:?}")),
                     ("free", free.capacity(), format!("{free:?}")),
-                    ("lookup", lookup.capacity(), lookup.len().to_string()),
+                    (
+                        "lookup",
+                        lookup_bytes(lookup),
+                        format!("{} {entries:?}", entries.len()),
+                    ),
                 ]
             }
         }
@@ -421,9 +439,9 @@ impl Column {
                     + dict.capacity() * std::mem::size_of::<Value>()
                     + refs.capacity() * 4
                     + free.capacity() * 4
-                    // A bucket holds the key, the code and a control byte, and
-                    // the key owns the same payload the dictionary entry does.
-                    + lookup.capacity() * (std::mem::size_of::<Value>() + 4 + 8)
+                    + lookup_bytes(lookup)
+                    // Each of the lookup's keys owns the same payload as the
+                    // dictionary entry.
                     + dict.iter().map(value_payload).sum::<usize>() * 2
             }
         }
@@ -501,6 +519,13 @@ fn put_by_slots(codes: &[u32], words: &mut [u64], takes: impl Fn(u32) -> bool) {
             words[slot >> 6] |= 1 << (slot & 63);
         }
     }
+}
+
+/// Bytes a dictionary column's lookup is priced at, being its table at the
+/// buckets it holds with the slots its releases left among them. What its
+/// keys own on the heap is priced with the dictionary's entries.
+fn lookup_bytes(lookup: &SizedMap<Value, u32>) -> usize {
+    lookup.table_bytes()
 }
 
 /// What a value owns on the heap beyond the 32 bytes of the `Value` itself.
@@ -850,9 +875,10 @@ impl ColumnStore {
         std::mem::swap(&mut self.slots, &mut parts.slots);
     }
 
-    /// Every part of the store, each with its capacity, for a test that
-    /// holds two stores to be the same codes and values. Absent from every
-    /// build that is not a test.
+    /// Every part of the store, each vector with its capacity and each
+    /// lookup with the bytes its table is priced at, for a test that holds
+    /// two stores to be the same codes and values. See `Column::layout`.
+    /// Absent from every build that is not a test.
     #[cfg(any(test, feature = "test-support"))]
     pub fn layout(&self) -> Vec<(&'static str, usize, String)> {
         let mut out = vec![
@@ -2024,6 +2050,41 @@ mod tests {
         }
     }
 
+    /// A clear lets the old columns and the old live set go before it makes
+    /// the new reservation, so it never holds both. Counted on this thread,
+    /// the bytes the store holds during the clear never pass the larger of
+    /// what it held before the clear and what it holds after, for a store of
+    /// records and for an empty one, cleared to a reservation and to none.
+    #[test]
+    fn a_clear_never_holds_the_old_store_and_the_new_reservation_at_once() {
+        let names = || vec!["cat".to_string(), "serial".to_string()];
+        for (records, reservation) in [
+            (100_000usize, 100_000usize),
+            (100_000, 0),
+            (0, 100_000),
+            (0, 0),
+        ] {
+            let mut store = ColumnStore::new(names(), 0);
+            for slot in 0..records {
+                let metadata = record(&[
+                    ("cat", json!(["a", "b", "c"][slot % 3])),
+                    ("serial", json!(format!("s{slot}"))),
+                ]);
+                store.write(slot, &metadata);
+            }
+            let ((), held) = crate::allocations::counted(|| store.clear(reservation));
+            assert_eq!(
+                held.peak,
+                held.end.max(0),
+                "a store of {records} records cleared to a reservation of {reservation} held \
+                 {} bytes above where the clear began, and ended {} bytes from it",
+                held.peak,
+                held.end
+            );
+            assert_eq!(store.record_count(), 0);
+        }
+    }
+
     /// A clear keeps the declaration and the table that finds a column, and
     /// holds a fresh store's reservation and nothing else, whatever the store
     /// grew to and whatever form its columns took.
@@ -2050,5 +2111,325 @@ mod tests {
             selected(&store, &field("cat", FieldTest::Equals(json!("b")))),
             vec![0]
         );
+    }
+
+    /// A dictionary column prices its lookup at the buckets its table holds,
+    /// which a release never gives back. A store that took 1,792 distinct
+    /// values, two records each, and then lost every record of 1,780 of them
+    /// prices its column at what it priced before and the codes the releases
+    /// put on the free list, whatever its lookup's seed, in each of eight
+    /// stores.
+    #[test]
+    fn a_release_leaves_the_lookup_priced_at_the_buckets_its_table_holds() {
+        for round in 0..8 {
+            let mut store = ColumnStore::new(vec!["serial".to_string()], 4_096);
+            for slot in 0..3_584usize {
+                store.write(slot, &record(&[("serial", json!(slot / 2))]));
+            }
+            assert!(
+                matches!(store.columns[0], Column::Dictionary { .. }),
+                "round {round}"
+            );
+            let before = store.heap_bytes();
+            for slot in 0..3_560usize {
+                store.erase(slot);
+            }
+            let Column::Dictionary { free, .. } = &store.columns[0] else {
+                panic!("round {round}: the column is a dictionary after the releases");
+            };
+            assert_eq!(free.len(), 1_780, "round {round}");
+            let freed = free.capacity() * std::mem::size_of::<u32>();
+            let after = store.heap_bytes();
+            assert_eq!(
+                after,
+                before + freed,
+                "round {round}: the store priced {before} bytes before the releases and {after} \
+                 after, where the free list adds {freed}"
+            );
+        }
+    }
+
+    // ========================================================================
+    // THE FILTER LANGUAGE UNDER RANDOM INPUT
+    // ========================================================================
+
+    /// The filters the fuzzer draws, unless `ZEUSDB_FUZZ_CASES` sets another
+    /// number for a deep run.
+    fn fuzz_filters() -> usize {
+        std::env::var("ZEUSDB_FUZZ_CASES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20_000)
+    }
+
+    /// The fields a record carries and a filter names. The first four are
+    /// declared as columns, and the rest are read from the metadata. One
+    /// takes the prefix the group keys take, and one is not ASCII.
+    const FUZZ_FIELDS: [&str; 8] = ["cat", "price", "tags", "name", "i", "flag", "$price", "ü"];
+
+    /// The operators a field condition names, being the thirteen the language
+    /// evaluates, the three presence questions, and names it refuses.
+    const FUZZ_OPERATORS: [&str; 19] = [
+        "eq",
+        "ne",
+        "gt",
+        "gte",
+        "lt",
+        "lte",
+        "contains",
+        "startswith",
+        "endswith",
+        "in",
+        "nin",
+        "any",
+        "all",
+        "exists",
+        "is_missing",
+        "is_null",
+        "between",
+        "$eq",
+        "EQ",
+    ];
+
+    /// Strings sharing prefixes and suffixes, ASCII and not, so `startswith`,
+    /// `endswith` and `contains` meet their edges.
+    const FUZZ_STRINGS: [&str; 10] = ["", "a", "ab", "abc", "b", "ba", "ü", "üb", "日本", "日"];
+
+    /// A seeded xorshift generator, which is the whole of the fuzzer's state.
+    struct Draws(u64);
+
+    impl Draws {
+        fn below(&mut self, bound: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 % bound.max(1) as u64) as usize
+        }
+
+        fn pick<T: Copy>(&mut self, from: &[T]) -> T {
+            from[self.below(from.len())]
+        }
+    }
+
+    /// A number at an edge of each width a comparison converts to.
+    fn fuzz_number(draws: &mut Draws) -> Value {
+        match draws.below(14) {
+            0 => json!(0),
+            1 => json!(-1),
+            2 => json!(1),
+            3 => json!(i64::MIN),
+            4 => json!(i64::MAX),
+            5 => json!(u64::MAX),
+            6 => json!(9_007_199_254_740_992i64),
+            7 => json!(9_007_199_254_740_993i64),
+            8 => json!(0.5),
+            9 => json!(-0.0),
+            10 => json!(1e308),
+            11 => json!(9_007_199_254_740_992.0f64),
+            12 => json!(1e-300),
+            _ => json!(draws.below(60) as i64 - 10),
+        }
+    }
+
+    /// A value of any JSON type, nested to `depth` at most.
+    fn fuzz_value(draws: &mut Draws, depth: usize) -> Value {
+        match draws.below(if depth == 0 { 5 } else { 7 }) {
+            0 => Value::Null,
+            1 => json!(draws.below(2) == 0),
+            2 | 3 => fuzz_number(draws),
+            4 => json!(draws.pick(&FUZZ_STRINGS)),
+            5 => Value::Array(
+                (0..draws.below(4))
+                    .map(|_| fuzz_value(draws, depth - 1))
+                    .collect(),
+            ),
+            _ => {
+                let mut map = serde_json::Map::new();
+                for _ in 0..draws.below(3) {
+                    map.insert(
+                        draws.pick(&FUZZ_FIELDS).to_string(),
+                        fuzz_value(draws, depth - 1),
+                    );
+                }
+                Value::Object(map)
+            }
+        }
+    }
+
+    /// One record's metadata: each field absent a quarter of the time and
+    /// otherwise of any type.
+    fn fuzz_record(draws: &mut Draws) -> HashMap<String, Value> {
+        let mut record = HashMap::new();
+        for name in FUZZ_FIELDS {
+            if draws.below(4) != 0 {
+                record.insert(name.to_string(), fuzz_value(draws, 2));
+            }
+        }
+        record
+    }
+
+    /// One field's condition: a value to equal, or a mapping of operators,
+    /// each with a target of any type, a list most often where the operator
+    /// takes one.
+    fn fuzz_condition(draws: &mut Draws) -> Value {
+        if draws.below(4) == 0 {
+            return fuzz_value(draws, 2);
+        }
+        let mut map = serde_json::Map::new();
+        for _ in 0..1 + draws.below(3) {
+            let op = draws.pick(&FUZZ_OPERATORS);
+            let target = match op {
+                "in" | "nin" | "any" | "all" if draws.below(4) != 0 => {
+                    Value::Array((0..draws.below(5)).map(|_| fuzz_value(draws, 1)).collect())
+                }
+                "exists" | "is_missing" | "is_null" if draws.below(4) != 0 => {
+                    json!(draws.below(2) == 0)
+                }
+                _ => fuzz_value(draws, 2),
+            };
+            map.insert(op.to_string(), target);
+        }
+        Value::Object(map)
+    }
+
+    /// One filter mapping, of fields and groups, nested to `depth`, with a
+    /// group's value drawn now and then of a shape the group refuses.
+    fn fuzz_mapping(draws: &mut Draws, depth: usize) -> serde_json::Map<String, Value> {
+        let mut map = serde_json::Map::new();
+        for _ in 0..1 + draws.below(3) {
+            let roll = if depth == 0 { 0 } else { draws.below(10) };
+            match roll {
+                0..=5 => {
+                    map.insert(draws.pick(&FUZZ_FIELDS).to_string(), fuzz_condition(draws));
+                }
+                6 | 7 => {
+                    let key = if roll == 6 { "$and" } else { "$or" };
+                    let value = if draws.below(12) == 0 {
+                        fuzz_value(draws, 1)
+                    } else {
+                        Value::Array(
+                            (0..draws.below(4))
+                                .map(|_| {
+                                    if draws.below(16) == 0 {
+                                        fuzz_value(draws, 1)
+                                    } else {
+                                        Value::Object(fuzz_mapping(draws, depth - 1))
+                                    }
+                                })
+                                .collect(),
+                        )
+                    };
+                    map.insert(key.to_string(), value);
+                }
+                _ => {
+                    let value = if draws.below(12) == 0 {
+                        fuzz_value(draws, 1)
+                    } else {
+                        Value::Object(fuzz_mapping(draws, depth - 1))
+                    };
+                    map.insert("$not".to_string(), value);
+                }
+            }
+        }
+        map
+    }
+
+    /// A refusal is one of the errors the compiler names for a filter.
+    fn is_a_filter_refusal(error: &crate::error::Error) -> bool {
+        use crate::error::Error;
+        matches!(
+            error,
+            Error::UnknownFilterOperation { .. }
+                | Error::ReservedKeyShape { .. }
+                | Error::FilterBranchNotMapping { .. }
+                | Error::FilterTooDeep { .. }
+                | Error::PresenceTargetNotBool { .. }
+        )
+    }
+
+    /// **The property.** Every mapping the grammar can draw, to a depth of
+    /// twelve and with shapes the compiler refuses among them, compiles or
+    /// is refused with one of the compiler's own errors, and none panics.
+    /// Every compiled filter judges every record without a panic. The
+    /// column store over the same records, with four fields declared and
+    /// some records erased, answers each filter with exactly the records
+    /// the walk finds where it answers exactly, and with a set containing
+    /// them where it narrows. A share of the filters compiles and a share of
+    /// the compiled ones the store answers exactly, so every path is reached.
+    #[test]
+    fn every_random_filter_compiles_or_is_refused_and_the_store_agrees_with_the_walk() {
+        use crate::allocations::{bounded, read_bound};
+        let filters = fuzz_filters();
+        let mut draws = Draws(0x0224_f11e_5eed_0001);
+        let records: Records = (0..200)
+            .map(|slot| (slot, fuzz_record(&mut draws)))
+            .collect();
+        let mut store = store_of(&FUZZ_FIELDS[..4], &records);
+        for (slot, _) in records.iter().filter(|(slot, _)| slot % 9 == 4) {
+            store.erase(*slot);
+        }
+        let (mut compiled, mut exact, mut narrowed) = (0usize, 0usize, 0usize);
+        for case in 0..filters {
+            let depth = draws.below(13);
+            let mapping: HashMap<String, Value> =
+                fuzz_mapping(&mut draws, depth).into_iter().collect();
+            let bound = read_bound(serde_json::to_string(&mapping).map_or(0, |text| text.len()));
+            let outcome = std::panic::catch_unwind(|| {
+                bounded(bound, || crate::filter::compile_filter(&mapping))
+            });
+            let filter = match outcome {
+                Err(_) => panic!("case {case}: compiling {mapping:?} panicked"),
+                Ok(Err(error)) => {
+                    assert!(
+                        is_a_filter_refusal(&error),
+                        "case {case}: {mapping:?} was refused with {error:?}"
+                    );
+                    continue;
+                }
+                Ok(Ok(filter)) => filter,
+            };
+            compiled += 1;
+            // Every record judged, the erased among them, and the live ones
+            // matched are the walk's answer.
+            let matched: Vec<usize> = records
+                .iter()
+                .filter(|(_, metadata)| crate::filter::matches_filter(metadata, &filter))
+                .map(|(slot, _)| *slot)
+                .collect();
+            let expected: Vec<usize> = matched
+                .into_iter()
+                .filter(|slot| store.live.contains(*slot))
+                .collect();
+            match store.select(&filter) {
+                Selection::Exact(bitmap) => {
+                    exact += 1;
+                    assert_eq!(
+                        bits(&bitmap),
+                        expected,
+                        "case {case}: the store's exact answer to {mapping:?}"
+                    );
+                }
+                Selection::Narrowed(bitmap, _) => {
+                    narrowed += 1;
+                    let bound = bits(&bitmap);
+                    assert!(
+                        expected.iter().all(|slot| bound.contains(slot)),
+                        "case {case}: the store's bound {bound:?} on {mapping:?} drops a record \
+                         of {expected:?}"
+                    );
+                }
+                Selection::Whole(_) => {}
+            }
+        }
+        eprintln!("{filters} filters, {compiled} compiled, {exact} exact, {narrowed} narrowed");
+        assert!(
+            compiled * 4 > filters && compiled < filters,
+            "{compiled} of {filters} compiled"
+        );
+        assert!(
+            exact * 10 > compiled,
+            "{exact} of {compiled} answered exactly"
+        );
+        assert!(narrowed > 0, "no filter was narrowed");
     }
 }

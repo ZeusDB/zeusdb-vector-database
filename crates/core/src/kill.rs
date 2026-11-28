@@ -15,6 +15,14 @@
 //! `checked` profile leave them on, which is where the matrix runs. See the
 //! `[profile]` tables in the workspace manifest.
 //!
+//! # A pause at a point
+//!
+//! A test that holds a write between two of its steps arms a pause at one of
+//! these points instead, under the `pause-points` feature and in this crate's
+//! own tests, and `at` holds the armed thread there before it reads whether
+//! the process is armed to abort; see `panic_point`. A build without the
+//! feature compiles none of it.
+//!
 //! # Why the points are an enum
 //!
 //! Every point is declared once in [`KillPoint`], and a process is armed by
@@ -33,8 +41,11 @@
 
 /// Every point a process can be aborted at.
 ///
-/// The six inside an `add` and the eleven inside a checkpoint, each named for
-/// the step it follows.
+/// Eleven inside an `add`, three of them reached only where its commit
+/// fails and one only in an overwrite, two in a roll by size, ten inside a
+/// checkpoint, five inside a backup, four inside the upgrade of a journal of
+/// format version 1, three inside a repair, one with the lock held, and one
+/// inside the close-up on removal, each named for the step it follows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(usize)]
 pub enum KillPoint {
@@ -42,14 +53,29 @@ pub enum KillPoint {
     AddBeforeFirstAppend = 0,
     /// With half a record's bytes written and no more.
     AddMidAppend,
+    /// After an overwrite segment's removal record is handed over and
+    /// before its first insert is.
+    OverwriteAfterRemovalAppend,
     /// After the second record of a batch is handed over.
     AddAfterSecondAppend,
     /// After every record of a segment is handed over and before the commit.
     AddAfterAppendBeforeCommit,
+    /// After the commit record is written and before it is synced.
+    AddAfterCommitRecord,
     /// After the commit and before the first record is installed.
     AddAfterCommitBeforeApply,
     /// After every record of the call is installed.
     AddAfterApply,
+    /// After a commit's sync failed and before the abort is written.
+    AddAfterFailedCommit,
+    /// With half an abort record's bytes written and no more.
+    AddMidAbort,
+    /// After the abort record is written and before it is synced.
+    AddAfterAbortBeforeSync,
+    /// After a full segment is synced and before the next one is created.
+    RollAfterSeal,
+    /// After the next segment is created and before a record lands in it.
+    RollAfterCreate,
     /// After the journal is synced and the sequence recorded, before the save.
     CheckpointBeforeSave,
     /// After the save has written every artefact but the graph dump.
@@ -63,16 +89,54 @@ pub enum KillPoint {
     SaveBetweenRenames,
     /// After the staged directory is in place.
     SaveAfterCommit,
-    /// After the save and before the journal is truncated.
-    CheckpointAfterSaveBeforeTruncate,
-    /// Before the truncation's first step.
-    TruncateBefore,
-    /// After the body is cut and synced, before the header is restated.
-    TruncateAfterSetLen,
-    /// After the header is restated and synced.
-    TruncateAfterHeader,
-    /// After the whole checkpoint.
-    CheckpointAfterTruncate,
+    /// After the save and before the journal rolls onto a segment naming it.
+    CheckpointAfterSaveBeforeRoll,
+    /// After the segment naming the checkpoint is created and synced, and
+    /// before any segment the checkpoint holds is deleted.
+    CheckpointAfterRoll,
+    /// After the first segment the checkpoint holds is deleted.
+    CheckpointMidDelete,
+    /// After every segment the checkpoint holds is deleted.
+    CheckpointAfterDelete,
+    /// After a backup has synced the journal and before it stages anything.
+    BackupAfterSync,
+    /// After a backup has written every artefact and the graph dump into
+    /// its staging directory, and before the manifest.
+    BackupAfterArtefacts,
+    /// After the backup's manifest, the last file it writes.
+    BackupAfterManifest,
+    /// Between a backup's two renames, with the target's previous directory
+    /// beside it and nothing at it.
+    BackupBetweenRenames,
+    /// After the backup's directory is in place.
+    BackupAfterCommit,
+    /// After a journal of format version 1 is replayed and before the
+    /// checkpoint that upgrades its directory.
+    UpgradeAfterReplay,
+    /// After the upgrading checkpoint's directory is in place and before its
+    /// journal's first segment is created.
+    UpgradeAfterCommit,
+    /// After that segment is created and before the version 1 file goes.
+    UpgradeAfterSegment,
+    /// After the version 1 file is removed.
+    UpgradeAfterOldRemoved,
+    /// After a repair has copied every byte it sets aside into its
+    /// quarantine folder, and before the journal changes.
+    RepairAfterQuarantine,
+    /// After a repair has cut the journal and removed the segments after the
+    /// cut, and before its checkpoint.
+    RepairAfterCut,
+    /// After a repair's checkpoint has committed and rolled the journal, and
+    /// before the repair is marked finished.
+    RepairAfterCheckpoint,
+    /// After `journal_to` takes the collection's lock and before anything is
+    /// written.
+    LockHeld,
+    /// Inside the close-up a removal batch runs where it leaves more holes
+    /// than the bound, after every structure's part is built off to the side
+    /// and before any is swapped in, which is after the batch's record is
+    /// committed.
+    RemovalMidCloseUp,
 }
 
 impl KillPoint {
@@ -80,21 +144,41 @@ impl KillPoint {
     pub const ALL: &'static [KillPoint] = &[
         KillPoint::AddBeforeFirstAppend,
         KillPoint::AddMidAppend,
+        KillPoint::OverwriteAfterRemovalAppend,
         KillPoint::AddAfterSecondAppend,
         KillPoint::AddAfterAppendBeforeCommit,
+        KillPoint::AddAfterCommitRecord,
         KillPoint::AddAfterCommitBeforeApply,
         KillPoint::AddAfterApply,
+        KillPoint::AddAfterFailedCommit,
+        KillPoint::AddMidAbort,
+        KillPoint::AddAfterAbortBeforeSync,
+        KillPoint::RollAfterSeal,
+        KillPoint::RollAfterCreate,
         KillPoint::CheckpointBeforeSave,
         KillPoint::SaveAfterArtefacts,
         KillPoint::SaveAfterDump,
         KillPoint::SaveAfterManifest,
         KillPoint::SaveBetweenRenames,
         KillPoint::SaveAfterCommit,
-        KillPoint::CheckpointAfterSaveBeforeTruncate,
-        KillPoint::TruncateBefore,
-        KillPoint::TruncateAfterSetLen,
-        KillPoint::TruncateAfterHeader,
-        KillPoint::CheckpointAfterTruncate,
+        KillPoint::CheckpointAfterSaveBeforeRoll,
+        KillPoint::CheckpointAfterRoll,
+        KillPoint::CheckpointMidDelete,
+        KillPoint::CheckpointAfterDelete,
+        KillPoint::BackupAfterSync,
+        KillPoint::BackupAfterArtefacts,
+        KillPoint::BackupAfterManifest,
+        KillPoint::BackupBetweenRenames,
+        KillPoint::BackupAfterCommit,
+        KillPoint::UpgradeAfterReplay,
+        KillPoint::UpgradeAfterCommit,
+        KillPoint::UpgradeAfterSegment,
+        KillPoint::UpgradeAfterOldRemoved,
+        KillPoint::RepairAfterQuarantine,
+        KillPoint::RepairAfterCut,
+        KillPoint::RepairAfterCheckpoint,
+        KillPoint::LockHeld,
+        KillPoint::RemovalMidCloseUp,
     ];
 
     /// What a case names the point, which is what a directory and a marker
@@ -103,21 +187,41 @@ impl KillPoint {
         match self {
             KillPoint::AddBeforeFirstAppend => "add:before_first_append",
             KillPoint::AddMidAppend => "add:mid_append",
+            KillPoint::OverwriteAfterRemovalAppend => "overwrite:after_removal_append",
             KillPoint::AddAfterSecondAppend => "add:after_second_append",
             KillPoint::AddAfterAppendBeforeCommit => "add:after_append_before_commit",
+            KillPoint::AddAfterCommitRecord => "add:after_commit_record",
             KillPoint::AddAfterCommitBeforeApply => "add:after_commit_before_apply",
             KillPoint::AddAfterApply => "add:after_apply",
+            KillPoint::AddAfterFailedCommit => "add:after_failed_commit",
+            KillPoint::AddMidAbort => "add:mid_abort",
+            KillPoint::AddAfterAbortBeforeSync => "add:after_abort_before_sync",
+            KillPoint::RollAfterSeal => "roll:after_seal",
+            KillPoint::RollAfterCreate => "roll:after_create",
             KillPoint::CheckpointBeforeSave => "checkpoint:before_save",
             KillPoint::SaveAfterArtefacts => "save:after_artefacts",
             KillPoint::SaveAfterDump => "save:after_dump",
             KillPoint::SaveAfterManifest => "save:after_manifest",
             KillPoint::SaveBetweenRenames => "save:between_renames",
             KillPoint::SaveAfterCommit => "save:after_commit",
-            KillPoint::CheckpointAfterSaveBeforeTruncate => "checkpoint:after_save_before_truncate",
-            KillPoint::TruncateBefore => "truncate:before",
-            KillPoint::TruncateAfterSetLen => "truncate:after_setlen",
-            KillPoint::TruncateAfterHeader => "truncate:after_header",
-            KillPoint::CheckpointAfterTruncate => "checkpoint:after_truncate",
+            KillPoint::CheckpointAfterSaveBeforeRoll => "checkpoint:after_save_before_roll",
+            KillPoint::CheckpointAfterRoll => "checkpoint:after_roll",
+            KillPoint::CheckpointMidDelete => "checkpoint:mid_delete",
+            KillPoint::CheckpointAfterDelete => "checkpoint:after_delete",
+            KillPoint::BackupAfterSync => "backup:after_sync",
+            KillPoint::BackupAfterArtefacts => "backup:after_artefacts",
+            KillPoint::BackupAfterManifest => "backup:after_manifest",
+            KillPoint::BackupBetweenRenames => "backup:between_renames",
+            KillPoint::BackupAfterCommit => "backup:after_commit",
+            KillPoint::UpgradeAfterReplay => "upgrade:after_replay",
+            KillPoint::UpgradeAfterCommit => "upgrade:after_commit",
+            KillPoint::UpgradeAfterSegment => "upgrade:after_segment",
+            KillPoint::UpgradeAfterOldRemoved => "upgrade:after_old_removed",
+            KillPoint::RepairAfterQuarantine => "repair:after_quarantine",
+            KillPoint::RepairAfterCut => "repair:after_cut",
+            KillPoint::RepairAfterCheckpoint => "repair:after_checkpoint",
+            KillPoint::LockHeld => "lock:held",
+            KillPoint::RemovalMidCloseUp => "removal:mid_close_up",
         }
     }
 
@@ -170,8 +274,11 @@ mod live {
     ///
     /// `std::process::abort` rather than `panic!` or `exit`, so no destructor
     /// runs, no buffer is flushed and no file is closed, which is what a
-    /// killed process leaves.
+    /// killed process leaves. A thread armed to pause at `point` pauses
+    /// first.
     pub fn at(point: KillPoint) {
+        #[cfg(any(test, feature = "pause-points"))]
+        crate::panic_point::pause_at_kill(point);
         if !armed_at(point) {
             return;
         }
@@ -202,8 +309,13 @@ mod live {
         false
     }
 
+    /// Pause where this thread is armed to pause at `_point`, under the
+    /// `pause-points` feature, and do nothing else.
     #[inline(always)]
-    pub fn at(_point: KillPoint) {}
+    pub fn at(_point: KillPoint) {
+        #[cfg(any(test, feature = "pause-points"))]
+        crate::panic_point::pause_at_kill(_point);
+    }
 }
 
 pub use live::{arm, armed_at, at, disarm};

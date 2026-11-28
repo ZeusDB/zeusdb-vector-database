@@ -1,21 +1,29 @@
 //! The storage traits over the local filesystem.
 //!
 //! [`FsStorage`] keeps a collection at a directory path, its target, and
-//! uses three siblings of it on the same volume. `<name>.zdbtmp` is the
+//! uses five siblings of it on the same volume. `<name>.zdbtmp` is the
 //! directory a save writes before it is moved into place, `<name>.zdbold`
-//! holds the directory being replaced while the new one moves in, and
-//! `<name>.zdbwal` is the journal. [`FsDir`] is a directory of artefacts
-//! under one path.
+//! holds the directory being replaced while the new one moves in,
+//! `<name>.zdbjournal` is the journal's directory of segments,
+//! `<name>.zdbwal` is the journal of format version 1 an older release
+//! wrote, and `<name>.zdblock` is the lock file. [`FsDir`] is a directory
+//! of artefacts under one path.
 
-use super::{ArtefactWriter, Dir, JournalFile, Staged, Storage};
+use super::{
+    refuses_writes, ArtefactWriter, Dir, JournalDir, JournalFile, LockFailure, LockGuard, LockMode,
+    Locked, Staged, Storage,
+};
 use crate::error::Error;
+use std::cell::RefCell;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{MutexGuard, PoisonError};
 use tracing::info;
 
-/// The target the one record this module emits carries, being the module
-/// path the staging code had in the binding. See the crate root.
+/// The target the records this module emits carry, being the module path
+/// the staging code had in the binding. See the crate root.
 const LOG_TARGET: &str = "zeusdb_vector_database::persistence";
 
 /// Suffix of the directory a save builds before it is moved into place.
@@ -24,8 +32,39 @@ const STAGING_SUFFIX: &str = ".zdbtmp";
 /// Suffix the directory being replaced is moved aside under.
 const REPLACED_SUFFIX: &str = ".zdbold";
 
-/// The suffix a collection's journal takes beside its directory.
-pub const JOURNAL_SUFFIX: &str = ".zdbwal";
+/// The suffix a collection's journal, a directory of segments, takes beside
+/// its directory.
+pub const JOURNAL_SUFFIX: &str = ".zdbjournal";
+
+/// The suffix the journal of format version 1, one file, took beside its
+/// directory. Releases from 0.11.0 to 0.13.0 wrote it, and this build reads
+/// it to upgrade the directory.
+pub const LEGACY_JOURNAL_SUFFIX: &str = ".zdbwal";
+
+/// The suffix of the lock file beside a directory.
+pub const LOCK_SUFFIX: &str = ".zdblock";
+
+/// The suffix of a segment inside the journal's directory.
+pub const SEGMENT_SUFFIX: &str = ".zdbseg";
+
+/// The digits of a segment's name, so that the names sort in sequence order.
+const SEGMENT_DIGITS: usize = 20;
+
+/// The file name of the segment whose first record is `number`, being the
+/// number in twenty decimal digits and the suffix.
+pub(crate) fn segment_file_name(number: u64) -> String {
+    format!("{number:0width$}{SEGMENT_SUFFIX}", width = SEGMENT_DIGITS)
+}
+
+/// The number a segment's file name carries, where `name` is a segment's
+/// name and nothing else: twenty decimal digits and the suffix.
+pub(crate) fn segment_number(name: &str) -> Option<u64> {
+    let digits = name.strip_suffix(SEGMENT_SUFFIX)?;
+    if digits.len() != SEGMENT_DIGITS || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
 
 // ============================================================================
 // A DIRECTORY OF ARTEFACTS
@@ -111,30 +150,6 @@ impl Dir for FsDir {
         Ok(Box::new(File::open(self.at(name))?))
     }
 
-    /// Every file under the path, the directories under it included, and
-    /// nothing where the path is not a directory.
-    fn total_bytes(&self) -> io::Result<u64> {
-        fn bytes_under(path: &Path) -> io::Result<u64> {
-            let mut total = 0u64;
-            for entry in fs::read_dir(path)? {
-                let entry = entry?;
-                let metadata = entry.metadata()?;
-                if metadata.is_file() {
-                    total += metadata.len();
-                } else if metadata.is_dir() {
-                    total += bytes_under(&entry.path())?;
-                }
-            }
-            Ok(total)
-        }
-
-        if self.root.is_dir() {
-            bytes_under(&self.root)
-        } else {
-            Ok(0)
-        }
-    }
-
     fn locate(&self, name: &str) -> String {
         if name.is_empty() {
             self.root.display().to_string()
@@ -202,21 +217,30 @@ impl ArtefactWriter for FsArtefact {
 ///
 /// So a commit over an existing directory does this:
 ///
-/// 1. rename the target aside to `<name>.zdbold`
-/// 2. rename the staging directory to the target
-/// 3. remove `<name>.zdbold`
+/// 1. sync every directory the save wrote, deepest first
+/// 2. rename the target aside to `<name>.zdbold`
+/// 3. rename the staging directory to the target
+/// 4. sync the folder the target sits in
+/// 5. remove `<name>.zdbold`
 ///
-/// Steps 1 and 2 are each atomic on both platforms. Between them the target
+/// A file's sync does not make its name durable, so each directory's own
+/// entries are synced, and a sync that fails fails the commit; see
+/// [`sync_directory`]. Step 4 comes before step 5, so a power loss leaves
+/// the new directory or the whole previous one.
+///
+/// Steps 2 and 3 are each atomic on both platforms. Between them the target
 /// does not exist, which is a window of two filesystem calls with no I/O
 /// between them. **A reader in that window sees no directory rather than a
 /// partial one**, which is the property that matters, and a process killed
 /// in it leaves the whole previous index at `<name>.zdbold`.
 /// [`Storage::recover`] puts that back, and both a load and the next save run
-/// it first. A save to a path that holds nothing yet is step 2 alone, which
-/// is atomic outright.
+/// it first. A save to a path that holds nothing yet is step 3 alone between
+/// its two syncs, which is atomic outright.
 ///
-/// If step 2 fails the target is renamed back from `<name>.zdbold`, so a
-/// failed save leaves the previous directory where it was.
+/// If step 3 fails the target is renamed back from `<name>.zdbold`, so a
+/// failed save leaves the previous directory where it was. If step 4 fails
+/// the new directory is in place and the previous one stays at
+/// `<name>.zdbold`, which the next save removes.
 ///
 /// A rename is only cheap, and only atomic, within one volume, which is why
 /// the staging directory is a sibling of the target rather than a directory
@@ -231,11 +255,28 @@ impl ArtefactWriter for FsArtefact {
 ///
 /// # The journal
 ///
-/// `<name>.zdbwal`, a sibling for the same reason. Windows refuses to rename
-/// a directory that holds an open file, and `remove_dir_all` on a directory
-/// holding an open file succeeds, so a journal inside the directory would
-/// either stop the first rename of a commit or be removed with
-/// `<name>.zdbold` after the second.
+/// `<name>.zdbjournal`, a directory of segments and a sibling for the same
+/// reason. Windows refuses to rename a directory that holds an open file,
+/// and `remove_dir_all` on a directory holding an open file succeeds, so a
+/// journal inside the directory would either stop the first rename of a
+/// commit or be removed with `<name>.zdbold` after the second.
+///
+/// A segment open for writing is opened on Windows without delete sharing,
+/// so no other handle can delete or rename it while this one holds it.
+///
+/// # The lock
+///
+/// `<name>.zdblock`, an ordinary file locked whole through `File::try_lock`
+/// and `File::try_lock_shared`, which are `flock` on Linux and macOS and
+/// `LockFileEx` on Windows. The lock lives in a file of its own because on
+/// Windows a lock blocks reads of the locked bytes through every other
+/// handle, so a lock on a segment or an artefact would stop a reader. The
+/// file is created on first use and never removed. A child forked through
+/// Python's `os.fork` closes its copy of every lock file just after the
+/// fork, through [`close_lock_files_in_forked_child`], so a lock stays with
+/// the process that took it. That process unlocks the file before it closes
+/// it, so the lock goes when it lets the lock go, even while a child it
+/// started still holds a copy of the file.
 #[derive(Clone, Debug)]
 pub struct FsStorage {
     target: PathBuf,
@@ -243,6 +284,8 @@ pub struct FsStorage {
     staging: PathBuf,
     replaced: PathBuf,
     journal: PathBuf,
+    legacy_journal: PathBuf,
+    lock: PathBuf,
 }
 
 impl FsStorage {
@@ -253,6 +296,8 @@ impl FsStorage {
             staging: sibling(target, STAGING_SUFFIX)?,
             replaced: sibling(target, REPLACED_SUFFIX)?,
             journal: sibling(target, JOURNAL_SUFFIX)?,
+            legacy_journal: sibling(target, LEGACY_JOURNAL_SUFFIX)?,
+            lock: sibling(target, LOCK_SUFFIX)?,
             dir: FsDir::new(target),
             target: target.to_path_buf(),
         })
@@ -268,6 +313,34 @@ fn sibling(target: &Path, suffix: &str) -> Result<PathBuf, Error> {
     let mut name = name.to_os_string();
     name.push(suffix);
     Ok(target.parent().unwrap_or_else(|| Path::new("")).join(name))
+}
+
+/// The most of a folder's `manifest.json` [`written_by_a_save`] reads,
+/// being far above any manifest a save writes.
+const MANIFEST_READ_LIMIT: usize = 1 << 20;
+
+/// Whether the file at `path` is a manifest a save writes: a JSON object
+/// whose `index_type` is `HNSW` and whose `format_version` is a string,
+/// which every manifest from format 1.0.0 to 5.0.0 holds. A file longer
+/// than [`MANIFEST_READ_LIMIT`] or holding anything else is one of the
+/// caller's own, which a save must not replace.
+fn written_by_a_save(path: &Path) -> io::Result<bool> {
+    let mut bytes = Vec::new();
+    File::open(path)?
+        .take(MANIFEST_READ_LIMIT as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MANIFEST_READ_LIMIT {
+        return Ok(false);
+    }
+    let Ok(serde_json::Value::Object(fields)) = serde_json::from_slice(&bytes) else {
+        return Ok(false);
+    };
+    Ok(
+        fields.get("index_type").and_then(serde_json::Value::as_str) == Some("HNSW")
+            && fields
+                .get("format_version")
+                .is_some_and(serde_json::Value::is_string),
+    )
 }
 
 impl Storage for FsStorage {
@@ -299,6 +372,10 @@ impl Storage for FsStorage {
         self.target.exists()
     }
 
+    fn aside_exists(&self) -> bool {
+        self.replaced.exists()
+    }
+
     fn dir(&self) -> &dyn Dir {
         &self.dir
     }
@@ -308,9 +385,18 @@ impl Storage for FsStorage {
     ///
     /// `<name>.zdbold` still present after the recovery is the previous index
     /// after a save that finished, so it is removed, and so is a staging
-    /// directory an interrupted save left.
+    /// directory an interrupted save left. The save that left it may not
+    /// have synced the folder after its move, so the folder is synced first,
+    /// and a power loss then leaves the directory that moved in rather than
+    /// a previous one part removed.
     fn stage(&self) -> Result<Box<dyn Staged>, Error> {
         if !self.recover()? && self.replaced.exists() {
+            let folder = folder_of(&self.target);
+            sync_directory(folder).map_err(|error| Error::SaveSyncFailed {
+                directory: folder.to_path_buf(),
+                target: self.target.clone(),
+                error: error.to_string(),
+            })?;
             remove_tree(
                 &self.replaced,
                 "the previous index a finished save left aside",
@@ -322,10 +408,12 @@ impl Storage for FsStorage {
                 "a staging directory an interrupted save left behind",
             )?;
         }
-        fs::create_dir_all(&self.staging).map_err(|e| Error::StagingCreateFailed {
-            staging: self.staging.clone(),
-            error: e.to_string(),
-        })?;
+        create_folders(folder_of(&self.staging))
+            .and_then(|()| fs::create_dir_all(&self.staging))
+            .map_err(|e| Error::StagingCreateFailed {
+                staging: self.staging.clone(),
+                error: e.to_string(),
+            })?;
         Ok(Box::new(FsStaged {
             target: self.target.clone(),
             dir: FsDir::new(&self.staging),
@@ -333,6 +421,45 @@ impl Storage for FsStorage {
             replaced: self.replaced.clone(),
             committed: false,
         }))
+    }
+
+    /// The target is read through its link where it is one, so a link to an
+    /// index directory is an index directory. A folder is an index directory
+    /// where its `manifest.json` is one a save writes; see
+    /// [`written_by_a_save`].
+    fn foreign_target(&self) -> Option<String> {
+        let metadata = fs::metadata(&self.target).ok()?;
+        if !metadata.is_dir() {
+            return Some("a file".to_string());
+        }
+        let manifest = self.target.join("manifest.json");
+        // What the folder's manifest.json is, where it holds one.
+        let held = manifest.is_file().then(|| written_by_a_save(&manifest));
+        let manifest_words = match &held {
+            None => "no manifest.json".to_string(),
+            Some(Ok(true)) => return None,
+            Some(Ok(false)) => "a manifest.json that no save wrote".to_string(),
+            Some(Err(error)) => format!("a manifest.json this process cannot read ({error})"),
+        };
+        match fs::read_dir(&self.target).map(Iterator::count) {
+            Ok(0) => None,
+            Ok(1) => Some(format!("a folder holding 1 entry and {manifest_words}")),
+            Ok(n) => Some(format!("a folder holding {n} entries and {manifest_words}")),
+            Err(error) => Some(format!(
+                "a folder this process cannot list ({error}) and {manifest_words}"
+            )),
+        }
+    }
+
+    /// A staging directory an interrupted save left is removed here, as
+    /// [`Storage::stage`] would remove it, so the probe asks the folder the
+    /// question a checkpoint's first write asks.
+    fn probe_writable(&self) -> io::Result<()> {
+        if self.staging.exists() {
+            fs::remove_dir_all(&self.staging)?;
+        }
+        fs::create_dir(&self.staging)?;
+        fs::remove_dir(&self.staging)
     }
 
     fn journal_path(&self) -> &Path {
@@ -350,31 +477,487 @@ impl Storage for FsStorage {
     }
 
     fn journal_exists(&self) -> bool {
-        self.journal.exists()
+        self.journal.is_dir()
     }
 
-    fn read_journal(&self) -> io::Result<Vec<u8>> {
-        fs::read(&self.journal)
+    /// The journal's directory is synced once it is emptied, and the folder
+    /// it sits in once it is there, so neither a segment of the journal it
+    /// replaces nor the loss of its own name can meet a later load.
+    fn create_journal(&self) -> io::Result<()> {
+        fs::create_dir_all(&self.journal)?;
+        let dir = FsJournalDir {
+            path: self.journal.clone(),
+        };
+        for number in dir.segments()? {
+            dir.remove_segment(number)?;
+        }
+        dir.sync()?;
+        sync_directory(folder_of(&self.journal))
     }
 
-    fn create_journal(&self) -> io::Result<Box<dyn JournalFile>> {
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .read(true)
-            .write(true)
-            .open(&self.journal)?;
-        Ok(Box::new(FsJournalFile { file }))
+    fn journal_dir(&self) -> Box<dyn JournalDir> {
+        Box::new(FsJournalDir {
+            path: self.journal.clone(),
+        })
     }
 
-    fn open_journal(&self) -> io::Result<Box<dyn JournalFile>> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&self.journal)?;
-        Ok(Box::new(FsJournalFile { file }))
+    fn legacy_journal_path(&self) -> &Path {
+        &self.legacy_journal
+    }
+
+    fn legacy_journal_exists(&self) -> bool {
+        self.legacy_journal.is_file()
+    }
+
+    fn read_legacy_journal(&self) -> io::Result<Vec<u8>> {
+        fs::read(&self.legacy_journal)
+    }
+
+    fn remove_legacy_journal(&self) -> io::Result<()> {
+        fs::remove_file(&self.legacy_journal)
+    }
+
+    fn sync_in_place(&self) -> io::Result<()> {
+        sync_tree(&self.target).map_err(|(directory, error)| {
+            io::Error::new(error.kind(), format!("{}: {error}", directory.display()))
+        })?;
+        let folder = folder_of(&self.target);
+        sync_directory(folder)
+            .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", folder.display())))
+    }
+
+    fn cut_legacy_journal(&self, len: u64) -> io::Result<()> {
+        let file = OpenOptions::new().write(true).open(&self.legacy_journal)?;
+        file.set_len(len)?;
+        file.sync_all()
+    }
+
+    fn lock_path(&self) -> &Path {
+        &self.lock
+    }
+
+    /// The holder's line is written after an exclusive acquisition alone. On
+    /// Windows a shared lock refuses writes to the locked bytes through
+    /// every handle, its own included, so a shared holder writes nothing.
+    ///
+    /// The process's lock files are held from the open until the file is
+    /// kept among them, so a fork never copies a lock file that its child
+    /// would not know to close.
+    fn lock(&self, mode: LockMode, holder: &str) -> Result<Locked, LockFailure> {
+        with_lock_files(|files| self.lock_kept_in(files, mode, holder))
     }
 }
+
+impl FsStorage {
+    /// [`Storage::lock`], with the lock file it opens kept in `files`.
+    fn lock_kept_in(
+        &self,
+        files: &mut LockFileList,
+        mode: LockMode,
+        holder: &str,
+    ) -> Result<Locked, LockFailure> {
+        let open = || {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&self.lock)
+        };
+        let writable = match open() {
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound && mode == LockMode::Exclusive =>
+            {
+                match self
+                    .lock
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                {
+                    Some(parent) => create_folders(parent).and_then(|()| open()),
+                    None => Err(error),
+                }
+            }
+            other => other,
+        };
+        match writable {
+            Ok(file) => {
+                acquire(&file, mode).map_err(|error| self.lock_failure(error))?;
+                if mode == LockMode::Exclusive {
+                    let _ = file
+                        .set_len(0)
+                        .and_then(|()| (&file).write_all(holder.as_bytes()));
+                }
+                Ok(Locked::Writable(Box::new(keep(files, file, mode))))
+            }
+            Err(reason) if refuses_writes(&reason) => match File::open(&self.lock) {
+                Ok(file) => {
+                    acquire(&file, LockMode::Shared).map_err(|error| self.lock_failure(error))?;
+                    Ok(Locked::ReadOnly {
+                        guard: Some(Box::new(keep(files, file, LockMode::Shared))),
+                        reason,
+                    })
+                }
+                Err(missing) if missing.kind() == io::ErrorKind::NotFound => Ok(Locked::ReadOnly {
+                    guard: None,
+                    reason,
+                }),
+                Err(other) => Err(LockFailure::Failed(other)),
+            },
+            Err(other) => Err(LockFailure::Failed(other)),
+        }
+    }
+
+    /// What a lock that was not taken means. The holder that excludes this
+    /// one is named only as another holder, since a refused lock call gives
+    /// nothing of the holder. The lock file holds the last record an
+    /// exclusive holder wrote, which a shared holder never replaces and a
+    /// release never clears, so its lines are quoted, joined, as that record
+    /// and never as the holder's. An empty lock file is named as recording no
+    /// holder, and one whose bytes are not UTF-8, which the read gives as
+    /// `InvalidData`, as holding no readable record. The words that the
+    /// system does not let a second handle read the file are for the read
+    /// that Windows refuses with `ERROR_LOCK_VIOLATION`, as it does while
+    /// another handle holds the lock exclusive. The lock stops no read on
+    /// Linux or macOS, so a read that fails for any other reason, on any
+    /// system, says that the lock file cannot be read and gives the system's
+    /// error.
+    fn lock_failure(&self, error: std::fs::TryLockError) -> LockFailure {
+        match error {
+            std::fs::TryLockError::WouldBlock => {
+                let holder = match fs::read_to_string(&self.lock) {
+                    Ok(text) => {
+                        let record = text
+                            .lines()
+                            .map(str::trim)
+                            .filter(|line| !line.is_empty())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        if record.is_empty() {
+                            "another holder, and its lock file records no holder".to_string()
+                        } else {
+                            format!(
+                                "another holder, and its lock file holds the last record an \
+                                 exclusive holder wrote, {record}"
+                            )
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                        "another holder, and its lock file holds no readable record".to_string()
+                    }
+                    Err(error)
+                        if cfg!(windows) && error.raw_os_error() == Some(ERROR_LOCK_VIOLATION) =>
+                    {
+                        "another holder, whose record this system does not let a second handle \
+                         read while the lock is held"
+                            .to_string()
+                    }
+                    Err(error) => format!(
+                        "another holder, and its lock file cannot be read, with the system's \
+                         error {error}"
+                    ),
+                };
+                LockFailure::Held { holder }
+            }
+            std::fs::TryLockError::Error(error) => LockFailure::Unavailable(error),
+        }
+    }
+}
+
+/// The error Windows gives a read of a range that another handle holds
+/// locked, `ERROR_LOCK_VIOLATION`.
+const ERROR_LOCK_VIOLATION: i32 = 33;
+
+/// Take `file`'s lock in `mode` without waiting.
+fn acquire(file: &File, mode: LockMode) -> Result<(), std::fs::TryLockError> {
+    match mode {
+        LockMode::Shared => file.try_lock_shared(),
+        LockMode::Exclusive => file.try_lock(),
+    }
+}
+
+/// The lock files a process holds open, each beside the number its guard
+/// carries.
+type LockFileList = Vec<(u64, File)>;
+
+/// [`LockFileList`] behind the lock that every opening, closing and fork of
+/// a lock file takes.
+#[allow(clippy::disallowed_types)]
+type LockFiles = std::sync::Mutex<LockFileList>;
+
+/// This process's lock files.
+///
+/// A file is kept here and not in its guard, so that a child forked from the
+/// process can close its copy of every one, wherever the guard that owns it
+/// lives. A lock on an open file goes only when the file is unlocked or the
+/// last copy of it is closed, so the child's close leaves the parent's lock
+/// held, and the lock then goes with the parent alone.
+static LOCK_FILES: LockFiles = LockFiles::new(Vec::new());
+
+/// The number the next lock file is kept under.
+static NEXT_LOCK_FILE: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    /// This process's lock files, while the thread that forks holds them
+    /// across the fork.
+    static HELD_FOR_FORK: RefCell<Option<MutexGuard<'static, LockFileList>>> =
+        const { RefCell::new(None) };
+}
+
+/// Hold this process's lock files from just before a fork, so that no other
+/// thread opens or closes one while the process is copied. After the fork the
+/// parent lets them go through [`release_lock_files_after_fork`] and the
+/// child closes its copies through [`close_lock_files_in_forked_child`]. The
+/// binding calls all three from `os.register_at_fork`.
+pub fn hold_lock_files_for_fork() {
+    HELD_FOR_FORK.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(LOCK_FILES.lock().unwrap_or_else(PoisonError::into_inner));
+        }
+    });
+}
+
+/// Let this process's lock files go after a fork, in the parent, as they were
+/// before it.
+pub fn release_lock_files_after_fork() {
+    let held = HELD_FOR_FORK.with(|slot| slot.borrow_mut().take());
+    drop(held);
+}
+
+/// Close, in a child just forked, the child's copy of every lock file the
+/// parent held open. The parent keeps every lock, since a close releases a
+/// lock only with the last copy of its file, and the child holds none, so a
+/// lock goes when the parent lets it go or ends, whether or not the child
+/// lives on. A guard the child drops later closes nothing.
+///
+/// The files are the ones held since [`hold_lock_files_for_fork`]. Where
+/// nothing holds them they are taken here, unless a thread the child does not
+/// have held them at the fork, and then the child keeps its copies.
+pub fn close_lock_files_in_forked_child() {
+    let copies = match HELD_FOR_FORK.with(|slot| slot.borrow_mut().take()) {
+        Some(mut held) => std::mem::take(&mut *held),
+        None => try_with_lock_files(std::mem::take).unwrap_or_default(),
+    };
+    drop(copies);
+}
+
+/// Run `f` through the hold this thread has taken for a fork, where it has
+/// one, so that a lock taken or dropped there before the fork does not wait
+/// on itself, and hand `f` back where it has none.
+fn through_fork_hold<R, F>(f: F) -> Result<R, F>
+where
+    F: FnOnce(&mut LockFileList) -> R,
+{
+    HELD_FOR_FORK.with(|slot| match slot.borrow_mut().as_mut() {
+        Some(held) => Ok(f(held)),
+        None => Err(f),
+    })
+}
+
+/// Run `f` over this process's lock files, waiting for them where another
+/// thread has them.
+fn with_lock_files<R>(f: impl FnOnce(&mut LockFileList) -> R) -> R {
+    through_fork_hold(f)
+        .unwrap_or_else(|f| f(&mut LOCK_FILES.lock().unwrap_or_else(PoisonError::into_inner)))
+}
+
+/// Run `f` over this process's lock files unless another thread has them,
+/// which a child forked from the process cannot wait out, since that thread
+/// is not in the child.
+fn try_with_lock_files<R>(f: impl FnOnce(&mut LockFileList) -> R) -> Option<R> {
+    match through_fork_hold(f) {
+        Ok(result) => Some(result),
+        Err(f) => match LOCK_FILES.try_lock() {
+            Ok(mut held) => Some(f(&mut held)),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(f(&mut poisoned.into_inner())),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        },
+    }
+}
+
+/// Keep `file` among this process's lock files, and give the guard whose drop
+/// closes it.
+fn keep(files: &mut LockFileList, file: File, mode: LockMode) -> FsLock {
+    let id = NEXT_LOCK_FILE.fetch_add(1, Ordering::Relaxed);
+    files.push((id, file));
+    FsLock {
+        id,
+        mode,
+        process: std::process::id(),
+    }
+}
+
+/// A lock held through an open lock file, which this process's lock files
+/// keep under `id`. Dropping it in the process that took it unlocks the file
+/// and closes it; see [`LockGuard`].
+#[derive(Debug)]
+struct FsLock {
+    id: u64,
+    mode: LockMode,
+    /// The process that took the lock.
+    process: u32,
+}
+
+impl LockGuard for FsLock {
+    fn mode(&self) -> LockMode {
+        self.mode
+    }
+}
+
+/// In the process that took the lock, the drop unlocks the file before it
+/// closes it, so the lock goes even while a child process holds a copy of
+/// the file, as a child does from its fork to its exec. A child never
+/// unlocks, since the open file it shares with the parent carries the
+/// parent's lock. A child forked from the process that took the lock has
+/// closed its copy already where the fork went through `os.register_at_fork`,
+/// and then the drop finds nothing to close. A child does not wait for the
+/// lock files, which a thread it does not have may hold, and keeps its copy
+/// where another thread had them.
+impl Drop for FsLock {
+    fn drop(&mut self) {
+        let id = self.id;
+        let take = move |files: &mut LockFileList| {
+            files
+                .iter()
+                .position(|(kept, _)| *kept == id)
+                .map(|at| files.swap_remove(at).1)
+        };
+        let file = if std::process::id() == self.process {
+            with_lock_files(|files| {
+                let file = take(files);
+                if let Some(file) = &file {
+                    // Where the unlock fails, the close still releases the
+                    // lock once no child holds a copy.
+                    let _ = file.unlock();
+                }
+                file
+            })
+        } else {
+            try_with_lock_files(take).flatten()
+        };
+        drop(file);
+    }
+}
+
+// ============================================================================
+// THE JOURNAL'S DIRECTORY
+// ============================================================================
+
+/// The journal's directory of segments.
+#[derive(Clone, Debug)]
+struct FsJournalDir {
+    path: PathBuf,
+}
+
+/// The options a segment is opened with for writing. On Windows the share
+/// mode is read and write without delete, so no other handle can delete or
+/// rename an open segment, which would orphan the journal under a live
+/// collection. The two values are `FILE_SHARE_READ` and `FILE_SHARE_WRITE`.
+fn segment_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.share_mode(0x0000_0001 | 0x0000_0002);
+    }
+    options
+}
+
+impl JournalDir for FsJournalDir {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// An entry whose name is not a segment's is left where it is. One that
+    /// is not the repair's `quarantine` folder is logged, once a listing.
+    fn segments(&self) -> io::Result<Vec<u64>> {
+        let mut numbers = Vec::new();
+        let mut others = Vec::new();
+        for entry in fs::read_dir(&self.path)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            match segment_number(&name) {
+                Some(number) if entry.file_type()?.is_file() => numbers.push(number),
+                _ if name == QUARANTINE => {}
+                _ => others.push(name.into_owned()),
+            }
+        }
+        if !others.is_empty() {
+            info!(target: LOG_TARGET, operation = "journal_entries",
+                journal = %self.path.display(),
+                entries = ?others,
+                "The journal's directory holds entries that are not segments; they were left where they are"
+            );
+        }
+        numbers.sort_unstable();
+        Ok(numbers)
+    }
+
+    fn read_segment(&self, number: u64) -> io::Result<Vec<u8>> {
+        fs::read(self.segment_path(number))
+    }
+
+    fn create_segment(&self, number: u64) -> io::Result<Box<dyn JournalFile>> {
+        let file = segment_options()
+            .create_new(true)
+            .open(self.segment_path(number))?;
+        Ok(Box::new(FsJournalFile { file }))
+    }
+
+    fn open_segment(&self, number: u64) -> io::Result<Box<dyn JournalFile>> {
+        let file = segment_options().open(self.segment_path(number))?;
+        Ok(Box::new(FsJournalFile { file }))
+    }
+
+    fn remove_segment(&self, number: u64) -> io::Result<()> {
+        fs::remove_file(self.segment_path(number))
+    }
+
+    fn sync(&self) -> io::Result<()> {
+        sync_directory(&self.path)
+    }
+
+    fn segment_path(&self, number: u64) -> PathBuf {
+        self.path.join(segment_file_name(number))
+    }
+
+    fn create_quarantine(&self, folder: &str) -> io::Result<()> {
+        fs::create_dir_all(self.path.join(QUARANTINE).join(folder))
+    }
+
+    fn quarantine(&self) -> Box<dyn Dir> {
+        Box::new(FsDir::new(self.path.join(QUARANTINE)))
+    }
+
+    fn quarantine_folders(&self) -> io::Result<Vec<String>> {
+        let root = self.path.join(QUARANTINE);
+        if !root.is_dir() {
+            return Ok(Vec::new());
+        }
+        let mut folders = Vec::new();
+        for entry in fs::read_dir(&root)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                folders.push(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
+        folders.sort_unstable();
+        Ok(folders)
+    }
+
+    fn sync_quarantine(&self, folder: &str) -> io::Result<()> {
+        let root = self.path.join(QUARANTINE);
+        sync_directory(&root.join(folder))?;
+        sync_directory(&root)?;
+        sync_directory(&self.path)
+    }
+}
+
+/// The folder under the journal's directory a repair copies what it sets
+/// aside into, one folder a repair.
+const QUARANTINE: &str = "quarantine";
 
 /// The staging directory, and the move that puts it in place. See
 /// [`FsStorage`] for what the move is on each platform.
@@ -391,8 +974,22 @@ impl Staged for FsStaged {
         &self.dir
     }
 
-    fn commit(mut self: Box<Self>) -> Result<(), Error> {
-        sync_directory(&self.staging);
+    /// Every directory the save wrote is synced before the first move, so a
+    /// directory moves into place only once every name in it is durable.
+    /// The folder is synced after the moves and before the directory they
+    /// replaced is removed, so a power loss leaves one of the two whole. A
+    /// sync that fails fails the commit. One after the moves leaves the
+    /// directory in place and the one it replaced at `<name>.zdbold`, which
+    /// the next save removes.
+    fn commit(mut self: Box<Self>, between: crate::KillPoint) -> Result<(), Error> {
+        if let Err((directory, error)) = sync_tree(&self.staging) {
+            return Err(Error::SaveSyncFailed {
+                directory,
+                target: self.target.clone(),
+                error: error.to_string(),
+            });
+        }
+        let folder = folder_of(&self.target).to_path_buf();
 
         if self.target.exists() {
             fs::rename(&self.target, &self.replaced).map_err(|e| Error::MoveAsideFailed {
@@ -400,7 +997,7 @@ impl Staged for FsStaged {
                 error: e.to_string(),
             })?;
 
-            crate::kill_at(crate::KillPoint::SaveBetweenRenames);
+            crate::kill_at(between);
 
             if let Err(e) = fs::rename(&self.staging, &self.target) {
                 // The target is empty at this point, so putting the previous
@@ -413,17 +1010,27 @@ impl Staged for FsStaged {
                     restored,
                 });
             }
+            self.committed = true;
 
+            sync_directory(&folder).map_err(|error| Error::SaveMoveNotDurable {
+                target: self.target.clone(),
+                error: error.to_string(),
+                kept: Some(self.replaced.clone()),
+            })?;
             remove_tree(&self.replaced, "the index this save replaced").ok();
         } else {
             fs::rename(&self.staging, &self.target).map_err(|e| Error::MoveIntoPlaceFailed {
                 target: self.target.clone(),
                 error: e.to_string(),
             })?;
-        }
+            self.committed = true;
 
-        sync_directory(self.target.parent().unwrap_or_else(|| Path::new(".")));
-        self.committed = true;
+            sync_directory(&folder).map_err(|error| Error::SaveMoveNotDurable {
+                target: self.target.clone(),
+                error: error.to_string(),
+                kept: None,
+            })?;
+        }
         Ok(())
     }
 }
@@ -447,36 +1054,223 @@ fn remove_tree(path: &Path, what: &'static str) -> Result<(), Error> {
     })
 }
 
-/// Persist a directory's own entries, where the platform has a call for it
+/// Make a directory's own entries durable, and return the failure of the
+/// open or of the sync for the caller to hold.
 ///
 /// A file's bytes reaching the disk does not put its name in its directory.
-/// On POSIX that needs the directory's own descriptor fsynced, which is what
-/// this does, and without it a power loss can leave the renamed directory
-/// holding entries that were never recorded.
+/// The directory's own handle has to be synced as well, and without it a
+/// power loss can lose a name whose file was synced, with nothing for a load
+/// to find. A caller is told nothing is durable while a name it rests on may
+/// not be, so a failure here is never passed over.
 ///
-/// **Windows has no equivalent through the standard library.** `File::open`
-/// refuses a directory there, so this is a no-op, and the durability claim on
-/// Windows rests on NTFS journalling the rename rather than on anything this
-/// crate does. That difference is not observable from a gate that runs on
-/// Windows.
-///
-/// Best effort on both. A filesystem that refuses the fsync is not a reason
-/// to fail a save whose bytes are already written.
+/// On Linux and macOS the directory is opened to read, and `sync_all` is
+/// `fsync` on Linux and `fcntl(F_FULLFSYNC)` on macOS. On Windows the
+/// standard library's `File::open` refuses a directory, so it is opened with
+/// write access and `FILE_FLAG_BACKUP_SEMANTICS`, which a directory handle
+/// needs and which `FlushFileBuffers` needs to flush it. NTFS persists the
+/// directory's structure at that flush, and other filesystems there return
+/// success and persist nothing more.
+#[cfg(any(unix, windows))]
+fn sync_directory(path: &Path) -> io::Result<()> {
+    #[cfg(any(test, feature = "test-support"))]
+    directory_sync_faults::asked(path)?;
+    open_directory(path)?.sync_all()?;
+    #[cfg(any(test, feature = "test-support"))]
+    directory_sync_faults::completed(path);
+    Ok(())
+}
+
+/// A target with neither system has no wheel and no call that syncs a
+/// directory, so there is nothing to make durable and nothing to fail.
+#[cfg(not(any(unix, windows)))]
+fn sync_directory(path: &Path) -> io::Result<()> {
+    #[cfg(any(test, feature = "test-support"))]
+    directory_sync_faults::asked(path)?;
+    let _ = path;
+    Ok(())
+}
+
+/// A directory opened for its sync, to read as Linux and macOS take it.
 #[cfg(unix)]
-fn sync_directory(path: &Path) {
-    if let Ok(dir) = File::open(path) {
-        let _ = dir.sync_all();
+fn open_directory(path: &Path) -> io::Result<File> {
+    File::open(path)
+}
+
+/// A directory opened for its sync, with write access and
+/// `FILE_FLAG_BACKUP_SEMANTICS`, whose value is `0x0200_0000`.
+#[cfg(windows)]
+fn open_directory(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    OpenOptions::new()
+        .write(true)
+        .custom_flags(0x0200_0000)
+        .open(path)
+}
+
+/// The folder `path` sits in, being `.` where `path` is a bare name, whose
+/// parent is the empty path.
+fn folder_of(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
     }
 }
 
-#[cfg(not(unix))]
-fn sync_directory(_path: &Path) {}
+/// Sync every directory under `root`, deepest first, and then `root`, so
+/// every name written anywhere inside it is durable. A failure names the
+/// directory it was for.
+fn sync_tree(root: &Path) -> Result<(), (PathBuf, io::Error)> {
+    let listed = |error| (root.to_path_buf(), error);
+    for entry in fs::read_dir(root).map_err(listed)? {
+        let entry = entry.map_err(listed)?;
+        if entry.file_type().map_err(listed)?.is_dir() {
+            sync_tree(&entry.path())?;
+        }
+    }
+    sync_directory(root).map_err(listed)
+}
+
+/// Create the folder `path` and every folder above it that is missing, and
+/// sync each folder created in the folder above it, so the path to whatever
+/// goes in it survives a power loss. A folder that exists already is left
+/// as it is and costs no sync.
+///
+/// A sync that fails names the folder it was for, and the folders created
+/// are removed again, deepest first, so the next call creates them and
+/// syncs them once more rather than finding them and syncing nothing. The
+/// error says where one of them could not be removed.
+fn create_folders(path: &Path) -> io::Result<()> {
+    let mut missing = Vec::new();
+    let mut at = path;
+    while !at.as_os_str().is_empty() && !at.exists() {
+        missing.push(at.to_path_buf());
+        match at.parent() {
+            Some(parent) => at = parent,
+            None => break,
+        }
+    }
+    fs::create_dir_all(path)?;
+    for created in missing.iter().rev() {
+        if let Err(error) = sync_directory(folder_of(created)) {
+            let removed = missing.iter().all(|folder| fs::remove_dir(folder).is_ok());
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "the folder {} was created and the folder above it could not be synced \
+                     ({error}), {}",
+                    created.display(),
+                    if removed {
+                        "so the folders created were removed"
+                    } else {
+                        "and the folders created could not all be removed"
+                    }
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Directory syncs a test makes fail, each armed for one directory by its
+/// path, and the syncs of it the system's call completed. Present under the
+/// `test-support` feature and in this crate's own tests, and absent from
+/// every other build.
+#[cfg(any(test, feature = "test-support"))]
+pub mod directory_sync_faults {
+    use std::io;
+    use std::path::{Path, PathBuf};
+    use std::sync::PoisonError;
+
+    #[allow(clippy::disallowed_types)]
+    static ARMED: std::sync::Mutex<Vec<Armed>> = std::sync::Mutex::new(Vec::new());
+
+    struct Armed {
+        path: PathBuf,
+        pass: usize,
+        fail: usize,
+        asked: usize,
+        completed: usize,
+    }
+
+    #[allow(clippy::disallowed_types)]
+    fn armed() -> std::sync::MutexGuard<'static, Vec<Armed>> {
+        ARMED.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Let the next `pass` syncs of the directory `path` through and fail
+    /// the `fail` after them. Arming a path again replaces its arm.
+    pub fn arm(path: &Path, pass: usize, fail: usize) {
+        let mut armed = armed();
+        armed.retain(|a| a.path != path);
+        armed.push(Armed {
+            path: path.to_path_buf(),
+            pass,
+            fail,
+            asked: 0,
+            completed: 0,
+        });
+    }
+
+    /// The syncs of `path` asked since it was armed.
+    pub fn asked_of(path: &Path) -> usize {
+        armed()
+            .iter()
+            .find(|a| a.path == path)
+            .map_or(0, |a| a.asked)
+    }
+
+    /// The syncs of `path` the system's call completed since it was armed.
+    pub fn completed_of(path: &Path) -> usize {
+        armed()
+            .iter()
+            .find(|a| a.path == path)
+            .map_or(0, |a| a.completed)
+    }
+
+    /// Whether every failure armed for `path` has been spent.
+    pub fn spent(path: &Path) -> bool {
+        armed()
+            .iter()
+            .find(|a| a.path == path)
+            .is_none_or(|a| a.fail == 0)
+    }
+
+    /// Take the arm of `path` away.
+    pub fn disarm(path: &Path) {
+        armed().retain(|a| a.path != path);
+    }
+
+    /// Count a sync of `path` as asked, and fail it where it is armed to.
+    pub(super) fn asked(path: &Path) -> io::Result<()> {
+        let mut armed = armed();
+        let Some(a) = armed.iter_mut().find(|a| a.path == path) else {
+            return Ok(());
+        };
+        a.asked += 1;
+        if a.pass > 0 {
+            a.pass -= 1;
+            return Ok(());
+        }
+        if a.fail > 0 {
+            a.fail -= 1;
+            return Err(io::Error::other("injected: the device refused it"));
+        }
+        Ok(())
+    }
+
+    /// Count a sync of `path` the system's call completed.
+    pub(super) fn completed(path: &Path) {
+        if let Some(a) = armed().iter_mut().find(|a| a.path == path) {
+            a.completed += 1;
+        }
+    }
+}
 
 // ============================================================================
 // THE JOURNAL
 // ============================================================================
 
-/// The journal's file, shared by its writer and the thread that syncs it.
+/// One segment, shared by its writer and the thread that syncs it.
 #[derive(Debug)]
 struct FsJournalFile {
     file: File,
@@ -485,10 +1279,6 @@ struct FsJournalFile {
 impl JournalFile for FsJournalFile {
     fn write_all(&self, bytes: &[u8]) -> io::Result<()> {
         (&self.file).write_all(bytes)
-    }
-
-    fn seek_start(&self) -> io::Result<()> {
-        (&self.file).seek(SeekFrom::Start(0)).map(|_| ())
     }
 
     fn seek_end(&self) -> io::Result<()> {
@@ -527,8 +1317,8 @@ mod tests {
     }
 
     /// An artefact under a prefix lands in the directory the prefix names,
-    /// reads back whole, and is counted, measured, located and removed by
-    /// the name it was written under.
+    /// reads back whole, and is measured, located and removed by the name it
+    /// was written under.
     #[test]
     fn an_artefact_lands_under_its_prefix_and_reads_back() {
         let tmp = tempfile::tempdir().unwrap();
@@ -544,7 +1334,6 @@ mod tests {
         assert!(dir.exists("config.json"));
         assert!(!dir.exists("absent.bin"));
         assert_eq!(dir.length("spaces/s/postings.zdbsparse").unwrap(), 300);
-        assert_eq!(dir.total_bytes().unwrap(), 302);
         assert_eq!(dir.locate(""), tmp.path().display().to_string());
         assert_eq!(
             dir.locate("config.json"),
@@ -556,13 +1345,6 @@ mod tests {
         ));
         dir.remove("config.json").unwrap();
         assert!(!dir.exists("config.json"));
-        assert_eq!(dir.total_bytes().unwrap(), 300);
-        assert_eq!(
-            FsDir::new(tmp.path().join("nowhere"))
-                .total_bytes()
-                .unwrap(),
-            0
-        );
     }
 
     /// A streamed artefact has its head written over the bytes it reserved,
@@ -599,13 +1381,13 @@ mod tests {
 
         let staged = storage.stage().unwrap();
         staged.dir().write("a.bin", b"first").unwrap();
-        staged.commit().unwrap();
+        staged.commit(crate::KillPoint::SaveBetweenRenames).unwrap();
         assert!(storage.exists());
         assert_eq!(storage.dir().read("a.bin").unwrap(), b"first");
 
         let staged = storage.stage().unwrap();
         staged.dir().write("b.bin", b"second").unwrap();
-        staged.commit().unwrap();
+        staged.commit(crate::KillPoint::SaveBetweenRenames).unwrap();
         assert_eq!(entries(&tmp.path().join("index.zdb")), vec!["b.bin"]);
         assert_eq!(entries(tmp.path()), vec!["index.zdb"]);
 
@@ -640,17 +1422,637 @@ mod tests {
         assert_eq!(entries(tmp.path()), vec!["index.zdb"]);
     }
 
-    /// The journal is the target's sibling, a path naming it another way
-    /// names the same journal, and a target with no name has no siblings.
+    /// The journal, the version 1 journal and the lock file are the target's
+    /// siblings, a path naming the journal another way names the same one,
+    /// and a target with no name has no siblings.
     #[test]
-    fn the_journal_is_the_targets_sibling() {
+    fn the_journal_and_the_lock_are_the_targets_siblings() {
         let storage = FsStorage::at(Path::new("a/b/index.zdb")).unwrap();
-        assert_eq!(storage.journal_path(), Path::new("a/b/index.zdb.zdbwal"));
-        assert!(storage.names_journal(Path::new("a/./b/index.zdb.zdbwal")));
-        assert!(!storage.names_journal(Path::new("a/b/other.zdb.zdbwal")));
+        assert_eq!(
+            storage.journal_path(),
+            Path::new("a/b/index.zdb.zdbjournal")
+        );
+        assert_eq!(
+            storage.legacy_journal_path(),
+            Path::new("a/b/index.zdb.zdbwal")
+        );
+        assert_eq!(storage.lock_path(), Path::new("a/b/index.zdb.zdblock"));
+        assert!(storage.names_journal(Path::new("a/./b/index.zdb.zdbjournal")));
+        assert!(!storage.names_journal(Path::new("a/b/other.zdb.zdbjournal")));
+        assert!(!storage.names_journal(Path::new("a/b/index.zdb.zdbwal")));
         assert!(matches!(
             FsStorage::at(Path::new("")),
             Err(Error::TargetHasNoName { .. })
         ));
+    }
+
+    /// A segment is named by its first sequence in twenty digits, so the
+    /// names sort in sequence order, and nothing else reads as a segment.
+    #[test]
+    fn a_segment_is_named_by_its_first_sequence_in_twenty_digits() {
+        assert_eq!(segment_file_name(1), "00000000000000000001.zdbseg");
+        assert_eq!(segment_file_name(u64::MAX), "18446744073709551615.zdbseg");
+        for number in [0u64, 1, 9, 10, 4_294_967_296, u64::MAX] {
+            assert_eq!(segment_number(&segment_file_name(number)), Some(number));
+        }
+        let mut names: Vec<String> = [100u64, 9, 1_000_000, 10]
+            .iter()
+            .map(|n| segment_file_name(*n))
+            .collect();
+        names.sort();
+        let sorted: Vec<u64> = names.iter().map(|n| segment_number(n).unwrap()).collect();
+        assert_eq!(sorted, vec![9, 10, 100, 1_000_000]);
+        for name in [
+            "1.zdbseg",
+            "0000000000000000001.zdbseg",
+            "000000000000000000001.zdbseg",
+            "0000000000000000000a.zdbseg",
+            "99999999999999999999.zdbseg",
+            "00000000000000000001.zdbseg.tmp",
+            "00000000000000000001",
+            "quarantine",
+        ] {
+            assert_eq!(segment_number(name), None, "{name}");
+        }
+    }
+
+    /// The journal's directory lists its segments in order and leaves every
+    /// other entry where it is, a segment is created once, opened, read and
+    /// removed by its number, and creating the journal again empties it of
+    /// segments alone.
+    #[test]
+    fn the_journal_directory_holds_segments_by_number() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = FsStorage::at(&tmp.path().join("index.zdb")).unwrap();
+        assert!(!storage.journal_exists());
+        storage.create_journal().unwrap();
+        assert!(storage.journal_exists());
+        let dir = storage.journal_dir();
+        assert_eq!(dir.path(), storage.journal_path());
+        assert!(dir.segments().unwrap().is_empty());
+        for number in [12u64, 1, 7] {
+            let file = dir.create_segment(number).unwrap();
+            file.write_all(&number.to_le_bytes()).unwrap();
+            file.sync_all().unwrap();
+        }
+        assert!(dir.create_segment(7).is_err(), "a segment is created once");
+        fs::create_dir(storage.journal_path().join("quarantine")).unwrap();
+        fs::write(storage.journal_path().join("notes.txt"), b"left").unwrap();
+        assert_eq!(dir.segments().unwrap(), vec![1, 7, 12]);
+        assert_eq!(dir.read_segment(7).unwrap(), 7u64.to_le_bytes());
+        let open = dir.open_segment(7).unwrap();
+        open.seek_end().unwrap();
+        open.write_all(b"more").unwrap();
+        assert_eq!(open.length().unwrap(), 12);
+        open.set_len(8).unwrap();
+        assert_eq!(dir.read_segment(7).unwrap(), 7u64.to_le_bytes());
+        drop(open);
+        dir.remove_segment(1).unwrap();
+        assert_eq!(dir.segments().unwrap(), vec![7, 12]);
+        assert_eq!(
+            dir.segment_path(7),
+            storage.journal_path().join("00000000000000000007.zdbseg")
+        );
+        storage.create_journal().unwrap();
+        assert!(dir.segments().unwrap().is_empty());
+        assert_eq!(
+            entries(storage.journal_path()),
+            vec!["notes.txt", "quarantine"]
+        );
+    }
+
+    /// The version 1 journal is one file beside the directory, read whole
+    /// and removed.
+    #[test]
+    fn the_version_1_journal_is_read_and_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = FsStorage::at(&tmp.path().join("index.zdb")).unwrap();
+        assert!(!storage.legacy_journal_exists());
+        fs::write(storage.legacy_journal_path(), b"ZDBJOURN").unwrap();
+        assert!(storage.legacy_journal_exists());
+        assert_eq!(storage.read_legacy_journal().unwrap(), b"ZDBJOURN");
+        storage.remove_legacy_journal().unwrap();
+        assert!(!storage.legacy_journal_exists());
+    }
+
+    /// A cut keeps the first bytes of the journal of format version 1 and
+    /// drops the rest.
+    #[test]
+    fn the_version_1_journal_is_cut_to_a_length() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = FsStorage::at(&tmp.path().join("index.zdb")).unwrap();
+        fs::write(storage.legacy_journal_path(), b"ZDBJOURN-and-a-tail").unwrap();
+        storage.cut_legacy_journal(8).unwrap();
+        assert_eq!(storage.read_legacy_journal().unwrap(), b"ZDBJOURN");
+    }
+
+    /// Nothing at the target, an empty folder and a folder holding a manifest
+    /// a save writes are each a target a save may replace. A file, a folder
+    /// of other entries and a folder whose manifest.json no save wrote are
+    /// not, and each is named as what it is.
+    #[test]
+    fn a_target_that_is_not_an_index_directory_is_named() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("index.zdb");
+        let storage = FsStorage::at(&target).unwrap();
+        assert_eq!(storage.foreign_target(), None);
+        fs::create_dir(&target).unwrap();
+        assert_eq!(storage.foreign_target(), None);
+        fs::write(target.join("notes.txt"), b"mine").unwrap();
+        assert_eq!(
+            storage.foreign_target().as_deref(),
+            Some("a folder holding 1 entry and no manifest.json")
+        );
+        fs::create_dir(target.join("more")).unwrap();
+        assert_eq!(
+            storage.foreign_target().as_deref(),
+            Some("a folder holding 2 entries and no manifest.json")
+        );
+        fs::write(target.join("manifest.json"), b"{}").unwrap();
+        assert_eq!(
+            storage.foreign_target().as_deref(),
+            Some("a folder holding 3 entries and a manifest.json that no save wrote")
+        );
+        fs::write(
+            target.join("manifest.json"),
+            br#"{"index_type": "HNSW", "format_version": "5.0.0"}"#,
+        )
+        .unwrap();
+        assert_eq!(storage.foreign_target(), None);
+        let file = tmp.path().join("file.zdb");
+        fs::write(&file, b"a file").unwrap();
+        assert_eq!(
+            FsStorage::at(&file).unwrap().foreign_target().as_deref(),
+            Some("a file")
+        );
+    }
+
+    /// The quarantine is folders under the journal's directory, each holding
+    /// files written durably, and the listing of segments passes over it.
+    #[test]
+    fn the_quarantine_sits_beside_the_segments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = FsStorage::at(&tmp.path().join("index.zdb")).unwrap();
+        storage.create_journal().unwrap();
+        let journal = storage.journal_dir();
+        assert!(journal.quarantine_folders().unwrap().is_empty());
+        journal.create_segment(5).unwrap();
+        journal.create_quarantine("b-9").unwrap();
+        journal.create_quarantine("a-3").unwrap();
+        journal
+            .quarantine()
+            .write("a-3/00000000000000000003.zdbseg", b"bytes")
+            .unwrap();
+        journal.sync_quarantine("a-3").unwrap();
+        assert_eq!(journal.quarantine_folders().unwrap(), ["a-3", "b-9"]);
+        assert_eq!(
+            journal
+                .quarantine()
+                .read("a-3/00000000000000000003.zdbseg")
+                .unwrap(),
+            b"bytes"
+        );
+        assert_eq!(journal.segments().unwrap(), [5]);
+        storage.create_journal().unwrap();
+        assert!(journal.segments().unwrap().is_empty());
+        assert_eq!(
+            journal.quarantine_folders().unwrap(),
+            ["a-3", "b-9"],
+            "emptying the journal of segments leaves the quarantine"
+        );
+    }
+
+    /// A sync of the journal's directory that fails after it is created or
+    /// emptied fails the creation, and so does a sync of the folder it sits
+    /// in, since a segment written there may lose its name on a power loss.
+    #[test]
+    fn a_failed_directory_sync_fails_the_journals_creation() {
+        for which in ["the journal's directory", "the folder it sits in"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let storage = FsStorage::at(&tmp.path().join("index.zdb")).unwrap();
+            let synced = if which == "the folder it sits in" {
+                tmp.path().to_path_buf()
+            } else {
+                storage.journal_path().to_path_buf()
+            };
+            directory_sync_faults::arm(&synced, 0, 1);
+            let created = storage.create_journal();
+            let spent = directory_sync_faults::spent(&synced);
+            directory_sync_faults::disarm(&synced);
+            assert!(spent, "{which}: the sync was asked");
+            assert_eq!(
+                created.map_err(|error| error.to_string()),
+                Err("injected: the device refused it".to_string()),
+                "{which}"
+            );
+        }
+    }
+
+    /// The directory in place is synced with every directory under it and
+    /// the folder it sits in, and a sync of any of them that fails is
+    /// returned naming the directory.
+    #[test]
+    fn a_failed_sync_of_the_directory_in_place_is_returned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("index.zdb");
+        let storage = FsStorage::at(&target).unwrap();
+        let staged = storage.stage().unwrap();
+        staged
+            .dir()
+            .write("spaces/s/postings.zdbsparse", b"p")
+            .unwrap();
+        staged.commit(crate::KillPoint::SaveBetweenRenames).unwrap();
+        let space = target.join("spaces").join("s");
+        for synced in [space.clone(), target.clone(), tmp.path().to_path_buf()] {
+            directory_sync_faults::arm(&synced, 0, 1);
+            let result = storage.sync_in_place();
+            let spent = directory_sync_faults::spent(&synced);
+            directory_sync_faults::disarm(&synced);
+            assert!(spent, "{}: the sync was asked", synced.display());
+            assert_eq!(
+                result.map_err(|error| error.to_string()),
+                Err(format!(
+                    "{}: injected: the device refused it",
+                    synced.display()
+                ))
+            );
+        }
+        storage.sync_in_place().unwrap();
+    }
+
+    /// A sync of the staging directory that fails fails the commit before
+    /// anything moves, so the directory in place is the one that was there,
+    /// and the staging directory is removed.
+    #[test]
+    fn a_failed_sync_of_the_staging_directory_fails_the_commit_before_anything_moves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("index.zdb");
+        let storage = FsStorage::at(&target).unwrap();
+        let staged = storage.stage().unwrap();
+        staged.dir().write("a.bin", b"first").unwrap();
+        staged.commit(crate::KillPoint::SaveBetweenRenames).unwrap();
+        let staging = tmp.path().join("index.zdb.zdbtmp");
+        let staged = storage.stage().unwrap();
+        staged.dir().write("b.bin", b"second").unwrap();
+        directory_sync_faults::arm(&staging, 0, 1);
+        let committed = staged.commit(crate::KillPoint::SaveBetweenRenames);
+        let spent = directory_sync_faults::spent(&staging);
+        directory_sync_faults::disarm(&staging);
+        assert!(spent, "the sync was asked");
+        assert_eq!(
+            committed.map_err(|error| error.to_string()),
+            Err(format!(
+                "Failed to sync {} before the saved index moved into place: injected: the \
+                 device refused it. Nothing was moved, and the directory at {} is as it was.",
+                staging.display(),
+                target.display()
+            ))
+        );
+        assert_eq!(entries(&target), vec!["a.bin"]);
+        assert_eq!(entries(tmp.path()), vec!["index.zdb"]);
+    }
+
+    /// A sync of the folder the directory sits in that fails once the
+    /// directory has moved into place fails the commit, and the directory it
+    /// replaced is kept beside it, since the move may not survive a power
+    /// loss. The next save removes it. A first save meets the same failure
+    /// with nothing to keep.
+    #[test]
+    fn a_failed_sync_of_the_folder_fails_the_commit_and_keeps_the_directory_it_replaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("index.zdb");
+        let storage = FsStorage::at(&target).unwrap();
+        let staged = storage.stage().unwrap();
+        staged.dir().write("a.bin", b"first").unwrap();
+        directory_sync_faults::arm(tmp.path(), 0, 1);
+        let first = staged.commit(crate::KillPoint::SaveBetweenRenames);
+        directory_sync_faults::disarm(tmp.path());
+        assert_eq!(
+            first.map_err(|error| error.to_string()),
+            Err(format!(
+                "The saved index is in place at {}, and the folder it sits in could not be \
+                 synced: injected: the device refused it. The move may not survive a power loss.",
+                target.display()
+            ))
+        );
+        let staged = storage.stage().unwrap();
+        staged.dir().write("b.bin", b"second").unwrap();
+        directory_sync_faults::arm(tmp.path(), 0, 1);
+        let second = staged.commit(crate::KillPoint::SaveBetweenRenames);
+        let spent = directory_sync_faults::spent(tmp.path());
+        directory_sync_faults::disarm(tmp.path());
+        assert!(spent, "the sync was asked");
+        assert_eq!(
+            second.map_err(|error| error.to_string()),
+            Err(format!(
+                "The saved index is in place at {}, and the folder it sits in could not be \
+                 synced: injected: the device refused it. The move may not survive a power \
+                 loss, so the index it replaced is kept at {} until the next save.",
+                target.display(),
+                tmp.path().join("index.zdb.zdbold").display()
+            ))
+        );
+        assert_eq!(
+            entries(tmp.path()),
+            vec!["index.zdb", "index.zdb.zdbold"],
+            "the directory replaced is kept"
+        );
+        assert_eq!(entries(&target), vec!["b.bin"]);
+        directory_sync_faults::arm(tmp.path(), 0, 1);
+        let staged = storage.stage().map(|_| ());
+        directory_sync_faults::disarm(tmp.path());
+        assert_eq!(
+            staged.map_err(|error| error.to_string()),
+            Err(format!(
+                "Failed to sync {} before the saved index moved into place: injected: the \
+                 device refused it. Nothing was moved, and the directory at {} is as it was.",
+                tmp.path().display(),
+                target.display()
+            )),
+            "the next save syncs the folder before it removes the directory kept"
+        );
+        assert_eq!(entries(tmp.path()), vec!["index.zdb", "index.zdb.zdbold"]);
+        drop(storage.stage().unwrap());
+        assert_eq!(entries(tmp.path()), vec!["index.zdb"]);
+    }
+
+    /// A commit syncs every directory the save wrote inside the staging
+    /// directory, deepest first, and a sync of one of them that fails fails
+    /// the commit before anything moves.
+    #[test]
+    fn a_commit_syncs_every_directory_the_save_wrote() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = FsStorage::at(&tmp.path().join("index.zdb")).unwrap();
+        let staging = tmp.path().join("index.zdb.zdbtmp");
+        let space = staging.join("spaces").join("s");
+        for synced in [space.clone(), staging.join("spaces")] {
+            let staged = storage.stage().unwrap();
+            staged.dir().write("config.json", b"{}").unwrap();
+            staged
+                .dir()
+                .write("spaces/s/postings.zdbsparse", &[7u8; 30])
+                .unwrap();
+            directory_sync_faults::arm(&synced, 0, 1);
+            let committed = staged.commit(crate::KillPoint::SaveBetweenRenames);
+            let asked = directory_sync_faults::asked_of(&synced);
+            directory_sync_faults::disarm(&synced);
+            assert!(
+                matches!(committed, Err(Error::SaveSyncFailed { .. })),
+                "{}: a commit whose directory does not sync is refused, and it asked {asked} \
+                 syncs of it",
+                synced.display()
+            );
+            assert!(!storage.exists(), "nothing moved");
+        }
+    }
+
+    /// A staging directory under folders the save created syncs each folder
+    /// it created in the folder above it, so the directory's path survives a
+    /// power loss. A sync that fails refuses the staging and removes the
+    /// folders created, so the next save creates and syncs them again.
+    #[test]
+    fn a_save_syncs_the_folders_it_created() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = FsStorage::at(&tmp.path().join("new").join("index.zdb")).unwrap();
+        directory_sync_faults::arm(tmp.path(), 0, 1);
+        let staged = storage.stage();
+        let asked = directory_sync_faults::asked_of(tmp.path());
+        match staged {
+            Err(error) => assert_eq!(
+                error.to_string(),
+                format!(
+                    "Failed to create the staging directory {}: the folder {} was created and \
+                     the folder above it could not be synced (injected: the device refused it), \
+                     so the folders created were removed",
+                    tmp.path().join("new").join("index.zdb.zdbtmp").display(),
+                    tmp.path().join("new").display()
+                )
+            ),
+            Ok(_) => panic!(
+                "a staging whose new folder's entry does not sync is refused, and it asked \
+                 {asked} syncs of the folder above it"
+            ),
+        }
+        assert!(
+            entries(tmp.path()).is_empty(),
+            "the folder created is removed"
+        );
+        let staged = storage.stage().unwrap();
+        let asked = directory_sync_faults::asked_of(tmp.path());
+        directory_sync_faults::disarm(tmp.path());
+        assert_eq!(asked, 2, "the next save syncs the folder above it again");
+        staged.dir().write("a.bin", b"first").unwrap();
+        staged.commit(crate::KillPoint::SaveBetweenRenames).unwrap();
+    }
+
+    /// A bare name sits in the current folder, which is the folder synced
+    /// for it.
+    #[test]
+    fn a_bare_name_sits_in_the_current_folder() {
+        assert_eq!(folder_of(Path::new("index.zdb")), Path::new("."));
+        assert_eq!(folder_of(Path::new("a/index.zdb")), Path::new("a"));
+    }
+
+    /// On a system that opens a directory to read, a directory this process
+    /// may write and may not read refuses the open its sync makes, which is
+    /// a refusal the filesystem itself gives, so the creation of a journal
+    /// beside it and a save into it each fail. Root reads every directory,
+    /// so the test runs as any other user.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_this_process_cannot_read_fails_its_directory_sync() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("write-only");
+        fs::create_dir(&folder).unwrap();
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o300)).unwrap();
+        if File::open(&folder).is_ok() {
+            fs::set_permissions(&folder, fs::Permissions::from_mode(0o700)).unwrap();
+            eprintln!("skipped: this user reads a folder whose mode refuses reads");
+            return;
+        }
+        let storage = FsStorage::at(&folder.join("index.zdb")).unwrap();
+        let created = storage.create_journal();
+        let saved = storage.stage().and_then(|staged| {
+            staged.dir().write("a.bin", b"first")?;
+            staged.commit(crate::KillPoint::SaveBetweenRenames)
+        });
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            created.map_err(|error| error.kind()),
+            Err(io::ErrorKind::PermissionDenied),
+            "the journal beside a folder its sync cannot open is not created"
+        );
+        assert!(
+            matches!(saved, Err(Error::SaveMoveNotDurable { .. })),
+            "a save into a folder its sync cannot open is refused: {saved:?}"
+        );
+    }
+
+    /// The probe makes and removes the staging directory, and removes one an
+    /// interrupted save left, so it leaves the folder as it found it.
+    #[test]
+    fn the_write_probe_leaves_the_folder_as_it_found_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = FsStorage::at(&tmp.path().join("index.zdb")).unwrap();
+        storage.probe_writable().unwrap();
+        assert!(entries(tmp.path()).is_empty());
+        fs::create_dir(tmp.path().join("index.zdb.zdbtmp")).unwrap();
+        fs::write(tmp.path().join("index.zdb.zdbtmp").join("a.bin"), b"left").unwrap();
+        storage.probe_writable().unwrap();
+        assert!(entries(tmp.path()).is_empty());
+    }
+
+    /// The lock tests run one at a time, since a child's close takes every
+    /// lock file of the process and a hold for a fork stops every other lock.
+    #[allow(clippy::disallowed_types)]
+    static ONE_LOCK_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn alone() -> MutexGuard<'static, ()> {
+        ONE_LOCK_TEST.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn holder(storage: &FsStorage, mode: LockMode) -> Result<Box<dyn LockGuard>, LockFailure> {
+        match storage.lock(mode, "pid 1, host test, exclusive, since now\n")? {
+            Locked::Writable(guard) => Ok(guard),
+            Locked::ReadOnly { .. } => panic!("the lock file is writable here"),
+        }
+    }
+
+    /// What a refusal says where the system lets a second handle read the
+    /// lock file, being the record [`holder`] writes, quoted as the last
+    /// record an exclusive holder wrote.
+    const RECORDED: &str = "another holder, and its lock file holds the last record an exclusive \
+                            holder wrote, pid 1, host test, exclusive, since now";
+
+    /// The lock in one process, as the standard library gives it on this
+    /// system. An exclusive holder refuses a second handle in either mode,
+    /// shared holders sit together and refuse an exclusive one, a dropped
+    /// guard releases, and the lock file is kept. A refusal quotes the
+    /// record wherever the system lets the second handle read the lock file,
+    /// which Windows does beside shared holders alone and Linux and macOS do
+    /// beside any holder.
+    #[test]
+    fn the_lock_refuses_a_second_handle_and_releases_on_drop() {
+        let _alone = alone();
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = FsStorage::at(&tmp.path().join("index.zdb")).unwrap();
+        let first = holder(&storage, LockMode::Exclusive).unwrap();
+        assert_eq!(first.mode(), LockMode::Exclusive);
+        let beside_exclusive = if cfg!(windows) {
+            "another holder, whose record this system does not let a second handle read while \
+             the lock is held"
+        } else {
+            RECORDED
+        };
+        for mode in [LockMode::Exclusive, LockMode::Shared] {
+            match holder(&storage, mode) {
+                Err(LockFailure::Held { holder }) => {
+                    assert_eq!(holder, beside_exclusive, "{mode:?}")
+                }
+                other => panic!("{mode:?}: expected the lock to be held, got {other:?}"),
+            }
+        }
+        drop(first);
+        let shared = holder(&storage, LockMode::Shared).unwrap();
+        let beside = holder(&storage, LockMode::Shared).unwrap();
+        assert_eq!(beside.mode(), LockMode::Shared);
+        match holder(&storage, LockMode::Exclusive) {
+            Err(LockFailure::Held { holder }) => assert_eq!(holder, RECORDED),
+            other => panic!("expected the shared holders to refuse, got {other:?}"),
+        }
+        drop(shared);
+        drop(beside);
+        let again = holder(&storage, LockMode::Exclusive).unwrap();
+        drop(again);
+        assert!(storage.lock_path().is_file(), "the lock file is kept");
+    }
+
+    /// A read of the lock file that fails for a reason other than the
+    /// Windows lock gives a refusal that says the lock file cannot be read
+    /// and gives the system's error, and never that the system does not let
+    /// a second handle read it. Here the lock file's mode refuses this
+    /// process every read. A lock call opens the lock file to read before
+    /// any refusal, so such a file stops the lock call at its open, and the
+    /// test makes the refusal's own read directly. Root reads every file, so
+    /// the test runs as any other user.
+    #[cfg(unix)]
+    #[test]
+    fn a_refusal_beside_a_lock_file_this_process_cannot_read_gives_the_systems_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = FsStorage::at(&tmp.path().join("index.zdb")).unwrap();
+        fs::write(
+            storage.lock_path(),
+            "pid 1, host test, exclusive, since now\n",
+        )
+        .unwrap();
+        fs::set_permissions(storage.lock_path(), fs::Permissions::from_mode(0o000)).unwrap();
+        let read = fs::read_to_string(storage.lock_path());
+        let refusal = storage.lock_failure(std::fs::TryLockError::WouldBlock);
+        fs::set_permissions(storage.lock_path(), fs::Permissions::from_mode(0o600)).unwrap();
+        let Err(error) = read else {
+            eprintln!("skipped: this user reads a lock file whose mode refuses reads");
+            return;
+        };
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        match refusal {
+            LockFailure::Held { holder } => assert_eq!(
+                holder,
+                format!(
+                    "another holder, and its lock file cannot be read, with the system's error \
+                     {error}"
+                )
+            ),
+            other => panic!("expected the refusal of a held lock, got {other:?}"),
+        }
+    }
+
+    /// A child forked from a holder closes its copy of every lock file, and a
+    /// guard it drops afterwards closes nothing. Run in one process, the copy
+    /// closed is the holder's own, so the lock is free once it is closed, and
+    /// a holder that takes it then keeps it through the first guard's drop.
+    #[test]
+    fn a_forked_childs_close_leaves_its_guards_nothing_to_close() {
+        let _alone = alone();
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = FsStorage::at(&tmp.path().join("index.zdb")).unwrap();
+        let first = holder(&storage, LockMode::Exclusive).unwrap();
+        hold_lock_files_for_fork();
+        close_lock_files_in_forked_child();
+        let second = holder(&storage, LockMode::Exclusive).unwrap();
+        drop(first);
+        assert!(
+            matches!(
+                holder(&storage, LockMode::Shared),
+                Err(LockFailure::Held { .. })
+            ),
+            "the first guard's drop closed the second holder's file"
+        );
+        drop(second);
+        holder(&storage, LockMode::Shared).unwrap();
+    }
+
+    /// Held for a fork and let go in the parent, the lock files are as they
+    /// were, and a lock taken and dropped on the thread that holds them goes
+    /// through that hold rather than waiting on it.
+    #[test]
+    fn a_hold_for_a_fork_leaves_every_lock_as_it_was() {
+        let _alone = alone();
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = FsStorage::at(&tmp.path().join("index.zdb")).unwrap();
+        let other = FsStorage::at(&tmp.path().join("other.zdb")).unwrap();
+        let first = holder(&storage, LockMode::Exclusive).unwrap();
+        hold_lock_files_for_fork();
+        let during = holder(&other, LockMode::Exclusive).unwrap();
+        drop(during);
+        release_lock_files_after_fork();
+        assert!(matches!(
+            holder(&storage, LockMode::Exclusive),
+            Err(LockFailure::Held { .. })
+        ));
+        drop(first);
+        holder(&storage, LockMode::Exclusive).unwrap();
+        holder(&other, LockMode::Exclusive).unwrap();
     }
 }

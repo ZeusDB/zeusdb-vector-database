@@ -14,6 +14,7 @@ Cargo.lock      text eol=lf
 # GitHub Actions workflows
 *.yml           text eol=lf
 *.yaml          text eol=lf
+*.sh            text eol=lf
 
 # Python
 *.py            text eol=lf
@@ -35,3 +36,8 @@ clippy.toml         text eol=lf
 deny.toml           text eol=lf
 rust-toolchain.toml text eol=lf
 py.typed            text eol=lf
+
+# Saved directories an older release wrote, kept byte for byte. Their JSON
+# artefacts carry digests in manifest.json, so a line ending converted on
+# checkout makes a fixture one no release wrote.
+tests/fixtures/**   -text

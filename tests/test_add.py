@@ -1,9 +1,16 @@
 """Vector insertion across the five input formats, overwrite, and add error handling."""
 
+import datetime
+import decimal
+import fractions
+import gc
+import math
+import numbers
+
 import numpy as np
 import pytest
 from zeusdb_vector_database import VectorDatabase
-from helpers import assert_vectors_close
+from helpers import assert_vectors_close, layouts, vector_layouts
 
 # ------------------------------------------------------------
 # Test 3: Format 1 - Single Object
@@ -96,12 +103,8 @@ def test_add_format_3_separate_arrays_lists():
     assert add_result.vector_shape == (2, 2)
     assert len(add_result.errors) == 0
     
-    # Verify repr format matches expected (adjust for actual format)
-    repr_str = repr(add_result)
-    # The actual format might be "Some((2, 2))" instead of "(2, 2)"
-    assert "inserted=2" in repr_str
-    assert "errors=0" in repr_str
-    assert "(2, 2)" in repr_str
+    # The repr writes the shape as Python writes the tuple it is.
+    assert repr(add_result) == "AddResult(inserted=2, errors=0, shape=(2, 2))"
     
     # Verify records were added correctly
     records = index.get_records(["doc1", "doc2"])
@@ -727,13 +730,12 @@ def test_add_batch_length_rule_leaves_valid_input_alone():
     assert empty.total_inserted == 0
     assert empty.total_errors == 0
 
-    # A batch carrying no recognised vector field is still reported through
-    # AddResult rather than raised, because it names no records to lose.
+    # A batch carrying no recognised vector field is a malformed call, and
+    # raises before anything is inserted.
     index = vdb.create("hnsw", dim=4, expected_size=10)
-    missing = index.add({"ids": ["a"], "junk": 1})
-    assert missing.total_inserted == 0
-    assert missing.total_errors == 1
-    assert "Missing vector data" in missing.errors[0]
+    with pytest.raises(ValueError, match="Missing vector data"):
+        index.add({"ids": ["a"], "junk": 1})
+    assert len(index) == 0
 
     # The four shapes with no parallel arrays are untouched, including the
     # per-record rejection a bad vector still gets inside a list batch.
@@ -750,3 +752,822 @@ def test_add_batch_length_rule_leaves_valid_input_alone():
     mixed = index.add([{"id": "ok", "values": rows3[0]}, {"id": "bad", "values": [1.0, 2.0]}])
     assert mixed.total_inserted == 1
     assert mixed.total_errors == 1
+
+
+# ------------------------------------------------------------
+# An input of no format, a batch with no vectors and a batch of the wrong
+# width raise before anything is inserted
+# ------------------------------------------------------------
+@pytest.mark.parametrize("data,type_name", [
+    (123, "int"),
+    ("not a vector", "str"),
+    (b"bytes", "bytes"),
+    (object(), "object"),
+    ({1, 2, 3}, "set"),
+])
+def test_an_input_of_no_format_raises_type_error(data, type_name):
+    """Every input `add` cannot read as one of its formats is refused whole,
+    before anything is inserted, rather than reported as a record error."""
+    index = VectorDatabase().create("hnsw", dim=4)
+    with pytest.raises(TypeError) as raised:
+        index.add(data)
+    assert str(raised.value) == (
+        "add() takes a record dict, a list of records, a dict of parallel arrays, a "
+        f"two dimensional array or one vector, and got {type_name}"
+    )
+    assert len(index) == 0
+
+
+def test_a_list_holding_an_item_that_is_no_record_raises_type_error():
+    """A list of numbers is not a list of records or of vectors, and nothing in
+    it is parsed, so no record takes a generated id."""
+    index = VectorDatabase().create("hnsw", dim=4)
+    for data, position, type_name in (
+        ([0.1, 0.2, 0.3, 0.4], 0, "float"),
+        ([[0.1, 0.2, 0.3, 0.4], None], 1, "NoneType"),
+        ([{"id": "a", "values": [0.1, 0.2, 0.3, 0.4]}, "text"], 1, "str"),
+    ):
+        with pytest.raises(TypeError) as raised:
+            index.add(data)
+        assert str(raised.value) == (
+            "add() takes a list whose items are record dicts or vectors, and item "
+            f"{position} is {type_name}"
+        )
+    assert len(index) == 0
+    assert index.add([[0.1, 0.2, 0.3, 0.4]]).ids == ["vec_1"]
+
+
+def test_a_batch_dict_with_no_vectors_raises_value_error():
+    index = VectorDatabase().create("hnsw", dim=4)
+    with pytest.raises(ValueError) as raised:
+        index.add({"ids": ["a", "b"], "metadatas": [{}, {}]})
+    assert str(raised.value) == (
+        "Missing vector data. Expected one of: 'vectors', 'embeddings', or 'values' key"
+    )
+    assert len(index) == 0
+
+
+def test_a_two_dimensional_array_of_the_wrong_width_raises_value_error():
+    """A whole array of the wrong width is a malformed batch, bare and under a
+    batch key alike, of either float type."""
+    index = VectorDatabase().create("hnsw", dim=2)
+    for dtype in (np.float32, np.float64):
+        with pytest.raises(ValueError) as raised:
+            index.add(np.zeros((5, 3), dtype=dtype))
+        assert str(raised.value) == "NumPy array must have shape (N, 2), got [5, 3]"
+        with pytest.raises(ValueError) as raised:
+            index.add({"ids": ["a", "b"], "embeddings": np.zeros((2, 4), dtype=dtype)})
+        assert str(raised.value) == "NumPy array must have shape (N, 2), got [2, 4]"
+    assert len(index) == 0
+
+
+def test_a_batch_vector_field_of_the_wrong_type_raises():
+    index = VectorDatabase().create("hnsw", dim=2)
+    with pytest.raises(TypeError) as raised:
+        index.add({"ids": ["a"], "vectors": ([0.1, 0.2],)})
+    assert str(raised.value) == (
+        "add expected 'vectors' to be a list of vectors or a two dimensional array of "
+        "float32 or float64, got tuple"
+    )
+    with pytest.raises(ValueError, match="^values field must be a list in batch format$"):
+        index.add({"ids": ["a"], "values": ([0.1, 0.2],)})
+    assert len(index) == 0
+
+
+# ------------------------------------------------------------
+# A parallel array that is not a list raises under every key
+# ------------------------------------------------------------
+def test_a_tuple_of_metadata_raises_rather_than_dropping_it():
+    """A tuple of metadata mappings raises under either spelling of the key,
+    before any record goes in, and a list of the same mappings goes in."""
+    index = VectorDatabase().create("hnsw", dim=2)
+    for key in ("metadatas", "metadata"):
+        with pytest.raises(TypeError) as raised:
+            index.add({"ids": ["a", "b"], "vectors": [[0.1, 0.2], [0.3, 0.4]],
+                       key: ({"k": 1}, {"k": 2})})
+        assert str(raised.value) == (
+            f"add expected '{key}' to be a list, got tuple. A batch pairs '{key}' with "
+            "'vectors' by position and reads only a list that way, with None for a "
+            "record that carries no metadata."
+        )
+    assert len(index) == 0
+    added = index.add({"ids": ["a", "b"], "vectors": [[0.1, 0.2], [0.3, 0.4]],
+                       "metadatas": [{"k": 1}, {"k": 2}]})
+    assert added.is_success()
+    assert [r["metadata"] for r in index.get_records(["a", "b"], return_vector=False)] == [
+        {"k": 1}, {"k": 2}]
+
+
+# ------------------------------------------------------------
+# Every record of a batch is parsed on its own
+# ------------------------------------------------------------
+def test_a_list_batch_parses_each_record_on_its_own():
+    """A bad record in a list batch is its own error, named by its id or its
+    position, and the records after it are parsed as the records before it."""
+    index = VectorDatabase().create("hnsw", dim=4)
+    added = index.add({
+        "ids": ["a", "bad", "c", "d"],
+        "vectors": [[0.1, 0.2, 0.3, 0.4], [0.1], [0.5, 0.6, 0.7, 0.8], [0.9, 0.1, 0.2, 0.3]],
+    })
+    assert added.ids == ["a", "c", "d"]
+    assert (added.total_inserted, added.total_errors) == (3, 1)
+    assert added.errors == ["Vector bad: Vector dimension mismatch: expected 4, got 1"]
+    assert added.vector_shape == (4, 4)
+    assert sorted(record_id for record_id, _ in index.list(10)) == ["a", "c", "d"]
+
+    # A record with no id given is named by its position, and takes no id.
+    index = VectorDatabase().create("hnsw", dim=4)
+    added = index.add({"vectors": [[0.1, 0.2, 0.3, 0.4], [float("nan"), 0.2, 0.3, 0.4],
+                                   [0.5, 0.6, 0.7, 0.8]]})
+    assert added.ids == ["vec_1", "vec_2"]
+    assert added.errors == ["Vector item_1: Vector contains invalid value at index 0: NaN"]
+    assert added.vector_shape == (3, 4)
+
+    # Metadata that does not convert is its record's error and no other's.
+    index = VectorDatabase().create("hnsw", dim=2)
+    added = index.add({"ids": ["a", "b", "c"], "vectors": [[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]],
+                       "metadatas": [{"k": 1}, {7: "a key that is not a string"}, {"k": 3}]})
+    assert added.ids == ["a", "c"]
+    assert len(added.errors) == 1 and added.errors[0].startswith("Vector b: ")
+
+
+def test_a_numpy_batch_parses_each_record_on_its_own():
+    """Metadata that does not convert is its row's error in a NumPy batch,
+    and the rows after it go in."""
+    index = VectorDatabase().create("hnsw", dim=2)
+    added = index.add({"ids": ["a", "b", "c"],
+                       "embeddings": np.array([[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]],
+                                              dtype=np.float32),
+                       "metadatas": [{"k": 1}, {7: "a key that is not a string"}, {"k": 3}]})
+    assert added.ids == ["a", "c"]
+    assert len(added.errors) == 1 and added.errors[0].startswith("Vector b: ")
+    assert added.vector_shape == (3, 2)
+
+
+# ------------------------------------------------------------
+# Metadata that does not convert is its record's error in every shape
+# ------------------------------------------------------------
+def _nested(levels):
+    """A mapping nested `levels` deep, past the 128 levels a value may nest
+    where `levels` is 128 or more."""
+    value = 1
+    for _ in range(levels):
+        value = {"k": value}
+    return value
+
+
+def key_words(place):
+    """The words `errors` names a record with whose metadata holds the key 7
+    in the mapping at `place`."""
+    return (f"Metadata error: TypeError: the mapping at {place} holds the key 7, of type int, "
+            f"and a metadata key is a str, so convert it to one.")
+
+
+DEPTH_WORDS = ("Metadata error: ValueError: Nested value is deeper than 128 levels, "
+               "which is as far as mappings and lists nest.")
+
+
+@pytest.mark.parametrize("metadata,words", [
+    ({7: "a key that is not a string"}, key_words("the entry")),
+    ({"outer": {7: "a nested key that is not a string"}}, key_words("key 'outer'")),
+    (_nested(200), DEPTH_WORDS),
+])
+def test_metadata_that_does_not_convert_is_refused_in_every_shape(metadata, words):
+    """A record whose metadata does not convert is refused and named in
+    `errors` in each of the four shapes, and the records around it go in."""
+    vectors = [[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]]
+    metadatas = [{"k": 1}, metadata, {"k": 3}]
+    shapes = {
+        "single object": {"id": "b", "values": vectors[1], "metadata": metadata},
+        "list of records": [{"id": record_id, "values": vector, "metadata": entry}
+                            for record_id, vector, entry in zip("abc", vectors, metadatas)],
+        "list batch": {"ids": list("abc"), "vectors": vectors, "metadatas": metadatas},
+        "array batch": {"ids": list("abc"), "vectors": np.array(vectors, dtype=np.float32),
+                        "metadatas": metadatas},
+    }
+    for shape, data in shapes.items():
+        index = VectorDatabase().create("hnsw", dim=2)
+        added = index.add(data)
+        assert added.errors == [f"Vector b: {words}"], shape
+        assert "b" not in index, shape
+        assert sorted(record_id for record_id, _ in index.list(10)) == (
+            [] if shape == "single object" else ["a", "c"]), shape
+
+
+def test_a_record_refused_for_its_metadata_takes_no_generated_id():
+    """A record given no id is named by its position and leaves the id it
+    would have taken to the next record."""
+    index = VectorDatabase().create("hnsw", dim=2)
+    words = key_words("the entry")
+    added = index.add([{"values": [0.1, 0.2], "metadata": {7: "x"}},
+                       {"values": [0.3, 0.4], "metadata": {"k": 1}}])
+    assert added.errors == [f"Vector item_0: {words}"]
+    assert added.ids == ["vec_1"]
+    added = index.add({"vectors": [[0.1, 0.2], [0.3, 0.4]], "metadatas": [{7: "x"}, {"k": 1}]})
+    assert added.errors == [f"Vector item_0: {words}"]
+    assert added.ids == ["vec_2"]
+    added = index.add({"vectors": np.array([[0.1, 0.2], [0.3, 0.4]], dtype=np.float32),
+                       "metadatas": [{7: "x"}, {"k": 1}]})
+    assert added.errors == [f"Vector row_0: {words}"]
+    assert added.ids == ["vec_3"]
+
+
+def test_every_shape_reads_a_metadata_entry_the_same_way():
+    """A dict is the record's metadata, a string is kept under `text`, any
+    other value under `value`, and `None` is no metadata, in each of the four
+    shapes that carry metadata."""
+    entries = [{"k": 1}, "plain words", 42, [1, 2], None]
+    expected = [{"k": 1}, {"text": "plain words"}, {"value": 42}, {"value": [1, 2]}, {}]
+    ids = [f"r{i}" for i in range(len(entries))]
+    vectors = [[0.1 * (i + 1), 0.2] for i in range(len(entries))]
+    records = [{"id": record_id, "values": vector, "metadata": entry}
+               for record_id, vector, entry in zip(ids, vectors, entries)]
+    calls = {
+        "single object": records,
+        "list of records": [records],
+        "list batch": [{"ids": ids, "vectors": vectors, "metadatas": entries}],
+        "array batch": [{"ids": ids, "vectors": np.array(vectors, dtype=np.float32),
+                         "metadatas": entries}],
+    }
+    for shape, payloads in calls.items():
+        index = VectorDatabase().create("hnsw", dim=2)
+        for payload in payloads:
+            assert index.add(payload).is_success(), shape
+        stored = {record["id"]: record["metadata"]
+                  for record in index.get_records(ids, return_vector=False)}
+        assert stored == dict(zip(ids, expected)), shape
+
+
+# ------------------------------------------------------------
+# A float64 array is read as search reads it
+# ------------------------------------------------------------
+def test_a_float64_array_is_read_as_its_float32_narrowing():
+    """NumPy's default float type, bare and under a batch key, goes in as the
+    float32 array it narrows to, as `search` reads it."""
+    rows = np.random.default_rng(5).random((3, 4))
+    for payload in (rows, {"ids": ["a", "b", "c"], "embeddings": rows},
+                    {"ids": ["a", "b", "c"], "vectors": rows}):
+        wide = VectorDatabase().create("hnsw", dim=4, space="l2")
+        narrow = VectorDatabase().create("hnsw", dim=4, space="l2")
+        narrow_payload = (rows.astype(np.float32) if isinstance(payload, np.ndarray)
+                          else {**payload, next(k for k in payload if k != "ids"):
+                                rows.astype(np.float32)})
+        added = wide.add(payload)
+        assert added.is_success() and added.vector_shape == (3, 4)
+        assert narrow.add(narrow_payload).is_success()
+        ids = [record_id for record_id, _ in wide.list(10)]
+        assert ids == [record_id for record_id, _ in narrow.list(10)]
+        for record_id in ids:
+            assert (wide.get_records(record_id)[0]["vector"]
+                    == narrow.get_records(record_id)[0]["vector"])
+
+
+# ------------------------------------------------------------
+# vector_shape is the records the input holds
+# ------------------------------------------------------------
+def test_vector_shape_counts_the_records_the_input_holds():
+    index = VectorDatabase().create("hnsw", dim=2)
+    assert index.add([]).vector_shape == (0, 2)
+    assert index.add({"ids": ["a", "b", "c"],
+                      "vectors": [[0.1, 0.2], [0.3], [0.5, 0.6]]}).vector_shape == (3, 2)
+    assert index.add([{"id": "d", "values": [0.1, 0.2]},
+                      {"id": "e", "values": [0.1]}]).vector_shape == (2, 2)
+    assert index.add(np.array([[0.1, 0.2], [np.nan, 0.2]],
+                              dtype=np.float32)).vector_shape == (2, 2)
+
+
+# ------------------------------------------------------------
+# A vector past the bound on a vector's norm
+# ------------------------------------------------------------
+# 2^62 as a float32, the largest norm an index under l2, dot or l1 takes, and
+# the next float32 above it.
+AT_BOUND = float(np.float32(2.0 ** 62))
+PAST_BOUND = float(np.nextafter(np.float32(2.0 ** 62), np.float32(np.inf)))
+
+
+def past_bound_words(norm):
+    """What a refusal says of a norm past the bound after it names the
+    vector, with the norm as the engine prints it."""
+    return (f"has a Euclidean norm of {repr(float(norm)).replace('e+', 'e')} "
+            f"(must be at most 2^62, 4.611686018427388e18, under l2, dot or l1)")
+
+
+@pytest.mark.parametrize("space", ["l2", "dot", "l1"])
+def test_add_refuses_a_vector_past_the_bound_on_its_norm(space):
+    """Under l2, dot and l1, add() refuses a record whose Euclidean norm
+    passes 2^62 as that record's error, naming its norm and the bound, in
+    each input shape, and takes a record at the bound, so no record makes a
+    distance overflow. The records around a refused one go in."""
+    index = VectorDatabase().create("hnsw", dim=4, space=space, expected_size=20)
+    at = [AT_BOUND, 0.0, 0.0, 0.0]
+    past = [0.0, -PAST_BOUND, 0.0, 0.0]
+    words = past_bound_words(PAST_BOUND)
+
+    result = index.add({"ids": ["a1", "p1"], "embeddings": np.array([at, past], dtype=np.float32)})
+    assert (result.total_inserted, result.errors) == (1, [f"Vector p1: {words}"])
+    result = index.add(np.array([past, at], dtype=np.float32))
+    assert (result.total_inserted, result.errors) == (1, [f"Vector row_0: {words}"])
+    result = index.add([{"id": "p2", "values": past}, {"id": "a2", "values": at}])
+    assert (result.total_inserted, result.errors) == (1, [f"Vector p2: Vector {words}"])
+    result = index.add({"id": "p3", "values": past})
+    assert (result.total_inserted, result.errors) == (0, [f"Vector p3: Vector {words}"])
+    assert len(index) == 3 and "a1" in index and "a2" in index
+    assert not any(name in index for name in ("p1", "p2", "p3"))
+    hits = index.search(at, top_k=3)
+    assert len(hits) == 3 and all(np.isfinite(hit["score"]) for hit in hits)
+
+
+@pytest.mark.parametrize("values", [
+    [3.0e38, -3.0e38, 3.0e38, -3.0e38],
+    [float(np.finfo(np.float32).max), 0.0, 0.0, 0.0],
+    [1e-30, -2e-30, 0.0, 1e-30],
+])
+def test_a_cosine_vector_whose_squares_leave_the_float32_range_is_stored_at_unit_length(values):
+    """Under cosine add() takes a vector whose squares overflow or underflow a
+    float32 and stores it at unit length in the direction it had, where it
+    was stored as the zero vector or unchanged."""
+    index = VectorDatabase().create("hnsw", dim=4, space="cosine", expected_size=10)
+    assert index.add({"id": "big", "values": values}).is_success()
+    [stored] = index.get_records("big", return_vector=True)
+    vector = np.asarray(stored["vector"], dtype=np.float64)
+    assert abs(np.linalg.norm(vector) - 1.0) < 1e-6
+    assert (np.sign(vector) == np.sign(np.asarray(values, dtype=np.float64))).all()
+
+
+# ------------------------------------------------------------
+# A two dimensional array is read by rows whatever its layout
+# ------------------------------------------------------------
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_a_two_dimensional_array_is_read_by_rows_whatever_its_layout(dtype):
+    """add() stores each row of a two dimensional array as NumPy defines it,
+    bare and under a batch dict, whether the array is C-ordered,
+    Fortran-ordered or strided."""
+    rows = (np.arange(12).reshape(3, 4) + 1).astype(dtype)
+    for name, array in layouts(rows).items():
+        for shape in ("bare", "batch dict"):
+            index = VectorDatabase().create("hnsw", dim=4, space="l2", expected_size=10)
+            added = (index.add(array) if shape == "bare"
+                     else index.add({"ids": ["vec_1", "vec_2", "vec_3"], "embeddings": array}))
+            assert added.ids == ["vec_1", "vec_2", "vec_3"], (name, shape, added.errors)
+            stored = [index.get_records([i], return_vector=True)[0]["vector"] for i in added.ids]
+            assert stored == rows.astype(np.float32).tolist(), (name, shape)
+
+
+# ------------------------------------------------------------
+# A one dimensional array is read by its values whatever its layout
+# ------------------------------------------------------------
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_a_one_dimensional_array_is_read_by_its_values_whatever_its_layout(dtype):
+    """add() stores a one dimensional array as NumPy defines its values,
+    whether it is a column, a reversed view or a stepped view, in every
+    shape that takes one vector."""
+    values = [1.0, 2.0, 3.0, 4.0]
+    for name, array in vector_layouts(np.array(values, dtype=dtype)).items():
+        for shape in ("single object", "list of records", "list batch", "bare",
+                      "list of vectors"):
+            index = VectorDatabase().create("hnsw", dim=4, space="l2", expected_size=10)
+            if shape == "single object":
+                added = index.add({"id": "x", "values": array})
+            elif shape == "list of records":
+                added = index.add([{"id": "x", "vector": array}])
+            elif shape == "list batch":
+                added = index.add({"ids": ["x"], "vectors": [array]})
+            elif shape == "bare":
+                added = index.add(array)
+            else:
+                added = index.add([array])
+            assert added.is_success(), (name, shape, added.errors)
+            [stored] = index.get_records(added.ids, return_vector=True)
+            assert stored["vector"] == values, (name, shape)
+
+
+# ------------------------------------------------------------
+# A metadata value comes back as the value it was, or is refused
+# ------------------------------------------------------------
+METADATA_SHAPES = ("single object", "list of records", "list batch", "array batch")
+
+
+def add_with_metadata(index, shape, record_id, entry):
+    """Add one record of id `record_id` carrying `entry` in the shape named."""
+    vector = [0.1, 0.2]
+    if shape == "single object":
+        return index.add({"id": record_id, "values": vector, "metadata": entry})
+    if shape == "list of records":
+        return index.add([{"id": record_id, "values": vector, "metadata": entry}])
+    if shape == "list batch":
+        return index.add({"ids": [record_id], "vectors": [vector], "metadatas": [entry]})
+    return index.add({"ids": [record_id], "vectors": np.array([vector], dtype=np.float32),
+                      "metadatas": [entry]})
+
+
+def same(given, back):
+    """Whether `back` is `given`, of the same type at every level, a float's
+    sign among it."""
+    if type(given) is not type(back):
+        return False
+    if isinstance(given, float):
+        return given == back and math.copysign(1, given) == math.copysign(1, back)
+    if isinstance(given, dict):
+        return given.keys() == back.keys() and all(same(given[k], back[k]) for k in given)
+    if isinstance(given, list):
+        return len(given) == len(back) and all(same(a, b) for a, b in zip(given, back))
+    return given == back
+
+
+# Each value JSON holds, beside the value it comes back as, which is itself
+# but for a NumPy scalar and a str subclass, read by their value.
+KEPT = [
+    (None, None), (True, True), (False, False), (0, 0), (-(2 ** 63), -(2 ** 63)),
+    (2 ** 63 - 1, 2 ** 63 - 1), (0.1, 0.1), (-0.0, -0.0), (1e300, 1e300), ("text", "text"),
+    ("", ""), ([1, "a", None, [2.5]], [1, "a", None, [2.5]]),
+    ({"nested": {"deep": [True]}}, {"nested": {"deep": [True]}}),
+    (np.int64(5), 5), (np.float32(0.5), 0.5), (np.float64(0.25), 0.25), (np.bool_(True), True),
+    (type("Sub", (str,), {})("sub"), "sub"),
+]
+
+
+def entry_form(value):
+    """The metadata a record whose entry is `value` holds."""
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return value
+    return {"text" if isinstance(value, str) else "value": value}
+
+
+@pytest.mark.parametrize("given, back", KEPT, ids=[repr(given)[:30] for given, _ in KEPT])
+def test_a_metadata_value_json_holds_comes_back_as_it_was(tmp_path, given, back):
+    """A metadata value comes back as the value it was, as the whole entry
+    and inside a mapping, in every shape, live, after a replay of the journal
+    and after a save and a load."""
+    index = VectorDatabase().create("hnsw", dim=2, expected_size=50)
+    path = tmp_path / "kept.zdb"
+    index.journal_to(str(path))
+    expected = {}
+    for number, shape in enumerate(METADATA_SHAPES):
+        for entry, held in ((given, entry_form(back)), ({"v": given}, {"v": back})):
+            record_id = f"r{len(expected)}"
+            added = add_with_metadata(index, shape, record_id, entry)
+            assert added.is_success(), (shape, added.errors)
+            expected[record_id] = held
+
+    def holds(target, when):
+        records = target.get_records(sorted(expected), return_vector=False)
+        for record in records:
+            assert same(expected[record["id"]], record["metadata"]), (when, record)
+
+    holds(index, "live")
+    del index
+    gc.collect()
+    replayed = VectorDatabase().load(str(path))
+    holds(replayed, "after a replay")
+    replayed.checkpoint()
+    del replayed
+    gc.collect()
+    holds(VectorDatabase().load(str(path)), "after a save and a load")
+
+
+def metadata_refusal(kind, place, shown):
+    """The words `errors` names a refused metadata value with, after
+    `Metadata error: `."""
+    if kind == "type":
+        return (f"TypeError: the value at {place} is of type {shown}, and a metadata value is "
+                f"None, a bool, an int, a float, a str, a list or a dict, so convert it to one "
+                f"of those.")
+    if kind == "not finite":
+        return (f"ValueError: the value at {place} is {shown}, a float that is not finite, and "
+                f"a metadata value is a finite float, so give None or a string in its place.")
+    return (f"ValueError: the value at {place} is {shown}, outside the integers from -2^63 to "
+            f"2^63 - 1 that a metadata value holds, so give it as a string.")
+
+
+REFUSED = [
+    ((1, "a"), "type", "tuple"), ({3}, "type", "set"), (frozenset({3}), "type", "frozenset"),
+    (b"ab", "type", "bytes"), (bytearray(b"ab"), "type", "bytearray"),
+    (datetime.date(2026, 11, 21), "type", "date"),
+    (datetime.datetime(2026, 11, 21, 10, 30), "type", "datetime"),
+    (decimal.Decimal("0.1"), "type", "Decimal"), (fractions.Fraction(1, 3), "type", "Fraction"),
+    (complex(1, 2), "type", "complex"), (np.array([1, 2]), "type", "ndarray"),
+    (object(), "type", "object"),
+    (float("nan"), "not finite", "nan"), (float("inf"), "not finite", "inf"),
+    (float("-inf"), "not finite", "-inf"), (np.float32("nan"), "not finite", "nan"),
+    (2 ** 63, "range", "9223372036854775808"),
+    (-(2 ** 63) - 1, "range", "-9223372036854775809"),
+    (2 ** 70, "range", str(2 ** 70)),
+]
+
+
+@pytest.mark.parametrize("value, kind, shown", REFUSED,
+                         ids=[f"{kind} {shown}"[:30] for _, kind, shown in REFUSED])
+def test_a_metadata_value_json_does_not_hold_refuses_its_record(value, kind, shown):
+    """A value that would not come back as it was refuses its record, named
+    in `errors` after `Metadata error` with the words that say where the
+    value sits, in every shape, and the records around it go in."""
+    for shape in METADATA_SHAPES:
+        for entry, place in ((value, "the entry"), ({"v": value}, "key 'v'"),
+                             ({"outer": {"tags": [1, 2, value]}},
+                              "key 'outer', key 'tags', item 2")):
+            index = VectorDatabase().create("hnsw", dim=2, expected_size=50)
+            assert add_with_metadata(index, shape, "a", {"k": 1}).is_success()
+            added = add_with_metadata(index, shape, "b", entry)
+            assert added.errors == [f"Vector b: Metadata error: "
+                                    f"{metadata_refusal(kind, place, shown)}"], (shape, place)
+            assert "b" not in index and "a" in index, (shape, place)
+
+
+# ------------------------------------------------------------
+# Metadata as deep as add() takes comes back after a save and a load
+# ------------------------------------------------------------
+def _lists(levels, innermost=None):
+    """`levels` lists, one inside the next, the innermost holding
+    `innermost`, or nothing where it is None."""
+    value = [] if innermost is None else [innermost]
+    for _ in range(levels - 1):
+        value = [value]
+    return value
+
+
+def test_metadata_add_takes_comes_back_after_a_save_and_a_load(tmp_path):
+    """A field of 126 lists around an int, whose int is at level 128, the
+    deepest add() takes, comes back after a save and a load in the array
+    batch shape."""
+    value = _lists(126, 1)
+    index = VectorDatabase().create("hnsw", dim=2, expected_size=10)
+    added = index.add({"ids": ["k"], "embeddings": np.ones((1, 2), dtype=np.float32),
+                       "metadatas": [{"k": value}]})
+    assert added.is_success(), added.errors
+    index.save(str(tmp_path / "deep.zdb"))
+    loaded = VectorDatabase().load(str(tmp_path / "deep.zdb"))
+    assert loaded.get_records("k")[0]["metadata"]["k"] == value
+
+
+@pytest.mark.parametrize("levels, innermost", [(126, 1), (127, None)],
+                         ids=["126-around-an-int", "127-empty"])
+def test_deep_metadata_comes_back_after_a_save_and_a_load(tmp_path, levels, innermost):
+    """A field that reaches level 128, the deepest add() takes, as 126 lists
+    around an int or as 127 lists with the innermost empty, comes back after
+    a save and a load, and one level more is refused where it is written."""
+    value = _lists(levels, innermost)
+    index = VectorDatabase().create("hnsw", dim=2, expected_size=10)
+    added = index.add({"id": "k", "values": [1.0, 0.5], "metadata": {"k": value}})
+    assert added.is_success(), added.errors
+    deeper = index.add({"id": "d", "values": [1.0, 0.5],
+                        "metadata": {"k": _lists(levels + 1, innermost)}})
+    assert deeper.errors == [f"Vector d: {DEPTH_WORDS}"], deeper.errors
+    index.save(str(tmp_path / "deep.zdb"))
+    loaded = VectorDatabase().load(str(tmp_path / "deep.zdb"))
+    assert loaded.get_records("k")[0]["metadata"]["k"] == value
+    assert len(loaded) == 1
+
+
+def test_deep_metadata_update_comes_back_after_a_save_and_a_load(tmp_path):
+    """A mapping update_metadata() writes whose field reaches level 128 comes
+    back after a save and a load."""
+    value = _lists(127)
+    index = VectorDatabase().create("hnsw", dim=2, expected_size=10)
+    assert index.add({"id": "u", "values": [1.0, 0.5], "metadata": {"k": 1}}).is_success()
+    assert index.update_metadata("u", {"k": value})
+    index.save(str(tmp_path / "updated.zdb"))
+    loaded = VectorDatabase().load(str(tmp_path / "updated.zdb"))
+    assert loaded.get_records("u")[0]["metadata"]["k"] == value
+
+
+# ------------------------------------------------------------
+# A metadata entry that is not a dict is held to the depth it is kept at
+# ------------------------------------------------------------
+def _kept_under(entry):
+    """The metadata a record whose entry `entry` is not a dict comes back
+    with."""
+    return {"text": entry} if isinstance(entry, str) else {"value": entry}
+
+
+@pytest.mark.parametrize("levels, innermost", [(126, 1), (127, None)],
+                         ids=["a-scalar-at-level-128", "a-list-at-level-128"])
+def test_an_entry_that_is_not_a_dict_is_held_to_the_depth_of_the_value_it_is_kept_as(
+        levels, innermost):
+    """A metadata entry that is not a dict is kept under `value`, so it is
+    held to the depth a field's value is held to. A list entry that reaches
+    level 128 there is taken in every shape, and one a level deeper is
+    refused where it is written, in the words a field of a dict that deep is
+    refused in."""
+    for shape in METADATA_SHAPES:
+        index = VectorDatabase().create("hnsw", dim=2, expected_size=10)
+        field = add_with_metadata(index, shape, "f", {"value": _lists(levels + 1, innermost)})
+        assert field.errors == [f"Vector f: {DEPTH_WORDS}"], (shape, field.errors)
+        added = add_with_metadata(index, shape, "k", _lists(levels, innermost))
+        assert added.is_success(), (shape, added.errors)
+        deeper = add_with_metadata(index, shape, "d", _lists(levels + 1, innermost))
+        assert deeper.errors == [f"Vector d: {DEPTH_WORDS}"], (shape, deeper.errors)
+
+
+@pytest.mark.parametrize("levels, innermost", [(126, 1), (127, None)],
+                         ids=["a-scalar-at-level-128", "a-list-at-level-128"])
+def test_every_entry_add_takes_comes_back_after_a_save_and_a_load(tmp_path, levels, innermost):
+    """Every metadata entry add() takes comes back after a save and a load: a
+    str, an int, and a list at level 128 and one a level deeper, each where
+    add() takes it."""
+    entries = {"s": "a str", "i": 7, "at": _lists(levels, innermost),
+               "past": _lists(levels + 1, innermost)}
+    index = VectorDatabase().create("hnsw", dim=2, expected_size=10)
+    taken = {}
+    for record_id, entry in entries.items():
+        if index.add({"id": record_id, "values": [0.1, 0.2], "metadata": entry}).is_success():
+            taken[record_id] = entry
+    assert {"s", "i", "at"} <= set(taken), sorted(taken)
+    index.save(str(tmp_path / "entries.zdb"))
+    loaded = VectorDatabase().load(str(tmp_path / "entries.zdb"))
+    assert len(loaded) == len(taken)
+    for record_id, entry in taken.items():
+        assert loaded.get_records(record_id)[0]["metadata"] == _kept_under(entry), record_id
+
+
+# ------------------------------------------------------------
+# A metadata key that is not a str is refused with its place
+# ------------------------------------------------------------
+@pytest.mark.parametrize("metadata, words", [
+    ({1: "x"}, "the mapping at the entry holds the key 1, of type int"),
+    ({"outer": [{"inner": {(1, 2): "x"}}]},
+     "the mapping at key 'outer', item 0, key 'inner' holds the key (1, 2), of type tuple"),
+], ids=["entry", "nested"])
+def test_a_metadata_key_that_is_not_a_str_is_refused_with_its_place(metadata, words):
+    """A key that is not a str refuses its record with TypeError, in words
+    that name the mapping holding it, the key as Python writes it and its
+    type, and the records around it go in."""
+    index = VectorDatabase().create("hnsw", dim=2, expected_size=10)
+    added = index.add({"ids": ["a", "b"], "embeddings": np.ones((2, 2), dtype=np.float32),
+                       "metadatas": [metadata, {"k": 1}]})
+    assert added.errors == [f"Vector a: Metadata error: TypeError: {words}, and a metadata "
+                            f"key is a str, so convert it to one."], added.errors
+    assert added.ids == ["b"]
+
+
+# ------------------------------------------------------------
+# A str holding a lone surrogate is refused in words that say so
+# ------------------------------------------------------------
+SURROGATE = "a" + chr(0xD800) + "b"
+
+
+@pytest.mark.parametrize("entry, place", [
+    (SURROGATE, "the entry"), ({"k": SURROGATE}, "key 'k'"),
+    ({"k": [1, {"j": SURROGATE}]}, "key 'k', item 1, key 'j'"),
+], ids=["entry", "value", "nested"])
+def test_a_metadata_str_holding_a_lone_surrogate_is_refused_in_true_words(entry, place):
+    """A str holding a lone surrogate, which UTF-8 does not encode, refuses
+    its record with ValueError in words that say so, in every shape, and the
+    records around it go in."""
+    for shape in METADATA_SHAPES:
+        index = VectorDatabase().create("hnsw", dim=2, expected_size=10)
+        assert add_with_metadata(index, shape, "a", {"k": 1}).is_success()
+        added = add_with_metadata(index, shape, "b", entry)
+        assert added.errors == [
+            f"Vector b: Metadata error: ValueError: the value at {place} is a str holding a "
+            f"lone surrogate, which a metadata value cannot hold, so remove it."
+        ], (shape, added.errors)
+        assert "b" not in index and "a" in index, shape
+
+
+@pytest.mark.parametrize("entry, place", [
+    ({SURROGATE: 1}, "the entry"), ({"k": [{SURROGATE: 1}]}, "key 'k', item 0"),
+], ids=["entry", "nested"])
+def test_a_metadata_key_holding_a_lone_surrogate_is_refused_in_true_words(entry, place):
+    """A key that is a str holding a lone surrogate refuses its record with
+    ValueError in words naming the mapping holding it and the key as Python
+    writes it, in every shape, and the records around it go in."""
+    for shape in METADATA_SHAPES:
+        index = VectorDatabase().create("hnsw", dim=2, expected_size=10)
+        assert add_with_metadata(index, shape, "a", {"k": 1}).is_success()
+        added = add_with_metadata(index, shape, "b", entry)
+        assert added.errors == [
+            f"Vector b: Metadata error: ValueError: the mapping at {place} holds the key "
+            f"{SURROGATE!r}, a str holding a lone surrogate, which a metadata key cannot "
+            f"hold, so remove it."
+        ], (shape, added.errors)
+        assert "b" not in index and "a" in index, shape
+
+
+# ------------------------------------------------------------
+# An id that is not a str refuses its record
+# ------------------------------------------------------------
+@pytest.mark.parametrize("bad, words", [
+    (5, "TypeError: the id is of type int, and an id is a str, so convert it to one."),
+    (2.5, "TypeError: the id is of type float, and an id is a str, so convert it to one."),
+    (b"a", "TypeError: the id is of type bytes, and an id is a str, so convert it to one."),
+    (SURROGATE, "ValueError: the id is a str holding a lone surrogate, which an id cannot "
+                "hold, so remove it."),
+], ids=["int", "float", "bytes", "surrogate"])
+def test_an_id_that_is_not_a_str_refuses_its_record(bad, words):
+    """A record whose id is not a str, or is a str holding a lone surrogate,
+    is refused in `errors`, named by its position, rather than taking a
+    generated id, in every shape, and the records around it go in under
+    their own ids. An id of None is an id left out, so its record takes a
+    generated id."""
+    vectors = [[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]]
+    shapes = {
+        "single object": ({"id": bad, "values": vectors[1]}, "single_object", []),
+        "list of records": ([{"id": record_id, "values": vector}
+                             for record_id, vector in zip(["a", bad, "c"], vectors)],
+                            "item_1", ["a", "c"]),
+        "list batch": ({"ids": ["a", bad, "c"], "vectors": vectors}, "item_1", ["a", "c"]),
+        "array batch": ({"ids": ["a", bad, "c"], "vectors": np.array(vectors, dtype=np.float32)},
+                        "row_1", ["a", "c"]),
+    }
+    for shape, (data, position, kept) in shapes.items():
+        index = VectorDatabase().create("hnsw", dim=2, expected_size=10)
+        added = index.add(data)
+        assert added.errors == [f"Vector {position}: {words}"], (shape, added.errors)
+        assert added.ids == kept, shape
+        assert len(index) == len(kept), shape
+    index = VectorDatabase().create("hnsw", dim=2, expected_size=10)
+    added = index.add([{"id": None, "values": [0.1, 0.2]}, {"id": "a", "values": [0.3, 0.4]}])
+    assert added.errors == []
+    assert added.ids == ["vec_1", "a"]
+
+
+# ------------------------------------------------------------
+# A float that a float64 holds only rounded
+# ------------------------------------------------------------
+class Rounded:
+    """A real number held exactly, which a float64 may hold only rounded. It
+    registers as numbers.Real, as numpy's float types do."""
+
+    def __init__(self, numerator, denominator):
+        self.fraction = fractions.Fraction(numerator, denominator)
+
+    def __float__(self):
+        return float(self.fraction)
+
+    def __eq__(self, other):
+        try:
+            return fractions.Fraction(other) == self.fraction
+        except (TypeError, ValueError):
+            return NotImplemented
+
+    def __hash__(self):
+        return hash(self.fraction)
+
+    def __repr__(self):
+        return f"Rounded({self.fraction})"
+
+
+numbers.Real.register(Rounded)
+
+
+def test_a_float_a_float64_holds_only_rounded_is_refused():
+    """A metadata value comes back as the value it was. A float of another
+    type that a float64 holds only rounded cannot, so add() refuses its
+    record with ValueError, naming its place, its value and its type, and one
+    a float64 holds exactly is read by its value and comes back equal to it."""
+    index = VectorDatabase().create("hnsw", dim=2, expected_size=10)
+    rounded = index.add({"id": "third", "values": [0.1, 0.2], "metadata": {"x": Rounded(1, 3)}})
+    assert rounded.errors == [
+        "Vector third: Metadata error: ValueError: the value at key 'x' is Rounded(1/3), of type "
+        "Rounded, which a float64 holds only rounded, so give it as a float or a string."
+    ], rounded.errors
+    exact = index.add({"id": "half", "values": [0.1, 0.2],
+                       "metadata": {"x": Rounded(1, 2), "y": np.float32(0.1)}})
+    assert exact.is_success(), exact.errors
+    [record] = index.get_records("half")
+    assert record["metadata"] == {"x": 0.5, "y": float(np.float32(0.1))}
+
+
+@pytest.mark.skipif(np.finfo(np.longdouble).nmant <= np.finfo(np.float64).nmant,
+                    reason="numpy.longdouble is no wider than float64 here")
+def test_a_longdouble_a_float64_holds_only_rounded_is_refused():
+    """Where numpy.longdouble is wider than float64, a value of it that a
+    float64 holds only rounded is refused, naming its place, and one a
+    float64 holds exactly comes back equal to it."""
+    third = np.longdouble(1) / np.longdouble(3)
+    assert np.longdouble(float(third)) != third
+    index = VectorDatabase().create("hnsw", dim=2, expected_size=10)
+    rounded = index.add({"id": "third", "values": [0.1, 0.2], "metadata": {"x": third}})
+    assert rounded.total_errors == 1, rounded.errors
+    assert "the value at key 'x'" in rounded.errors[0], rounded.errors
+    assert "which a float64 holds only rounded" in rounded.errors[0], rounded.errors
+    exact = index.add({"id": "half", "values": [0.1, 0.2], "metadata": {"x": np.longdouble(0.5)}})
+    assert exact.is_success(), exact.errors
+    assert index.get_records("half")[0]["metadata"] == {"x": 0.5}
+
+
+# ------------------------------------------------------------
+# A finite value past what a float32 holds
+# ------------------------------------------------------------
+def test_add_names_a_value_past_the_float32_range_as_given():
+    """A finite value past what a float32 holds is refused, and add() names
+    it as the caller gave it, in every shape that reads a list or a float64
+    array. A NaN or an infinity given is named as it was."""
+    given = "contains invalid value at index 0: 1e39, which a float32 holds as inf"
+    shapes = {
+        "single object": ({"id": "a", "values": [1e39, 0.0]}, f"Vector a: Vector {given}"),
+        "list of records": ([{"id": "a", "values": [1e39, 0.0]}], f"Vector a: Vector {given}"),
+        "list batch": ({"ids": ["a"], "vectors": [[1e39, 0.0]]}, f"Vector a: Vector {given}"),
+        "float64 array batch": ({"ids": ["a"], "vectors": np.array([[1e39, 0.0]])},
+                                f"Vector a: {given} (must be finite)"),
+        "bare float64 array": (np.array([[1e39, 0.0]]), f"Vector row_0: {given} (must be finite)"),
+        "an infinity given": ({"id": "a", "values": [math.inf, 0.0]},
+                              "Vector a: Vector contains invalid value at index 0: inf"),
+    }
+    index = VectorDatabase().create("hnsw", dim=2, expected_size=10)
+    for shape, (data, error) in shapes.items():
+        added = index.add(data)
+        assert added.errors == [error], (shape, added.errors)
+    assert len(index) == 0

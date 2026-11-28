@@ -18,13 +18,14 @@ use std::sync::{Arc, Mutex};
 use serde_json::{json, Value};
 
 use zeusdb_vector_core::{
-    compile_filter, test_support::clustered, Error, IdfScope, JournalRecord, Operation,
-    OperationKind, SparseVector, DUMP_FILENAME, MAX_INTERNAL_ID,
+    compile_filter, test_support::clustered, Error, Fitted, GraphCeilings, IdfScope, JournalRecord,
+    Operation, OperationKind, SparseVector, DUMP_FILENAME, GRAPH_CEILINGS, MAX_INTERNAL_ID,
 };
 use zeusdb_vector_sparse::{SparseConfig, Weighting};
 use zeusdb_vector_text::{SimpleTokenizer, Tokenizer};
 
 use super::{Collection, Declaration, OperationSink, ParsedRecord, SparseHalf, StorageMode};
+use crate::RerankCalibration;
 
 // ============================================================================
 // FIXTURES
@@ -258,7 +259,10 @@ struct Snapshot {
     training_ids: Vec<String>,
     threshold_reached: bool,
     stamp: Option<String>,
-    rerank_fetch: Option<usize>,
+    /// The rerank calibration as JSON, every field but its measured time.
+    calibration: Option<String>,
+    /// The calibration's measured time, a clock reading like the stamp.
+    calibration_millis: Option<u64>,
     /// Values a scalar graph has clipped, which every replay must reach.
     saturated: u64,
     terms: Option<Vec<String>>,
@@ -345,7 +349,10 @@ impl Snapshot {
             training_ids,
             threshold_reached: collection.training_threshold_reached(),
             stamp: collection.training_completed_at(),
-            rerank_fetch: collection.rerank_calibration().map(|c| c.fetch),
+            calibration: collection
+                .rerank_calibration()
+                .map(|c| serde_json::to_string(&RerankCalibration { millis: 0, ..c }).unwrap()),
+            calibration_millis: collection.rerank_calibration().map(|c| c.millis),
             saturated: collection.int8_saturated(),
             terms,
             index_metadata: collection.all_metadata().into_iter().collect(),
@@ -389,7 +396,8 @@ impl Snapshot {
         cmp!(training_ids);
         cmp!(threshold_reached);
         cmp!(stamp);
-        cmp!(rerank_fetch);
+        cmp!(calibration);
+        cmp!(calibration_millis);
         cmp!(saturated);
         cmp!(terms);
         cmp!(index_metadata);
@@ -437,8 +445,10 @@ impl Run {
     }
 
     /// Load the checkpoint, apply every record past it, and hold the result
-    /// to the original under rule R2. A second replay from the same
-    /// checkpoint is held to the first. Returns the kinds replayed.
+    /// to the original under rule R2, every saved artefact among it. A
+    /// second replay from the same checkpoint is held to the first, and
+    /// neither fits a quantizer, since a training's record carries what it
+    /// fitted. Returns the kinds replayed.
     fn prove(
         &self,
         queries: &Queries,
@@ -466,10 +476,16 @@ impl Run {
         for (kind, _) in records.iter().skip(from) {
             kinds.insert(*kind);
         }
+        let fits = zeusdb_vector_core::test_support::quantizer_fits();
         let first = replay("replayed");
         assert_eq!(original.diff(&first), Vec::<&str>::new());
         let second = replay("replayed-again");
         assert_eq!(first.diff(&second), Vec::<&str>::new());
+        assert_eq!(
+            zeusdb_vector_core::test_support::quantizer_fits(),
+            fits,
+            "a replay fits no quantizer"
+        );
         assert!(!first.records.is_empty() || first.id_counter == 0);
         kinds
     }
@@ -481,11 +497,11 @@ impl Run {
 
 /// The records arrive in the order the seam is built to keep: a term's record at
 /// the moment its id is issued and ahead of the insert that carries it, a
-/// removal ahead of the inserts that replace what it removed, every insert
-/// of a call handed over and committed before any is installed, and the
-/// training's record between the insert that filled the set and the one
-/// after it, so that the levels the records carry are the ones the graph
-/// installed at.
+/// removal ahead of the inserts that replace what it removed and in the same
+/// call, every insert of a call handed over and committed before any is
+/// installed, and the training's record between the insert that filled the
+/// set and the one after it, so that the levels the records carry are the
+/// ones the graph installed at.
 #[test]
 fn the_seam_hands_records_over_in_the_order_the_mutations_ran() {
     let vectors = clustered(20, 4, 0x0014_7b01);
@@ -552,18 +568,15 @@ fn the_seam_hands_records_over_in_the_order_the_mutations_ran() {
         }
     }
 
-    // An overwrite removes first, and the record of the removal comes
-    // before the replacement's interning and insert.
+    // An overwrite of a held record admits the replacement first, which
+    // hands its new term over as it is counted, then hands over the removal
+    // and the replacement's insert, and commits them as one call.
     overwrite(
         &collection,
         vec![text_record(&collection, 12, &vectors).with_id("r0")],
     );
-    assert_eq!(recording.kinds()[8..], [Remove, Intern, Insert]);
-    assert_eq!(
-        recording.commits(),
-        3,
-        "the removal and the segment each commit"
-    );
+    assert_eq!(recording.kinds()[8..], [Intern, Remove, Insert]);
+    assert_eq!(recording.commits(), 2, "the overwrite commits once");
 
     // A removal names only the ids the index holds, once each, and a
     // removal of nothing is not recorded.
@@ -621,7 +634,7 @@ fn the_seam_hands_records_over_in_the_order_the_mutations_ran() {
         } => assert_eq!((m, expected_size, ef_construction), (6, 100, 50)),
         other => panic!("{other:?}"),
     }
-    assert_eq!(recording.commits(), 9);
+    assert_eq!(recording.commits(), 8);
 
     // Training inside a batch: the insert that fills the set ends its
     // segment, the training's record follows it, and the rest of the batch
@@ -644,8 +657,24 @@ fn the_seam_hands_records_over_in_the_order_the_mutations_ran() {
     assert_eq!(recording.commits(), 3);
     let records = recording.records();
     match decode(1000, records[1000].0, &records[1000].1, 8) {
-        Operation::Train { completed_at } => {
-            assert_eq!(Some(completed_at), quantized.training_completed_at())
+        Operation::Train {
+            completed_at,
+            fitted,
+        } => {
+            assert_eq!(Some(completed_at), quantized.training_completed_at());
+            assert!(
+                matches!(
+                    fitted,
+                    Some(Fitted::Codebook {
+                        subvectors: 2,
+                        centroids: 4,
+                        width: 4,
+                        calibration: Some(_),
+                        ..
+                    })
+                ),
+                "the record carries the codebook and its calibration"
+            );
         }
         other => panic!("{other:?}"),
     }
@@ -664,10 +693,12 @@ impl WithId for ParsedRecord {
     }
 }
 
-/// A sink that refuses leaves the counter, the index and every map as they
-/// were, and every entry point carries the refusal out, so a caller learns
-/// that nothing was recorded rather than finding a mutation the journal
-/// never saw.
+/// A sink that refuses leaves the index and every map as they were, and
+/// every entry point carries the refusal out, so a caller learns that
+/// nothing was recorded rather than finding a mutation the journal never
+/// saw. A record refused at admission leaves the counter where it was. An
+/// overwrite refused once its admission is over leaves the ids admission
+/// issued issued, as a withdrawn call does, and the fault with them.
 #[test]
 fn a_sink_that_refuses_leaves_the_collection_as_it_was() {
     let vectors = clustered(6, 4, 0x0014_7b03);
@@ -699,10 +730,10 @@ fn a_sink_that_refuses_leaves_the_collection_as_it_was() {
         2,
         "the refused records burnt no id"
     );
-    // The first term was interned before its record was refused, and the
-    // refusal stopped the count there, which is the state a replay of the
-    // records before it reaches.
-    assert_eq!(collection.term_count(), Some(1));
+    // A term's record is handed over before the term is interned, so the
+    // refusal of the first stopped the count with nothing interned, which
+    // is the state a replay of the records before it reaches.
+    assert_eq!(collection.term_count(), Some(0));
 
     let refused = |result: Result<(), Error>| {
         let err = result.unwrap_err();
@@ -729,10 +760,22 @@ fn a_sink_that_refuses_leaves_the_collection_as_it_was() {
     );
     refused(collection.clear().map(|_| ()));
     refused(collection.rebuild_with_quantization().map(|_| ()));
-    // An overwrite of a held record is refused at the removal's record.
+    // An overwrite of a held record is refused at the removal's record,
+    // once the replacement is admitted, and leaves the fault.
     let added = collection.add_records(vec![record(0, &vectors)], vec![], true);
     assert_eq!(added.total_errors, 1);
-    assert!(added.errors[0].contains("Failed to record the removal"));
+    assert!(
+        added.errors[0].contains("the sink refuses everything"),
+        "{:?}",
+        added.errors
+    );
+    let next = collection.add_records(vec![record(5, &vectors)], vec![], false);
+    assert!(
+        next.errors[0].contains("The journal's commit failed"),
+        "{:?}",
+        next.errors
+    );
+    assert_eq!(collection.id_counter(), 3, "the admitted id stays issued");
 
     assert_eq!(collection.len(), 2);
     assert_eq!(collection.m(), 4);
@@ -746,11 +789,12 @@ fn a_sink_that_refuses_leaves_the_collection_as_it_was() {
         Some(&json!(0))
     );
 
-    // Detached, everything runs again and the next ids follow the counter.
+    // Detached, the fault goes with the sink, everything runs again and the
+    // next ids follow the counter.
     assert!(collection.detach_sink().is_some());
     add(&collection, vec![record(2, &vectors), record(3, &vectors)]);
-    assert_eq!(collection.internal_id_of("r2"), Some(3));
-    assert_eq!(collection.internal_id_of("r3"), Some(4));
+    assert_eq!(collection.internal_id_of("r2"), Some(4));
+    assert_eq!(collection.internal_id_of("r3"), Some(5));
 }
 
 /// A record whose journal payload would be above the ceiling is refused at
@@ -1032,12 +1076,13 @@ fn a_record_refused_for_its_id_or_its_width_moves_nothing() {
             let dir = TempDir::new();
             let ours = Snapshot::take(&collection, &dir.sub("ours.zdb"), &queries);
             let theirs = Snapshot::take(&twin, &dir.sub("twin.zdb"), &queries);
-            // The training stamp is each collection's own clock reading.
+            // The training stamp and the calibration's measured time are each
+            // collection's own clock readings.
             let differ = |snapshot: &Snapshot| -> Vec<&'static str> {
                 snapshot
                     .diff(&theirs)
                     .into_iter()
-                    .filter(|field| *field != "stamp")
+                    .filter(|field| *field != "stamp" && *field != "calibration_millis")
                     .collect()
             };
             assert_eq!(differ(&ours), Vec::<&str>::new(), "{label}");
@@ -1056,6 +1101,507 @@ fn a_record_refused_for_its_id_or_its_width_moves_nothing() {
             }
         }
     }
+}
+
+// ============================================================================
+// THE GRAPH'S ROOM, THE FORWARD ARENA AND THE LONGEST TERM
+// ============================================================================
+
+/// The graph's ceilings, lowered on this thread so the refusals they give
+/// are reached without gigabytes of graph, and put back when dropped.
+struct GraphLowered(GraphCeilings);
+
+impl GraphLowered {
+    fn to(ceilings: GraphCeilings) -> Self {
+        GraphLowered(GRAPH_CEILINGS.with(|held| held.replace(ceilings)))
+    }
+}
+
+impl Drop for GraphLowered {
+    fn drop(&mut self) {
+        GRAPH_CEILINGS.with(|held| held.set(self.0));
+    }
+}
+
+/// What the dense graph's arenas hold, as nodes, upper list words, wide
+/// upper lists and upper list slots.
+fn graph_held(collection: &Collection) -> [usize; 4] {
+    collection.dense_index().graph().room().held()
+}
+
+/// The words the graph gives a record a graph that is full of `arena` cannot
+/// take, holding `held` of the `held` it can address.
+fn full(arena: &str, held: usize, needed: usize) -> String {
+    format!(
+        "The graph is full: its {arena} number {held} of the {held} it can address, and one \
+         more record can add up to {needed}. compact() rebuilds the graph without the nodes \
+         that removed and replaced records leave in it."
+    )
+}
+
+/// The words a rebuild gives where the graph it builds is full of `arena`,
+/// holding `held` of the `held` it can address.
+fn rebuilt_full(arena: &str, held: usize, needed: usize) -> String {
+    format!(
+        "The rebuilt graph is full: its {arena} number {held} of the {held} it can address, \
+         and the next record to go in can add up to {needed}."
+    )
+}
+
+/// A call whose records together may take the graph past a ceiling, though
+/// the graph has room for each of them alone, has each record the room
+/// cannot be sure of, after the records the call admitted before it, refused
+/// in the words that say the call is too large to place at once, with the
+/// graph far from full. The records the call admits go in, and nothing of a
+/// refused record reaches the sink. The refused records then go in one call each,
+/// and every record of the call is held. A replay of what the sink holds
+/// reaches the collection, artefact for artefact, under the same ceiling.
+#[test]
+fn a_call_too_large_to_place_at_once_goes_in_across_smaller_calls() {
+    let vectors = clustered(300, 4, 0x0221_d001);
+    let queries = Queries {
+        dense: vectors[7].clone(),
+        text: None,
+        sparse: None,
+    };
+    let mut run = Run::new(refusals_collection(false));
+    add(
+        &run.original,
+        (0..200).map(|i| record(i, &vectors)).collect(),
+    );
+    run.checkpoint();
+    let held = graph_held(&run.original);
+    let ceiling = held[2] + 150;
+    let _lowered = GraphLowered::to(GraphCeilings {
+        wide_lists: ceiling,
+        ..GraphCeilings::LAYOUT
+    });
+
+    let added = run.original.add_records(
+        (200..300).map(|i| record(i, &vectors)).collect(),
+        vec![],
+        false,
+    );
+    assert!(added.total_errors > 0, "the call is too large for the room");
+    assert!(
+        added.errors.iter().all(|error| error.contains(
+            "This call is too large to place at once: the graph's wide upper lists number "
+        ) && error.contains(
+            "The graph has room for the record on its own, so add the records across smaller \
+             calls."
+        )),
+        "{:?}",
+        added.errors
+    );
+    let refused: Vec<usize> = (200..300)
+        .filter(|i| !added.inserted.contains(&format!("r{i}")))
+        .collect();
+    assert_eq!(refused.len(), added.total_errors);
+    assert!(
+        graph_held(&run.original)[2] < ceiling,
+        "the graph has room left"
+    );
+
+    for i in refused {
+        add(&run.original, vec![record(i, &vectors)]);
+    }
+    assert!((0..300).all(|i| run.original.contains(&format!("r{i}"))));
+    assert_eq!(run.original.vector_count(), 300);
+    let inserts = run
+        .recording
+        .kinds()
+        .iter()
+        .filter(|kind| **kind == OperationKind::Insert)
+        .count();
+    assert_eq!(inserts, 300, "no refused record reached the sink");
+    run.prove(&queries, None);
+}
+
+/// A record the graph has no room for even alone is refused in the words
+/// that say the graph is full, before its id is issued for good or anything
+/// reaches the sink. The nodes removed records leave in the graph take room
+/// until a compaction rebuilds it without them, as the words say, and the
+/// record then goes in.
+#[test]
+fn a_record_a_full_graph_has_no_room_for_moves_nothing_until_a_compaction() {
+    let vectors = clustered(40, 4, 0x0221_d002);
+    let run = Run::new(refusals_collection(false));
+    add(
+        &run.original,
+        (0..30).map(|i| record(i, &vectors)).collect(),
+    );
+    let gone: Vec<String> = (0..5).map(|i| format!("r{i}")).collect();
+    assert!(run.original.remove_points(&gone).unwrap().is_empty());
+    assert_eq!(graph_held(&run.original)[0], 30);
+    let counter = run.original.id_counter();
+    let handed = run.recording.len();
+    let _lowered = GraphLowered::to(GraphCeilings {
+        nodes: 30,
+        ..GraphCeilings::LAYOUT
+    });
+
+    let added = run
+        .original
+        .add_records(vec![record(30, &vectors)], vec![], false);
+    assert_eq!(added.total_errors, 1);
+    assert!(
+        added.errors[0].contains(&full("nodes", 30, 1)),
+        "{:?}",
+        added.errors
+    );
+    assert!(!run.original.contains("r30"));
+    assert_eq!(run.original.id_counter(), counter);
+    assert_eq!(run.recording.len(), handed, "nothing reached the sink");
+
+    assert_eq!(run.original.compact().unwrap(), 5);
+    add(&run.original, vec![record(30, &vectors)]);
+    assert!(run.original.contains("r30"));
+}
+
+/// A compaction whose replacement graph has no room for the records held is
+/// refused in the words a rebuild gives and installs nothing, so the graph, every
+/// record and every page stay as they were, on a raw collection and on a
+/// product quantized one. A replay of a compaction's record passes it over
+/// where the room refuses it, as the live collection, which committed the
+/// record before the compaction ran, was refused at the same record.
+#[test]
+fn a_compaction_the_room_refuses_changes_nothing() {
+    let vectors = clustered(1_100, 4, 0x0221_d003);
+    let queries = Queries {
+        dense: vectors[33].clone(),
+        text: None,
+        sparse: None,
+    };
+    for pq in [false, true] {
+        let label = format!("pq {pq}");
+        let held = if pq { 1_010 } else { 60 };
+        let collection = refusals_collection(pq);
+        add(
+            &collection,
+            (0..held).map(|i| record(i, &vectors)).collect(),
+        );
+        assert_eq!(collection.is_quantized(), pq, "{label}");
+        let gone: Vec<String> = (0..10).map(|i| format!("r{i}")).collect();
+        assert!(collection.remove_points(&gone).unwrap().is_empty());
+        let live = held - 10;
+        let dir = TempDir::new();
+        let before = Snapshot::take(&collection, &dir.sub("before.zdb"), &queries);
+
+        let lowered = GraphLowered::to(GraphCeilings {
+            nodes: live - 1,
+            ..GraphCeilings::LAYOUT
+        });
+        assert_eq!(
+            collection.compact().unwrap_err().to_string(),
+            rebuilt_full("nodes", live - 1, 1),
+            "{label}"
+        );
+        collection.apply(Operation::Compact).unwrap();
+        drop(lowered);
+        let after = Snapshot::take(&collection, &dir.sub("after.zdb"), &queries);
+        assert_eq!(before.diff(&after), Vec::<&str>::new(), "{label}");
+        assert_eq!(collection.compact().unwrap(), 10, "{label}");
+    }
+}
+
+/// A rebuild whose replacement graph has no room for the records at its new
+/// degree is refused in the words a rebuild gives, and the graph and the
+/// configuration it was built with stay. A replay of the rebuild's record
+/// passes it over, so the collection a replay reaches is the collection. A
+/// graph at `m` 2 spans about four times the layers one at `m` 16 does, so
+/// the rebuild needs more upper list words than the graph it replaces held,
+/// and the ceiling is set at what that graph holds.
+#[test]
+fn a_rebuild_the_room_refuses_keeps_the_graph_and_its_configuration() {
+    let vectors = clustered(300, 4, 0x0221_d004);
+    let queries = Queries {
+        dense: vectors[5].clone(),
+        text: None,
+        sparse: None,
+    };
+    let declaration = Declaration::validate(4, "l2", 16, 50, 400, vec!["cat".to_string()]).unwrap();
+    let mut run = Run::new(Collection::build(declaration, None));
+    add(
+        &run.original,
+        (0..300).map(|i| record(i, &vectors)).collect(),
+    );
+    run.checkpoint();
+    let words = graph_held(&run.original)[1];
+    let _lowered = GraphLowered::to(GraphCeilings {
+        words,
+        ..GraphCeilings::LAYOUT
+    });
+
+    let plan = run.original.plan_rebuild(Some(2), None, None).unwrap();
+    let refused = run.original.rebuild(plan).unwrap_err();
+    assert!(
+        matches!(
+            refused,
+            Error::GraphFull {
+                arena: "upper list words",
+                call: false,
+                rebuild: true,
+                ..
+            }
+        ),
+        "{refused:?}"
+    );
+    assert!(
+        refused
+            .to_string()
+            .starts_with("The rebuilt graph is full: its upper list words number "),
+        "{refused}"
+    );
+    assert_eq!(run.original.m(), 16);
+    assert_eq!(graph_held(&run.original)[1], words);
+    assert_eq!(
+        run.recording.kinds().last(),
+        Some(&OperationKind::Rebuild),
+        "the rebuild's record was handed over before it ran"
+    );
+    run.prove(&queries, None);
+}
+
+/// A quantized rebuild whose replacement graph has no room for the records
+/// held is refused in the words a rebuild gives and installs nothing, so the
+/// graph, every record, every code and every page stay as they were, on a
+/// product quantized and on a scalar collection, and the same rebuild goes
+/// in at the ceilings the layout sets.
+#[test]
+fn a_quantized_rebuild_the_room_refuses_changes_nothing() {
+    let vectors = clustered(1_100, 4, 0x0221_d005);
+    let queries = Queries {
+        dense: vectors[44].clone(),
+        text: None,
+        sparse: None,
+    };
+    for scalar in [false, true] {
+        let label = format!("scalar {scalar}");
+        let declaration =
+            Declaration::validate(4, "l2", 4, 50, 2_000, vec!["cat".to_string()]).unwrap();
+        let quantization = if scalar {
+            declaration
+                .scalar_quantization("per_dimension", 1_000, None, StorageMode::QuantizedOnly)
+                .unwrap()
+        } else {
+            declaration
+                .quantization(2, 4, 1_000, None, StorageMode::QuantizedWithRaw)
+                .unwrap()
+        };
+        let collection = Collection::build(declaration, Some(quantization));
+        add(
+            &collection,
+            (0..1_010).map(|i| record(i, &vectors)).collect(),
+        );
+        assert!(collection.is_quantized(), "{label}");
+        let dir = TempDir::new();
+        let before = Snapshot::take(&collection, &dir.sub("before.zdb"), &queries);
+
+        let lowered = GraphLowered::to(GraphCeilings {
+            nodes: 1_009,
+            ..GraphCeilings::LAYOUT
+        });
+        assert_eq!(
+            collection
+                .rebuild_with_quantization()
+                .unwrap_err()
+                .to_string(),
+            rebuilt_full("nodes", 1_009, 1),
+            "{label}"
+        );
+        drop(lowered);
+        let after = Snapshot::take(&collection, &dir.sub("after.zdb"), &queries);
+        assert_eq!(before.diff(&after), Vec::<&str>::new(), "{label}");
+        assert!(collection.rebuild_with_quantization().unwrap(), "{label}");
+    }
+}
+
+/// A recorded insert the graph has no room for at the level it names is
+/// refused as admission refuses it, before its id is issued, and the
+/// collection is as it was.
+#[test]
+fn a_replayed_insert_is_held_to_the_room() {
+    let vectors = clustered(40, 4, 0x0221_d005);
+    let mut run = Run::new(refusals_collection(false));
+    add(
+        &run.original,
+        (0..30).map(|i| record(i, &vectors)).collect(),
+    );
+    run.checkpoint();
+    add(&run.original, vec![record(30, &vectors)]);
+    let (checkpoint, from) = run.checkpoint.clone().unwrap();
+    let records = run.recording.records();
+    let (at, (kind, payload)) = records
+        .iter()
+        .enumerate()
+        .skip(from)
+        .find(|(_, (kind, _))| *kind == OperationKind::Insert)
+        .unwrap();
+    let operation = decode(at, *kind, payload, 4);
+    let replayed = Collection::load(&checkpoint).unwrap();
+    let counter = replayed.id_counter();
+    let _lowered = GraphLowered::to(GraphCeilings {
+        nodes: 30,
+        ..GraphCeilings::LAYOUT
+    });
+    assert_eq!(
+        replayed.apply(operation).unwrap_err().to_string(),
+        full("nodes", 30, 1)
+    );
+    assert_eq!(replayed.id_counter(), counter);
+    assert!(!replayed.contains("r30"));
+}
+
+/// The sparse forward arena's ceiling, lowered on this thread for the length
+/// of a test and put back when dropped.
+struct ForwardLowered(usize);
+
+impl ForwardLowered {
+    fn to(ceiling: usize) -> Self {
+        ForwardLowered(zeusdb_vector_sparse::FORWARD_CEILING.with(|held| held.replace(ceiling)))
+    }
+}
+
+impl Drop for ForwardLowered {
+    fn drop(&mut self) {
+        zeusdb_vector_sparse::FORWARD_CEILING.with(|held| held.set(self.0));
+    }
+}
+
+/// A record whose sparse half would take the space's forward arena past its
+/// ceiling, counting the nonzeros of the records the call admitted before
+/// it, is refused naming the space, before anything of it reaches the sink,
+/// and the records before it go in. A replayed insert is held to the same
+/// ceiling, before its id is issued.
+#[test]
+fn a_sparse_half_past_the_forward_ceiling_is_refused_naming_the_space() {
+    let vectors = clustered(40, 4, 0x0221_d006);
+    let sparse = |i: usize| {
+        let dims: Vec<u32> = (0..4).map(|j| (i * 4 + j) as u32).collect();
+        SparseHalf::Vector(SparseVector {
+            dims,
+            values: vec![1.0; 4],
+        })
+    };
+    let with_sparse = |i: usize| ParsedRecord {
+        sparse: Some(sparse(i)),
+        ..record(i, &vectors)
+    };
+    let mut run = Run::new(overwrite_collection(true));
+    add(&run.original, (0..10).map(with_sparse).collect());
+    run.checkpoint();
+    let held = run
+        .original
+        .sparse()
+        .unwrap()
+        .index
+        .read()
+        .unwrap()
+        .forward_len();
+    assert_eq!(held, 40);
+    let handed = run.recording.len();
+    let lowered = ForwardLowered::to(held + 10);
+    let added = run
+        .original
+        .add_records((10..13).map(with_sparse).collect(), vec![], false);
+    assert_eq!(added.inserted, vec!["r10".to_string(), "r11".to_string()]);
+    assert_eq!(added.total_errors, 1);
+    assert!(
+        added.errors[0].contains(
+            "The sparse space 'terms' cannot take the record: its forward store holds 40 \
+             nonzeros, the records this call admitted before it carry 8 more, the record \
+             carries 4, and the store can address 50. compact() reclaims the nonzeros of \
+             removed records."
+        ),
+        "{:?}",
+        added.errors
+    );
+    assert_eq!(run.recording.len(), handed + 2, "the two records went in");
+    drop(lowered);
+
+    let records = run.recording.records();
+    let (at, (kind, payload)) = records
+        .iter()
+        .enumerate()
+        .skip(handed)
+        .find(|(_, (kind, _))| *kind == OperationKind::Insert)
+        .unwrap();
+    let operation = decode(at, *kind, payload, 4);
+    let (checkpoint, _) = run.checkpoint.clone().unwrap();
+    let replayed = Collection::load(&checkpoint).unwrap();
+    let counter = replayed.id_counter();
+    let _lowered = ForwardLowered::to(held + 3);
+    assert_eq!(
+        replayed.apply(operation).unwrap_err().to_string(),
+        "The sparse space 'terms' cannot take the record: its forward store holds 40 nonzeros, \
+         the record carries 4, and the store can address 43. compact() reclaims the nonzeros \
+         of removed records."
+    );
+    assert_eq!(replayed.id_counter(), counter);
+}
+
+/// A record carrying a term longer than a text space stores is refused,
+/// before its id is issued for good, with the term neither interned nor
+/// handed to the sink, and the records around it go in.
+#[test]
+fn a_term_past_the_ceiling_is_refused_before_it_is_interned() {
+    let vectors = clustered(10, 8, 0x0221_d007);
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(SimpleTokenizer);
+    let declaration = Declaration::validate(8, "l2", 8, 60, 50, vec!["cat".to_string()])
+        .unwrap()
+        .with_text("text", SparseConfig::default(), tokenizer)
+        .unwrap();
+    let run = Run::new(Collection::build(declaration, None));
+    let c = &run.original;
+    let with_text = |i: usize, text: &str| ParsedRecord {
+        sparse: Some(SparseHalf::Terms(c.tokenize(text).unwrap())),
+        ..record(i, &vectors)
+    };
+    add(c, vec![with_text(0, "alpha beta")]);
+    let counter = c.id_counter();
+    let lowered = zeusdb_vector_text::TERM_CEILING.with(|held| held.replace(6));
+    let added = c.add_records(
+        vec![
+            with_text(1, "alpha gamma"),
+            with_text(2, "alpha overlong"),
+            with_text(3, "beta delta"),
+        ],
+        vec![],
+        false,
+    );
+    zeusdb_vector_text::TERM_CEILING.with(|held| held.set(lowered));
+    assert_eq!(added.inserted, vec!["r1".to_string(), "r3".to_string()]);
+    assert_eq!(added.total_errors, 1);
+    assert!(
+        added.errors[0].contains(
+            "A term of 8 bytes is longer than the 6 bytes a text space stores for one term."
+        ),
+        "{:?}",
+        added.errors
+    );
+    assert!(!c.contains("r2"));
+    assert_eq!(c.id_counter(), counter + 2);
+    let dictionary = c
+        .sparse()
+        .unwrap()
+        .text
+        .as_ref()
+        .unwrap()
+        .dictionary
+        .read()
+        .unwrap()
+        .terms()
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<String>>();
+    assert_eq!(dictionary, ["alpha", "beta", "gamma", "delta"]);
+    assert!(
+        run.recording
+            .records()
+            .iter()
+            .all(|(_, payload)| !payload.windows(8).any(|w| w == b"overlong")),
+        "the term never reached the sink"
+    );
 }
 
 /// A collection with a sparse space under BM25, whose values must be whole,
@@ -1206,7 +1752,11 @@ fn an_overwrite_keeps_the_record_its_refused_replacement_names() {
                 .unwrap();
             assert_eq!(kept.len(), 1, "{label}: the replaced record is kept");
             assert_eq!(kept[0].vector.as_ref(), Some(&vectors[2]), "{label}");
-            assert_eq!(kept[0].metadata, metadata_for(2), "{label}");
+            assert_eq!(
+                kept[0].metadata,
+                metadata_for(2).into_iter().collect::<BTreeMap<_, _>>(),
+                "{label}"
+            );
 
             let twin = overwrite_collection(sparse);
             add(&twin, (0..10).map(held).collect());
@@ -1258,7 +1808,10 @@ fn an_add_without_overwrite_refuses_a_held_id_and_keeps_its_record() {
         .unwrap();
     assert_eq!(kept.len(), 1, "the held record is kept");
     assert_eq!(kept[0].vector.as_ref(), Some(&vectors[2]));
-    assert_eq!(kept[0].metadata, metadata_for(2));
+    assert_eq!(
+        kept[0].metadata,
+        metadata_for(2).into_iter().collect::<BTreeMap<_, _>>()
+    );
     assert_eq!(run.original.len(), 11);
     assert_eq!(
         run.original.id_counter(),
@@ -1500,12 +2053,23 @@ fn apply_refuses_a_record_that_does_not_belong_to_the_collection() {
     ));
     assert_eq!(collection.m(), 4);
 
-    // A training the collection has not run.
+    // A training that carries nothing it fitted, and one before the
+    // collection has filled its training set.
     mismatch(
         Operation::Train {
             completed_at: "2001-02-03T04:05:06+00:00".into(),
+            fitted: None,
         },
-        "codebook is not fitted",
+        "carries nothing it fitted",
+    );
+    mismatch(
+        Operation::Train {
+            completed_at: "2001-02-03T04:05:06+00:00".into(),
+            fitted: Some(Fitted::Scales {
+                values: vec![1.0; 4],
+            }),
+        },
+        "has not filled its training set",
     );
 
     // Nothing is applied while a sink is attached.
@@ -1625,10 +2189,10 @@ fn replay_reproduces_a_raw_collection_kind_for_kind() {
 }
 
 /// Training fires inside a batch after the checkpoint, in both storage
-/// modes, and the replay retrains from the same records to the same
-/// codebook, the same codes, the same calibration and the same graph, with
-/// the stamp taken from the training's record. The quantized rebuild, a
-/// compaction over codes and an overwrite into the quantized graph follow.
+/// modes, and the replay installs the codebook, the calibration and the
+/// stamp the training's record carries, fitting nothing, to the same codes
+/// and the same graph. The quantized rebuild, a compaction over codes and an
+/// overwrite into the quantized graph follow.
 #[test]
 fn replay_reproduces_training_inside_a_batch() {
     for (mode, seed) in [
@@ -1689,9 +2253,8 @@ fn replay_reproduces_training_inside_a_batch() {
 /// The scalar counterpart of the test above: a checkpoint before the set
 /// fills, training inside a batch, and the mutations after it, replayed
 /// under rule R2 with the scales, the rows and the clipped count among what
-/// is compared. Two builds of the same records reach one codec because the
-/// fit draws nothing, and the rows are a function of the codec and the
-/// records.
+/// is compared. The replay installs the scales the training's record
+/// carries, and the rows are a function of the codec and the records.
 #[test]
 fn replay_reproduces_scalar_training_inside_a_batch() {
     let vectors = clustered(1400, 16, 0x0015_7b20);
@@ -1758,6 +2321,125 @@ fn replay_reproduces_scalar_training_inside_a_batch() {
     }
     assert!(run.original.training_completed_at().is_some());
     assert!(run.original.int8_codec().is_some());
+}
+
+/// A training's record is held to the collection before anything is
+/// installed: the quantizer it carries is the one the collection declares,
+/// at the declared shape, with every value finite and a calibration only
+/// where the collection reranks, and the collection holds its quantizer
+/// unfitted with its set full. Each refusal leaves the collection
+/// untrained, and the record as written installs once.
+#[test]
+fn a_training_record_is_held_to_the_collection() {
+    let vectors = clustered(1000, 8, 0x0219_b002);
+    let declaration = Declaration::validate(8, "l2", 8, 60, 2000, vec![]).unwrap();
+    let quantization = declaration
+        .quantization(2, 4, 1000, None, StorageMode::QuantizedOnly)
+        .unwrap();
+    let mut run = Run::new(Collection::build(declaration, Some(quantization)));
+    run.checkpoint();
+    add(
+        &run.original,
+        (0..1000).map(|i| record(i, &vectors)).collect(),
+    );
+    assert!(run.original.is_quantized());
+    let records = run.recording.records();
+    let train_at = records
+        .iter()
+        .position(|(kind, _)| *kind == OperationKind::Train)
+        .unwrap();
+    let (checkpoint, _) = run.checkpoint.clone().unwrap();
+    let replayed = Collection::load_with(&checkpoint, None).unwrap();
+    for (i, (kind, payload)) in records.iter().enumerate().take(train_at) {
+        replayed.apply(decode(i, *kind, payload, 8)).unwrap();
+    }
+    assert!(!replayed.is_quantized() && replayed.is_training_ready());
+    let (completed_at, fitted) =
+        match decode(train_at, records[train_at].0, &records[train_at].1, 8) {
+            Operation::Train {
+                completed_at,
+                fitted: Some(fitted),
+            } => (completed_at, fitted),
+            other => panic!("{other:?}"),
+        };
+    let Fitted::Codebook {
+        subvectors,
+        centroids,
+        width,
+        values,
+        ..
+    } = fitted.clone()
+    else {
+        panic!("{fitted:?}")
+    };
+    let refused = |fitted: Fitted, expected: &str| match replayed.apply(Operation::Train {
+        completed_at: completed_at.clone(),
+        fitted: Some(fitted),
+    }) {
+        Err(Error::JournalReplayMismatch { detail }) => {
+            assert!(detail.contains(expected), "{detail}")
+        }
+        other => panic!("{other:?}"),
+    };
+    refused(
+        Fitted::Codebook {
+            subvectors: 4,
+            centroids,
+            width: 2,
+            values: values.clone(),
+            calibration: None,
+        },
+        "4 subvectors",
+    );
+    refused(
+        Fitted::Codebook {
+            subvectors,
+            centroids: 8,
+            width,
+            values: values[..2 * 8 * 4].to_vec(),
+            calibration: None,
+        },
+        "8 centroids",
+    );
+    let mut not_finite = values.clone();
+    not_finite[3] = f32::NAN;
+    refused(
+        Fitted::Codebook {
+            subvectors,
+            centroids,
+            width,
+            values: not_finite,
+            calibration: None,
+        },
+        "value 3",
+    );
+    refused(
+        Fitted::Codebook {
+            subvectors,
+            centroids,
+            width,
+            values: values.clone(),
+            calibration: Some("{}".into()),
+        },
+        "keeps no raw vector",
+    );
+    refused(
+        Fitted::Scales {
+            values: vec![1.0; 8],
+        },
+        "declares product quantization",
+    );
+    assert!(!replayed.is_quantized(), "every refusal installed nothing");
+
+    replayed
+        .apply(Operation::Train {
+            completed_at: completed_at.clone(),
+            fitted: Some(fitted.clone()),
+        })
+        .unwrap();
+    assert!(replayed.is_quantized());
+    assert_eq!(replayed.training_completed_at(), Some(completed_at.clone()));
+    refused(fitted, "already fitted");
 }
 
 /// A checkpoint taken after training, on the mode that sheds its raw
@@ -1958,4 +2640,61 @@ fn replay_reproduces_a_sparse_collection() {
     for kind in [Insert, Remove, Compact] {
         assert!(kinds.contains(&kind), "{kind:?} was replayed");
     }
+}
+
+/// A replay moves the generated id counter past every `vec_N` the records
+/// it applies hold, through `apply`, `apply_legacy` and `apply_withdrawn`,
+/// so the next id a collection generates after a replay is one no record it
+/// replayed held.
+#[test]
+fn a_replay_moves_the_generated_id_counter_past_every_id_it_applies() {
+    let declaration = || Declaration::validate(2, "l2", 4, 50, 100, vec![]).unwrap();
+    let script = Collection::build(declaration(), None);
+    let sink = Recording::default();
+    script.attach_sink(Box::new(sink.clone()));
+    let ids: Vec<String> = (0..3).map(|_| script.generate_id()).collect();
+    assert_eq!(ids, ["vec_1", "vec_2", "vec_3"]);
+    let records: Vec<ParsedRecord> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| ParsedRecord {
+            id: id.clone(),
+            vector: vec![i as f32, 1.0],
+            sparse: None,
+            metadata: HashMap::new(),
+        })
+        .collect();
+    add(&script, records);
+    let recorded: Vec<Operation> = sink
+        .records()
+        .into_iter()
+        .enumerate()
+        .map(|(i, (kind, payload))| decode(i, kind, &payload, 2))
+        .collect();
+    assert_eq!(recorded.len(), 3);
+
+    type Apply = fn(&Collection, Operation) -> Result<(), Error>;
+    let paths: [(&str, Apply); 3] = [
+        ("apply", Collection::apply),
+        ("apply_legacy", Collection::apply_legacy),
+        ("apply_withdrawn", Collection::apply_withdrawn),
+    ];
+    let next: Vec<(&str, String)> = paths
+        .into_iter()
+        .map(|(path, apply)| {
+            let replayed = Collection::build(declaration(), None);
+            for operation in recorded.clone() {
+                apply(&replayed, operation).unwrap();
+            }
+            (path, replayed.generate_id())
+        })
+        .collect();
+    assert_eq!(
+        next,
+        [
+            ("apply", "vec_4".to_string()),
+            ("apply_legacy", "vec_4".to_string()),
+            ("apply_withdrawn", "vec_4".to_string()),
+        ]
+    );
 }

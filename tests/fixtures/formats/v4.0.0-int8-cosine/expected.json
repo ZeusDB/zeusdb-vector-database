@@ -1,0 +1,32 @@
+{
+"absent": ["r5"],
+"format_version": "4.0.0",
+"metadata_sha256": "853637c9af2947adf791e6423557bddc3ed7c489c92b8cb718d9ec35446fa588",
+"records": 999,
+"sampled": {
+  "r0": {"metadata": {"i": 0}, "vector": "cfa459be00000000c8a1a63e36d9c0bdf0f920bf7acfdb3eb1a5383e165ff43e"},
+  "r50": {"metadata": {"i": 50}, "vector": "f362ab3eb1c8153f5c2f36beae6dccbec15fecbe8094f5bdd57ac8bd3876af3e"},
+  "r100": {"metadata": {"i": 100}, "vector": "5f1e94be9699f53dd4eaaa3e000000008607e5be7d1a02bf3f9b923eaa0700bf"},
+  "r150": {"metadata": {"i": 150}, "vector": "d28b79be1e11823d27c37a3e107a413f000000003dd5f53da81fd83eb6fbabbe"},
+  "r200": {"metadata": {"i": 200}, "vector": "dc12d23e23d1a53e3448d4bdcc0a343f42de33be60e2933ecfed4f3e546e833e"},
+  "r250": {"metadata": {"i": 250}, "vector": "b8fababd71ab32bf98275c3eb18d233ea09e4abe657f193fb1391a3e7657db3d"},
+  "r300": {"metadata": {"i": 300}, "vector": "66a5b63ec7a4b73e4a9d26beefbe1bbe0f79193f2658a9be36f0e23eba0d2fbe"},
+  "r350": {"metadata": {"i": 350}, "vector": "2fa1d13e443ec23e7abe8f3e36cf31bdcfa9cdbec0c4233fd4e975bccfba443e"},
+  "r400": {"metadata": {"i": 400}, "vector": "9985fcbe306366bc46b5b53c1516fcbe6d8f513de4e6353fe892383d7a4083bd"},
+  "r450": {"metadata": {"i": 450}, "vector": "ee2ee6be2d7c243f17e454bdca08c9be70e63b3e8381e7bc5ecdc8bd12aedbbe"},
+  "r500": {"metadata": {"i": 500}, "vector": "1d1d94be123e893eb4ba88be76121ebf0c71a13e77f8fcbe5f0bd83d7c8645be"},
+  "r550": {"metadata": {"i": 550}, "vector": "8365c6be70703bbe7546d43de392ed3cb4145d3f19d6e63d276df6bd8289363e"},
+  "r600": {"metadata": {"i": 600}, "vector": "80bd78bd3dacc93efdb213bfb42ea3bdb8a5513ebe2a2bbf5543a93d517ca0bd"},
+  "r650": {"metadata": {"i": 650}, "vector": "bb94f9bb6df1fc3e51cc2ebe3df2c83e1b4eb4bcf3db173e5146b9bddd793c3f"},
+  "r700": {"metadata": {"i": 700}, "vector": "5e75133e906625bfd53f97bdb5b50c3e35baa0be2d7b49bdbd73e6be9da2f73e"},
+  "r750": {"metadata": {"i": 750}, "vector": "45eeaa3da394493f7044723c6d3f6d3cfdad153d3e7a153f681d123e3a29ccbd"},
+  "r800": {"metadata": {"i": 800}, "vector": "18f0313edd08013ffe62adbe736922bf66d9b2bda330d7bd081fb0bec91c7e3e"},
+  "r850": {"metadata": {"i": 850}, "vector": "e764da3d5a3a26be4ce83fbf85f8053ec79901bf8ca2103dd39ae7bd0704ac3e"},
+  "r900": {"metadata": {"i": 900}, "vector": "6868083faa1fe73d45e8173fea12ab3e454370bc2f7e6e3e964d1a3dc173db3e"},
+  "r950": {"metadata": {"i": 950}, "vector": "9c9079bd53a2e33e4163a33eeefae2be85d44abecb8aadbc71f20abf5097d03e"}
+},
+"shape": {"dim": 8, "m": 4, "quantization": {"training_size": 1000, "type": "int8"}, "space": "cosine", "text": false},
+"term_count": null,
+"vectors_sha256": "50e91eacc68ea004fef35e26d266ef3eca3269b63452b3ace6496d8c8c2028ce",
+"zeusdb_version": "0.13.0"
+}

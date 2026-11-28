@@ -1,0 +1,12 @@
+{
+  "dim": 8,
+  "space": "l2",
+  "m": 16,
+  "ef_construction": 200,
+  "expected_size": 200,
+  "id_counter": 120,
+  "vector_count": 120,
+  "generated_ids": 0,
+  "metadata": {},
+  "indexed_fields": []
+}

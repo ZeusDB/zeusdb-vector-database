@@ -32,9 +32,18 @@
 //!
 //! An admit set the index can enumerate whose count is at or under
 //! [`FULL_SCAN_THRESHOLD`] is scored exactly, record by record, from the
-//! graph's own store or from the reconstruction of the record's codes where
-//! the store holds none. Everything else traverses the graph under the admit
-//! set as a predicate. The collection decides what the admit set is, being a
+//! graph's own store. So is a set admitting every record where a node is
+//! stranded and the index holds fewer records than the search's width, the
+//! larger of its `ef` and its `k`, which a traversal could never fill its
+//! heap from; see
+//! [`DenseIndex::scans_every_record`]. The scan scores the raw vector, the
+//! scalar row, or the product quantized codes through the kernel and the
+//! query table a traversal uses. A graph that keeps raw vectors beside its
+//! codes is scored by its codes unless the caller rescores the page against
+//! the raw vectors, so a record takes the score a traversal's page or a
+//! rescored page gives it; see `DenseIndex::score_exact`. Everything else
+//! traverses the graph under the admit set as a predicate. The collection
+//! decides what the admit set is, being a
 //! filter's bitmap, the matches of a metadata walk, or a conjunction of a
 //! bound and a predicate, and the threshold is applied here, so the rule is
 //! stated once whatever built the set.
@@ -62,9 +71,10 @@
 //! is the memory it touches and a kernel timed in a loop runs from cache:
 //! at width 100 a search at `ef` 200 cost as much as eleven thousand kernel
 //! evaluations and visited about a thousand nodes. Both units are timed
-//! over records scattered across the store, under a bitmap test per
-//! candidate as a filtered search pays, and the search is asked for a
-//! vector the graph does not hold. An exact scan is priced per
+//! over records scattered across the store, the kernel under a bitmap test
+//! per record and the search on the traversal a search admitting every
+//! record runs on the graph, and the search is asked for a vector the graph
+//! does not hold. An exact scan is priced per
 //! record from the kernel. A filtered traversal grows as the admitted share
 //! falls, from two measured points. An index too small to time takes a
 //! compiled-in floor for each.
@@ -81,10 +91,10 @@ use std::sync::Arc;
 
 use tracing::error;
 use zeusdb_vector_core::{
-    restore_graph, restore_int8_graph, Admit, ArtefactRecord, Bitmap, Bounds, Budget, Cost, Dense,
-    Dir, DumpBounds, Error, Hit, Hits, Int8Codec, Inventory, Ledger, Persist, Planned, Position,
-    Prepared, Record, RecordId, Restore, ScoreKind, Selectivity, VectorGraph, VectorIndex,
-    DUMP_FILENAME, PQ,
+    restore_graph, restore_int8_graph, Admit, ArtefactRecord, Bitmap, Bounds, Budget, CodeScores,
+    Cost, Dense, Dir, DumpBounds, DumpRefusal, DumpRegion, DumpRows, Error, Hit, Hits, Int8Codec,
+    Inventory, Ledger, Persist, Planned, Position, Prepared, Record, RecordId, Restore, Restored,
+    ScoreKind, Selectivity, VectorGraph, VectorIndex, DUMP_FILENAME, PQ,
 };
 
 /// The empty marker, being a position that holds no record or a node that
@@ -116,55 +126,11 @@ impl<'a> IdsByPosition<'a> {
         debug_assert!(node == NONE || (node as usize) < self.origin_ids.len());
         self.origin_ids.get(node as usize).copied()
     }
-
-    /// The reader, chosen once, for a pass over many positions that matches
-    /// on it and runs a loop compiled for each answer, so neither loop tests
-    /// what the other needs.
-    pub(crate) fn reader(&self) -> PositionReader<'a> {
-        if self.shifted {
-            PositionReader::Shifted {
-                extent: self.node_at.len(),
-            }
-        } else {
-            PositionReader::Read {
-                node_at: self.node_at,
-                origin_ids: self.origin_ids,
-            }
-        }
-    }
 }
 
-/// One of the two ways [`IdsByPosition`] answers, chosen once for a pass.
-#[derive(Clone, Copy)]
-pub(crate) enum PositionReader<'a> {
-    /// Every position below `extent` holds a record whose internal id is
-    /// one past its position.
-    Shifted { extent: usize },
-    /// The node for each position and the graph's origin id for each node.
-    Read {
-        node_at: &'a [u32],
-        origin_ids: &'a [usize],
-    },
-}
-
-/// The internal id of the record at `at` under [`PositionReader::Shifted`].
-pub(crate) fn shifted_internal_id(extent: usize, at: usize) -> Option<usize> {
-    (at < extent).then_some(at + 1)
-}
-
-/// The internal id of the record at `at` under [`PositionReader::Read`],
-/// being the origin id of its node.
-///
-/// A hole's node is [`NONE`], which lies past every node the graph holds,
-/// so the bound of the origin ids answers for it.
-pub(crate) fn read_internal_id(node_at: &[u32], origin_ids: &[usize], at: usize) -> Option<usize> {
-    let node = *node_at.get(at)?;
-    debug_assert!(node == NONE || (node as usize) < origin_ids.len());
-    origin_ids.get(node as usize).copied()
-}
-
+use super::query::AdmitShape;
 use super::search::FULL_SCAN_THRESHOLD;
-use crate::{prepare_reconstruction, raw_distance_fn, reconstruction_needs_unit, RawVectors};
+use crate::{raw_distance_fn, RawVectors};
 
 /// The target every record this file emits carries, being the search
 /// module's, since the records here are the ones the traversal emitted from
@@ -499,6 +465,10 @@ impl DenseIndex {
         let mut every = true;
         for (node, record) in self.graph.records_mut().iter_mut().enumerate() {
             let at = *record as usize;
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a node index, held below 2^31 by append_node and loading_layout"
+            )]
             if *record != NONE && held.contains(at) && node_at[at] == NONE {
                 node_at[at] = node as u32;
                 placed += 1;
@@ -562,6 +532,10 @@ impl DenseIndex {
         let mut node_at = Vec::with_capacity(self.node_at.capacity().min(kept));
         let mut records = Vec::with_capacity(self.graph.record_capacity());
         records.extend_from_slice(self.graph.records());
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a position, below MAX_INTERNAL_ID, refused at admit and at load"
+        )]
         for (k, &old) in old_of_new.iter().enumerate() {
             let node = self.node_at[old as usize];
             node_at.push(node);
@@ -680,6 +654,10 @@ impl DenseIndex {
                 continue;
             }
             held += 1;
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a position, below MAX_INTERNAL_ID, refused at admit and at load"
+            )]
             if records.get(node as usize) != Some(&(at as u32)) {
                 return false;
             }
@@ -691,6 +669,10 @@ impl DenseIndex {
         }
         let filed = records.iter().filter(|&&position| position != NONE).count();
         let every = filed == records.len();
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a node index, held below 2^31 by append_node and loading_layout"
+        )]
         let back = records.iter().enumerate().all(|(node, &position)| {
             position == NONE || self.node_at.get(position as usize) == Some(&(node as u32))
         });
@@ -699,13 +681,14 @@ impl DenseIndex {
 
     /// Time the two units on a graph that is not yet installed, so a
     /// replacement is measured with no guard held. The kernel over records
-    /// scattered across the store, and a whole search per unit of `ef`, both
-    /// under a bitmap test, which is the predicate's cost without its
-    /// outcome. The bitmap holds every number below the node count. The
-    /// kernel's test is asked about a node, and the search's about the
-    /// position a candidate's node holds its record at, which is below the
-    /// node count for every record the graph holds. So each test admits every
-    /// record, and the search's refuses a stranded node's marker alone.
+    /// scattered across the store, under a bitmap test, which is the
+    /// predicate's cost without its outcome: the bitmap holds every number
+    /// below the node count and is asked about a node, so it admits every
+    /// node. And a whole search per unit of `ef`, which is the traversal a
+    /// search admitting every record runs on this graph: no predicate where
+    /// every node holds a record, and the test of the empty marker where a
+    /// node is stranded, asked about the position each candidate's node holds
+    /// its record at. See [`DenseIndex::traverse`].
     pub(crate) fn time_graph(graph: &VectorGraph) -> Option<(f64, f64)> {
         let nodes = graph.nb_points();
         if nodes < CALIBRATION_MIN_NODES {
@@ -728,14 +711,39 @@ impl DenseIndex {
         let distance_ns = graph
             .time_distance_ns(CALIBRATION_EVALUATIONS, CALIBRATION_ROUNDS, &admits)
             .filter(|ns| ns.is_finite() && *ns > 0.0)?;
-        let search_ns = graph
-            .time_search_ns(
+        // A fold rather than `any`, so the pass has no early exit and runs
+        // as a vector compare over the positions.
+        let stranded = graph
+            .records()
+            .iter()
+            .fold(false, |found, &at| found | (at == NONE));
+        let search_ns = if stranded {
+            let none = NONE as usize;
+            let live = |at: &usize| {
+                let admitted = *at != none;
+                #[cfg(test)]
+                TIMING_ANSWERS.with(|answers| {
+                    if let Some(answers) = answers.borrow_mut().as_mut() {
+                        answers.push((*at, admitted));
+                    }
+                });
+                admitted
+            };
+            graph.time_search_ns(
                 CALIBRATION_SEARCH_K,
                 CALIBRATION_SEARCH_EF,
                 CALIBRATION_SEARCHES,
-                &admits,
+                Some(&live),
             )
-            .filter(|ns| ns.is_finite() && *ns > 0.0)?;
+        } else {
+            graph.time_search_ns(
+                CALIBRATION_SEARCH_K,
+                CALIBRATION_SEARCH_EF,
+                CALIBRATION_SEARCHES,
+                None::<&fn(&usize) -> bool>,
+            )
+        }
+        .filter(|ns| ns.is_finite() && *ns > 0.0)?;
         Some((distance_ns, search_ns / CALIBRATION_SEARCH_EF as f64))
     }
 
@@ -792,38 +800,139 @@ impl DenseIndex {
         }
     }
 
-    /// The distance from `query` to the record one node holds, on the raw
-    /// scale.
+    /// Whether a search admitting every record, at width `ef` for `k`
+    /// results, scores the records the index holds rather than traversing,
+    /// which it does where a node is stranded and fewer records are held than
+    /// the width its traversal runs at, being the larger of `ef` and `k` by
+    /// the core graph's `search`.
     ///
-    /// The stored raw vector where the graph holds one and the reconstruction
-    /// from the record's codes where it does not, normalised first where the
-    /// space requires it. A record holding neither cannot exist, since every
-    /// insertion writes one or the other, and is sorted last.
+    /// A traversal there can never fill its heap, so it visits every node it
+    /// reaches, the stranded ones among them, and it misses a record whose
+    /// node no traversal from the entry point reaches. The scan scores each
+    /// record the index holds once, on the exact path a small admit set
+    /// takes.
+    pub(crate) fn scans_every_record(&self, ef: usize, k: usize) -> bool {
+        !self.every_node_live && self.live_count < ef.max(k)
+    }
+
+    /// Every position the index holds a record at, in increasing order.
+    fn held_positions(&self) -> Vec<Position> {
+        self.node_at
+            .iter()
+            .enumerate()
+            .filter(|&(_, &node)| node != NONE)
+            .map(|(at, _)| Position::from_slot(at))
+            .collect()
+    }
+
+    /// What a search under an admit set of `shape` costs at `budget`, and
+    /// whether its page is exact, priced on the path
+    /// [`VectorIndex::search`] takes. That is one evaluation a record held
+    /// where a search admitting every record scores the records, and
+    /// otherwise [`DenseIndex::cost_at`] at the width the traversal runs at,
+    /// being the larger of the budget's `ef` and `k` by the core graph's
+    /// `search`.
+    pub(crate) fn cost_under(
+        &self,
+        _query: &[f32],
+        k: usize,
+        shape: &AdmitShape,
+        budget: &Budget,
+    ) -> Cost {
+        let ef = budget.ef.unwrap_or_else(|| self.default_ef(k));
+        if matches!(shape, AdmitShape::All) && self.scans_every_record(ef, k) {
+            return Cost {
+                work_ns: self.live_count as f64 * self.units.distance_ns,
+                exact: true,
+            };
+        }
+        self.cost_at(ef.max(k), shape.selectivity().as_ref())
+    }
+
+    /// What a search admitting `admitted` costs where its traversal runs at
+    /// width `ef`: an exact scan of the admitted records where they are few
+    /// enough to be scanned, and otherwise `ef` units of traversal, divided by
+    /// the admitted share where a filter applies.
+    fn cost_at(&self, ef: usize, admitted: Option<&Selectivity>) -> Cost {
+        let ef = ef as f64;
+        match admitted {
+            Some(selectivity) if (selectivity.expected as usize) <= FULL_SCAN_THRESHOLD => Cost {
+                work_ns: selectivity.expected as f64 * self.units.distance_ns,
+                exact: true,
+            },
+            Some(selectivity) => {
+                let live = self.live_count.max(1) as f64;
+                let share = (selectivity.expected as f64 / live).clamp(1e-3, 1.0);
+                Cost {
+                    work_ns: ef * self.units.ef_ns / share.powf(SELECTIVITY_EXPONENT),
+                    exact: false,
+                }
+            }
+            None => Cost {
+                work_ns: ef * self.units.ef_ns,
+                exact: false,
+            },
+        }
+    }
+
+    /// The distance from `query` to the record one node holds, scored from
+    /// the vector or the row the node stores.
+    ///
+    /// The stored raw vector where the graph holds one, on the raw scale.
+    /// Otherwise the graph's own kernel over the record's scalar row, which
+    /// is what a traversal scores the node with, so the scan and the
+    /// traversal give a record the same bits. A record the scan scores by
+    /// its product quantized codes is [`DenseIndex::coded_distance_at`]'s. A
+    /// record holding neither cannot reach here, since every insertion
+    /// writes one, and is sorted last.
     fn exact_distance_at(
         &self,
         query: &[f32],
         node: u32,
         distance: fn(&[f32], &[f32]) -> f32,
-        needs_unit: bool,
     ) -> f32 {
         if let Some(stored) = self.graph.raw_vector_at(node) {
             return distance(query, stored);
         }
-        // A scalar row is scored through the graph's own kernel, so the exact
-        // scan and the traversal agree bit for bit and the page is on the
-        // scale the kernel already puts it on.
-        if let Some(scored) = self.graph.int8_distance_at(query, node) {
-            return scored;
-        }
-        let reconstructed = self
-            .graph
-            .codes_at(node)
-            .and_then(|codes| self.pq.as_ref()?.reconstruct(codes).ok());
-        match reconstructed {
-            Some(reconstructed) => {
-                distance(query, &prepare_reconstruction(needs_unit, reconstructed))
-            }
+        self.graph
+            .int8_distance_at(query, node)
+            .unwrap_or(f32::INFINITY)
+    }
+
+    /// The distance from the query `code_scores` holds the table of to the
+    /// record one node holds, by the product quantized kernel a traversal
+    /// evaluates and on the scale the index reports, so the scan and the
+    /// traversal give a record the same bits. A node the graph does not hold
+    /// is sorted last.
+    #[inline]
+    fn coded_distance_at(&self, code_scores: &CodeScores<'_>, node: u32) -> f32 {
+        match code_scores.at(node) {
+            Some(score) => self.reported(score),
             None => f32::INFINITY,
+        }
+    }
+
+    /// Whether a score of the graph's kernel takes a root on its way to a
+    /// page, which a product quantized l2 graph's does.
+    ///
+    /// That kernel sums a table of squared distances and takes no root,
+    /// since the root is monotone. Every other kernel returns its score on
+    /// the scale the index reports: the product quantized cosine kernel
+    /// makes its own conversion, and a scalar l2 kernel takes the root
+    /// itself.
+    #[inline]
+    fn roots_scores(&self) -> bool {
+        self.graph.is_pq() && self.metric == "l2"
+    }
+
+    /// A score of the graph's kernel on the scale the index reports, for the
+    /// exact scan. See [`DenseIndex::roots_scores`] and [`rooted`].
+    #[inline]
+    fn reported(&self, score: f32) -> f32 {
+        if self.roots_scores() {
+            rooted(score)
+        } else {
+            score
         }
     }
 
@@ -832,26 +941,52 @@ impl DenseIndex {
     /// The positions arrive in increasing order. Each reads its node from
     /// `node_at`, skips a position that holds no record, and is scored from
     /// the node's vector, scalar row or codes.
+    ///
+    /// A product quantized record is scored by its codes through the
+    /// graph's own kernel, as a traversal scores it, except on a graph that
+    /// keeps raw vectors where `rescored` says the caller rescores the page
+    /// against them, which scores the raw vector, as the rescore does. So a
+    /// record and a query take one score whichever path answers: the raw
+    /// vector's on a rescored page and the codes' on any other.
     fn score_exact(
         &self,
         query: &[f32],
         positions: &[Position],
         k: usize,
         boundary_ties: bool,
+        rescored: bool,
     ) -> Hits {
-        let distance = raw_distance_fn(&self.metric);
-        let needs_unit = reconstruction_needs_unit(&self.metric);
-        let node_at = &self.node_at;
-        let mut scored: Vec<(f32, u32)> = positions
-            .iter()
-            .filter_map(|at| match node_at.get(at.slot()) {
-                Some(&node) if node != NONE => Some((
-                    self.exact_distance_at(query, node, distance, needs_unit),
-                    at.0,
-                )),
-                _ => None,
-            })
-            .collect();
+        // The query's table, where the scan scores codes. A query the table
+        // cannot be made for is answered as the traversal answers it, with
+        // the refusal logged and no record.
+        let codes = if rescored && self.graph.holds_raw() {
+            None
+        } else {
+            self.graph.code_scores(query)
+        };
+        let code_scores = match codes {
+            None => None,
+            Some(Ok(scores)) => Some(scores),
+            Some(Err(e)) => {
+                error!(target: LOG_TARGET, operation = "adc_scan", error = %e, "Graph scan failed");
+                return Hits {
+                    items: Vec::new(),
+                    kind: ScoreKind::Distance,
+                    exact: true,
+                };
+            }
+        };
+        let mut scored = match code_scores.as_ref() {
+            Some(scores) => {
+                self.scored_positions(positions, |node| self.coded_distance_at(scores, node))
+            }
+            None => {
+                let distance = raw_distance_fn(&self.metric);
+                self.scored_positions(positions, |node| {
+                    self.exact_distance_at(query, node, distance)
+                })
+            }
+        };
         scored.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
         let mut end = k.min(scored.len());
         if boundary_ties && end > 0 && end < scored.len() {
@@ -872,6 +1007,24 @@ impl DenseIndex {
             kind: ScoreKind::Distance,
             exact: true,
         }
+    }
+
+    /// Each of `positions` that holds a record, as its node's score by
+    /// `score` and the position, in the order the positions arrive.
+    #[inline]
+    fn scored_positions(
+        &self,
+        positions: &[Position],
+        score: impl Fn(u32) -> f32,
+    ) -> Vec<(f32, u32)> {
+        let node_at = &self.node_at;
+        positions
+            .iter()
+            .filter_map(|at| match node_at.get(at.slot()) {
+                Some(&node) if node != NONE => Some((score(node), at.0)),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Run the traversal under one predicate.
@@ -933,19 +1086,11 @@ impl DenseIndex {
                 score: hit.distance,
             })
             .collect();
-        // Put a product quantized l2 index's approximate scores back on the
-        // scale it reports. That scorer sums a table of squared distances and
-        // takes no root, because the root is monotone and would cost one per
-        // evaluation to change nothing, so the root is taken once per
-        // returned candidate here. Cosine arrives already on its own scale,
-        // since its conversion is not monotone in the sum and the scorer has
-        // to make it. A scalar l2 scorer takes the root inside the kernel,
-        // reproducing the raw kernel over the decoded values, so its page is
-        // already on that scale and a second root here would move every
-        // score off it; the condition is the product quantized graph alone.
-        if self.graph.is_pq() && self.metric == "l2" {
+        // Put a product quantized l2 index's scores on the scale it reports,
+        // one root for each returned candidate. See `roots_scores`.
+        if self.roots_scores() {
             for item in &mut items {
-                item.score = item.score.max(0.0).sqrt();
+                item.score = rooted(item.score);
             }
         }
         Hits {
@@ -1007,15 +1152,16 @@ impl DenseIndex {
             .collect()
     }
 
-    /// The score the exact scan gives the record one node holds.
+    /// The score the exact scan gives the record one node holds, on a page
+    /// the caller rescores against the raw vectors where `rescored` is set.
     #[cfg(test)]
-    pub(crate) fn exact_distance_of_node(&self, query: &[f32], node: u32) -> f32 {
-        self.exact_distance_at(
-            query,
-            node,
-            raw_distance_fn(&self.metric),
-            reconstruction_needs_unit(&self.metric),
-        )
+    pub(crate) fn exact_distance_of_node(&self, query: &[f32], node: u32, rescored: bool) -> f32 {
+        if !(rescored && self.graph.holds_raw()) {
+            if let Some(scores) = self.graph.code_scores(query).map(Result::unwrap) {
+                return self.coded_distance_at(&scores, node);
+            }
+        }
+        self.exact_distance_at(query, node, raw_distance_fn(&self.metric))
     }
 
     /// Draw the level the next record's node takes, advancing the graph's
@@ -1129,7 +1275,9 @@ impl VectorIndex<Dense> for DenseIndex {
     /// the graph's, is a refusal: nothing is installed and the record is not
     /// held, so every record the index holds has a node. The graph logs the
     /// cause. No caller reaches it, since the plan takes the record's form
-    /// from the graph.
+    /// from the graph. So is a record the graph has no room for at the level
+    /// it was planned at, which the collection's door and a replay refuse
+    /// before they reach here.
     fn insert(
         &mut self,
         at: Position,
@@ -1153,6 +1301,7 @@ impl VectorIndex<Dense> for DenseIndex {
                 id.0
             )));
         };
+        self.graph.room().take(planned.level())?;
         let record = match (&plan.codes, &plan.row) {
             (Some(codes), _) => Record::Codes {
                 codes,
@@ -1161,6 +1310,10 @@ impl VectorIndex<Dense> for DenseIndex {
             (None, Some(row)) => Record::Int8(row),
             (None, None) => Record::Raw(vector),
         };
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the node count, held below 2^31 by append_node and loading_layout"
+        )]
         let node = self.graph.nb_points() as u32;
         self.graph.install(record, id.slot(), at, planned);
         // A record takes the next position, which `node_at` reaches, but
@@ -1228,36 +1381,43 @@ impl VectorIndex<Dense> for DenseIndex {
                     positions.push(at);
                     true
                 }) {
-                    return Ok(self.score_exact(query, &positions, k, budget.boundary_ties));
+                    return Ok(self.score_exact(
+                        query,
+                        &positions,
+                        k,
+                        budget.boundary_ties,
+                        budget.rescored,
+                    ));
                 }
             }
+        }
+        if admit.admits_all() && self.scans_every_record(ef, k) {
+            return Ok(self.score_exact(
+                query,
+                &self.held_positions(),
+                k,
+                budget.boundary_ties,
+                budget.rescored,
+            ));
         }
         Ok(self.traverse(query, k, ef, admit))
     }
 
-    /// Priced from `ef` and the admitted share, and the query is ignored,
-    /// since a traversal's work does not depend on which vector is asked.
+    /// Priced from the default `ef` for `k` and the admitted share, and the
+    /// query is ignored, since a traversal's work does not depend on which
+    /// vector is asked. See [`DenseIndex::cost_at`].
     fn cost(&self, _query: &[f32], k: usize, admitted: Option<&Selectivity>) -> Cost {
-        let ef = self.default_ef(k) as f64;
-        match admitted {
-            Some(selectivity) if (selectivity.expected as usize) <= FULL_SCAN_THRESHOLD => Cost {
-                work_ns: selectivity.expected as f64 * self.units.distance_ns,
-                exact: true,
-            },
-            Some(selectivity) => {
-                let live = self.live_count.max(1) as f64;
-                let share = (selectivity.expected as f64 / live).clamp(1e-3, 1.0);
-                Cost {
-                    work_ns: ef * self.units.ef_ns / share.powf(SELECTIVITY_EXPONENT),
-                    exact: false,
-                }
-            }
-            None => Cost {
-                work_ns: ef * self.units.ef_ns,
-                exact: false,
-            },
-        }
+        self.cost_at(self.default_ef(k), admitted)
     }
+}
+
+/// The root that puts a product quantized l2 kernel's score, a sum of squared
+/// distances, on the scale the index reports. The traversal's page and the
+/// exact scan both take it here, so a record's score is the same bits on
+/// either path.
+#[inline(always)]
+fn rooted(score: f32) -> f32 {
+    score.max(0.0).sqrt()
 }
 
 /// The positions an index over `graph` reserves, being the nodes the graph
@@ -1326,6 +1486,10 @@ fn numbering_of(graph: &VectorGraph) -> (Vec<u32>, usize, bool) {
     node_at.resize(extent, NONE);
     let mut placed = 0;
     let mut every = true;
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a node index, held below 2^31 by append_node and loading_layout"
+    )]
     for (node, &position) in records.iter().enumerate() {
         if position == NONE {
             every = false;
@@ -1359,6 +1523,10 @@ pub(crate) enum DenseParts {
 
 /// Whether every node `graph` holds holds a record at a position `node_at`
 /// files it under.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "a node index, held below 2^31 by append_node and loading_layout"
+)]
 fn every_node_live(graph: &VectorGraph, node_at: &[u32]) -> bool {
     graph
         .records()
@@ -1413,45 +1581,64 @@ pub(crate) struct DenseOpen {
     /// The fitted scalar codec, where the saved graph was a scalar one.
     pub(crate) int8: Option<Arc<Int8Codec>>,
     pub(crate) keeps_raw: bool,
+    /// The dump version the directory's format requires.
+    pub(crate) version: u32,
+    /// At version 2, read and verify the rows and hand them back without
+    /// building a graph, for a rebuild the caller asked for.
+    pub(crate) rows_only: bool,
 }
 
-impl Restore for DenseIndex {
-    type Config = DenseOpen;
+/// What opening a dense index from its dump gave.
+pub(crate) enum DenseRestored {
+    /// The index over the graph the dump holds, boxed so the open moves a
+    /// pointer to it.
+    Index(Box<DenseIndex>),
+    /// The verified rows of a version 2 dump, where no graph was built from
+    /// it, with why.
+    Rows { rows: DumpRows, reason: String },
+}
 
-    /// Restore the graph the save wrote.
+impl DenseIndex {
+    /// Open the graph the save wrote, or the rows its dump holds.
     ///
     /// The inventory's recorded length is checked before the dump is read,
     /// because a self-consistent dump from a different save of an index of
-    /// the same shape would otherwise pass the dump's own checksums. Every
-    /// error is a reason to rebuild rather than to fail, which the caller
-    /// decides. The reader numbers the nodes against the mappings the bounds
-    /// carry, so each node names its record's position or is stranded, and a
-    /// dump naming no node for a record the mappings hold is refused. The
-    /// index comes back holding no record and the caller files the records at
-    /// those positions; see [`DenseIndex::set_live`].
-    fn restore(
+    /// the same shape would otherwise pass the dump's own checksums. A
+    /// refusal names the region it falls in, and the caller decides whether
+    /// it refuses the load or rebuilds. The reader numbers the nodes against
+    /// the mappings the bounds carry, so each node names its record's
+    /// position or is stranded, and a dump naming no node for a record the
+    /// mappings hold is refused. The index comes back holding no record and
+    /// the caller files the records at those positions; see
+    /// [`DenseIndex::set_live`].
+    pub(crate) fn open_dump(
         config: &DenseOpen,
         prefix: &str,
         dir: &dyn Dir,
         inventory: &dyn Inventory,
         bounds: &Bounds<'_>,
-    ) -> Result<Self, Error> {
+    ) -> Result<DenseRestored, DumpRefusal> {
         let name = dump_name(prefix);
         if let Some(recorded) = inventory.recorded(&name) {
             let found = dir.length(&name).unwrap_or(0);
             if found != recorded.bytes {
-                return Err(Error::Engine(format!(
-                    "the graph dump is {} bytes and manifest.json records it as {}",
-                    found, recorded.bytes
-                )));
+                return Err(DumpRefusal {
+                    region: DumpRegion::Header,
+                    detail: format!(
+                        "the file is {} bytes and manifest.json records {}",
+                        found, recorded.bytes
+                    ),
+                });
             }
         }
         let dump_bounds = DumpBounds {
             min_nodes: bounds.min_records,
             max_origin_id: bounds.max_records,
             positions: Some(bounds.ids_by_position),
+            version: config.version,
+            rows_only: config.rows_only,
         };
-        let (graph, _nodes) = match &config.int8 {
+        let restored = match &config.int8 {
             Some(codec) => restore_int8_graph(
                 dir,
                 &name,
@@ -1474,15 +1661,38 @@ impl Restore for DenseIndex {
                     dump_bounds,
                 )
             }
+        }?;
+        Ok(match restored {
+            Restored::Graph(graph) => DenseRestored::Index(Box::new(DenseIndex::new(
+                *graph,
+                &config.metric,
+                config.dim,
+                config.pq.clone(),
+                config.keeps_raw,
+            ))),
+            Restored::Rows { rows, reason } => DenseRestored::Rows { rows, reason },
+        })
+    }
+}
+
+impl Restore for DenseIndex {
+    type Config = DenseOpen;
+
+    /// Restore the graph the save wrote, through
+    /// [`DenseIndex::open_dump`], a refusal and rows handed back both refused
+    /// in the words of the check that failed.
+    fn restore(
+        config: &DenseOpen,
+        prefix: &str,
+        dir: &dyn Dir,
+        inventory: &dyn Inventory,
+        bounds: &Bounds<'_>,
+    ) -> Result<Self, Error> {
+        match DenseIndex::open_dump(config, prefix, dir, inventory, bounds) {
+            Ok(DenseRestored::Index(index)) => Ok(*index),
+            Ok(DenseRestored::Rows { reason, .. }) => Err(Error::Engine(reason)),
+            Err(refusal) => Err(Error::Engine(refusal.detail)),
         }
-        .map_err(Error::Engine)?;
-        Ok(DenseIndex::new(
-            graph,
-            &config.metric,
-            config.dim,
-            config.pq.clone(),
-            config.keeps_raw,
-        ))
     }
 }
 
@@ -1590,8 +1800,9 @@ mod tests {
     }
 
     /// A small enumerable admit set is scored exactly with the boundary tie
-    /// group kept on request, and a set admitting everything traverses
-    /// under the live set alone.
+    /// group kept on request. A set admitting everything traverses under the
+    /// live set alone at a width no larger than the records held, and with a
+    /// node stranded it is scored exactly at a width above them.
     #[test]
     fn a_small_admit_set_is_scored_exactly_and_everything_traverses() {
         let mut index = index_of(&[
@@ -1626,9 +1837,11 @@ mod tests {
         let ids: Vec<u32> = page.items.iter().map(|h| h.position.0).collect();
         assert_eq!(ids, vec![1, 2, 3], "the removed record 5 is never scored");
 
-        let page = index
-            .search(&query, 10, &Candidates::All, &Budget::default())
-            .unwrap();
+        let narrow = Budget {
+            ef: Some(4),
+            ..Budget::default()
+        };
+        let page = index.search(&query, 4, &Candidates::All, &narrow).unwrap();
         assert!(!page.exact);
         let mut ids: Vec<u32> = page.items.iter().map(|h| h.position.0).collect();
         ids.sort_unstable();
@@ -1636,6 +1849,17 @@ mod tests {
             ids,
             vec![1, 2, 3, 4],
             "the stranded node routes and is never returned"
+        );
+
+        let page = index
+            .search(&query, 10, &Candidates::All, &Budget::default())
+            .unwrap();
+        assert!(page.exact, "four records held under a width of 150");
+        let ids: Vec<u32> = page.items.iter().map(|h| h.position.0).collect();
+        assert_eq!(
+            ids,
+            vec![1, 2, 3, 4],
+            "every record held, by distance and then by position, and the removed record 5 never"
         );
     }
 
@@ -2243,8 +2467,6 @@ mod tests {
             .chain([Position(1 + count as u32 * gap + 7), Position(NONE)])
             .collect();
         positions.sort_unstable();
-        let distance = raw_distance_fn("l2");
-        let needs_unit = reconstruction_needs_unit("l2");
         for (kind, index) in &indexes {
             for q in [3usize, 77, 150] {
                 let query = &vectors[q];
@@ -2255,10 +2477,7 @@ mod tests {
                     })
                     .map(|at| {
                         let node = node_with_origin(index.graph(), at.slot()).unwrap();
-                        (
-                            index.exact_distance_at(query, node, distance, needs_unit),
-                            at.0,
-                        )
+                        (index.exact_distance_of_node(query, node, true), at.0)
                     })
                     .collect();
                 assert_eq!(looked_up.len(), count - count.div_ceil(7), "{kind}");
@@ -2270,7 +2489,7 @@ mod tests {
                         .collect()
                 };
                 for k in [10usize, count] {
-                    let page = index.score_exact(query, &positions, k, false);
+                    let page = index.score_exact(query, &positions, k, false, true);
                     let page: Vec<(u32, u32)> = page
                         .items
                         .iter()
@@ -2281,6 +2500,88 @@ mod tests {
                     assert_eq!(page, bits(&cut), "{kind} query {q} k {k}");
                 }
             }
+        }
+    }
+
+    /// The exact scan scores a product quantized record that keeps no raw
+    /// vector as the traversal scores it, bit for bit, under cosine and under
+    /// l2. Every record a traversal returns scores the same bits by the
+    /// scan, and a traversal wide enough to reach every record answers the
+    /// page the scan answers over the same records, score for score, and
+    /// record for record wherever two neighbours' scores differ.
+    #[test]
+    fn the_exact_scan_scores_a_coded_record_as_the_traversal_scores_it() {
+        let (count, dim) = (600usize, 16usize);
+        let layers = NB_LAYER_MAX as usize;
+        let unit = |v: &[f32]| -> Vec<f32> {
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            v.iter().map(|x| x / norm).collect()
+        };
+        for metric in ["cosine", "l2"] {
+            let raw = zeusdb_vector_core::test_support::clustered(count + 40, dim, 0x0225);
+            let vectors: Vec<Vec<f32>> = if metric == "cosine" {
+                raw.iter().map(|v| unit(v)).collect()
+            } else {
+                raw
+            };
+            let (records, queries) = vectors.split_at(count);
+            let pq = Arc::new(PQ::new(dim, 8, 4, 256, None));
+            pq.train(records).unwrap();
+            let graph = VectorGraph::new_pq(metric, 16, count, layers, 200, pq.clone());
+            let mut index = DenseIndex::new(graph, metric, dim, Some(pq), false);
+            for (k, v) in records.iter().enumerate() {
+                put(&mut index, k as u32, v);
+            }
+            assert!(index.graph().is_pq() && !index.graph().holds_raw());
+            let every: Vec<Position> = (0..count as u32).map(Position).collect();
+
+            let (mut compared, mut pages) = (0usize, 0usize);
+            for (q, query) in queries.iter().enumerate() {
+                // What the traversal returns, each record scored again by
+                // the scan.
+                let traversed = index.traverse_under(query, 50, 200, &Candidates::All);
+                assert_eq!(traversed.items.len(), 50, "{metric} query {q}");
+                for hit in &traversed.items {
+                    let node = index.node_of(hit.position).unwrap();
+                    let scanned = index.exact_distance_of_node(query, node, false);
+                    compared += 1;
+                    assert_eq!(
+                        scanned.to_bits(),
+                        hit.score.to_bits(),
+                        "{metric} query {q}: the scan scores the record at {} as {scanned:e} and \
+                         the traversal as {:e}",
+                        hit.position.0,
+                        hit.score
+                    );
+                }
+
+                // A traversal that reaches every record against the scan of
+                // every record.
+                let wide = index.traverse_under(query, count, 4 * count, &Candidates::All);
+                let scan = index.score_exact(query, &every, count, false, false);
+                assert_eq!(wide.items.len(), count, "{metric} query {q}");
+                assert_eq!(scan.items.len(), count, "{metric} query {q}");
+                for (rank, (a, b)) in wide.items.iter().zip(&scan.items).enumerate() {
+                    assert_eq!(
+                        a.score.to_bits(),
+                        b.score.to_bits(),
+                        "{metric} query {q} rank {rank}: the traversal holds {:e} and the scan \
+                         {:e}",
+                        a.score,
+                        b.score
+                    );
+                    let tied = (rank > 0 && scan.items[rank - 1].score == b.score)
+                        || scan
+                            .items
+                            .get(rank + 1)
+                            .is_some_and(|next| next.score == b.score);
+                    if !tied {
+                        assert_eq!(a.position, b.position, "{metric} query {q} rank {rank}");
+                    }
+                }
+                pages += 1;
+            }
+            assert_eq!((compared, pages), (40 * 50, 40), "{metric}");
         }
     }
 
@@ -2420,11 +2721,10 @@ mod tests {
             .collect()
     }
 
-    /// The reader of each position's internal id, and the form a pass takes
-    /// of it, answer what the node and its origin id answer, at every
-    /// position and past the last, holes included, and the reader takes the
-    /// ids as the positions plus one exactly where they are: no hole, the
-    /// first id one and the last the record count.
+    /// The reader of each position's internal id answers what the node and
+    /// its origin id answer, at every position and past the last, holes
+    /// included, and takes the ids as the positions plus one exactly where
+    /// they are: no hole, the first id one and the last the record count.
     #[test]
     fn each_position_names_the_internal_id_its_node_was_inserted_under() {
         let vectors: Vec<Vec<f32>> = (0..40)
@@ -2434,26 +2734,9 @@ mod tests {
         let check = |index: &DenseIndex, shifted: bool, label: &str| {
             let reader = index.ids_by_position();
             assert_eq!(reader.shifted, shifted, "{label}");
-            assert_eq!(
-                matches!(reader.reader(), PositionReader::Shifted { .. }),
-                shifted,
-                "{label}"
-            );
             let past = index.node_at().len() + 3;
             let read: Vec<Option<usize>> = (0..past).map(|at| reader.get(at)).collect();
             assert_eq!(read, ids_read_twice(index, past), "{label}");
-            let by_pass: Vec<Option<usize>> = match reader.reader() {
-                PositionReader::Shifted { extent } => (0..past)
-                    .map(|at| shifted_internal_id(extent, at))
-                    .collect(),
-                PositionReader::Read {
-                    node_at,
-                    origin_ids,
-                } => (0..past)
-                    .map(|at| read_internal_id(node_at, origin_ids, at))
-                    .collect(),
-            };
-            assert_eq!(by_pass, read, "{label}, the reader a pass takes");
         };
         let forty = || {
             let mut index = DenseIndex::new(graph(), "l2", 2, None, false);
@@ -2532,6 +2815,401 @@ mod tests {
         for at in [4usize, 5] {
             assert!(!index.holds(Position(at as u32)), "{at}");
             assert_eq!(index.raw_vector(at), None, "{at}");
+        }
+    }
+
+    /// The timing search runs the traversal a search admitting every record
+    /// runs on the graph, which with every node holding a record is the
+    /// traversal with no predicate: the timing asks the kernel's questions
+    /// and none for the search.
+    #[test]
+    fn the_timing_search_runs_no_predicate_where_every_node_holds_a_record() {
+        let (count, dim) = (200usize, 8usize);
+        let vectors = zeusdb_vector_core::test_support::clustered(count, dim, 223);
+        let graph = VectorGraph::new_raw("l2", dim, 8, 64, NB_LAYER_MAX as usize, 50);
+        let mut index = DenseIndex::new(graph, "l2", dim, None, false);
+        for (k, v) in vectors.iter().enumerate() {
+            put_at(&mut index, k as u32, 1 + k as u32, v);
+        }
+        assert!(index.every_node_live, "built by insertion alone");
+
+        TIMING_ANSWERS.with(|answers| *answers.borrow_mut() = Some(Vec::new()));
+        let timed = DenseIndex::time_graph(index.graph());
+        let answers = TIMING_ANSWERS
+            .with(|answers| answers.borrow_mut().take())
+            .unwrap();
+        assert!(timed.is_some(), "a graph of {count} nodes is timed");
+        assert_eq!(
+            answers.len(),
+            CALIBRATION_EVALUATIONS * CALIBRATION_ROUNDS,
+            "the kernel's questions and none from the search"
+        );
+    }
+
+    /// Admits one position in fifty-one, asked one at a time. Record `k`
+    /// sits in cluster `k % 50` of the clustered fixture, so the records it
+    /// admits sit in twenty clusters, one in each.
+    struct OneInFiftyOne;
+
+    impl Admit for OneInFiftyOne {
+        fn admits(&self, at: Position) -> bool {
+            at.0 % 51 == 3
+        }
+
+        fn len_hint(&self) -> Option<usize> {
+            None
+        }
+    }
+
+    /// Admits one position in twenty, asked one at a time.
+    struct OneInTwenty;
+
+    impl Admit for OneInTwenty {
+        fn admits(&self, at: Position) -> bool {
+            at.0 % 20 == 4
+        }
+
+        fn len_hint(&self) -> Option<usize> {
+            None
+        }
+    }
+
+    /// A traversal admitting fewer records than its width returns the
+    /// nearest records it admits, `k` of them where it admits as many, at
+    /// every width: through stranded nodes under the empty marker's test,
+    /// and under a bitmap, the table's predicate and both conjunctions, on
+    /// raw, scalar and product quantized graphs. Each admitted record sits
+    /// in a cluster of its own, and each query is an admitted record's own
+    /// vector, so the first record admitted lies at distance zero and every
+    /// candidate after it lies farther. Asked for all twenty at each width at
+    /// or above twenty, the page holds every admitted record. On the raw and
+    /// the scalar graph the page at a width at or above the admitted count is
+    /// the exact scan's, positions and score bits both, since the scan scores
+    /// with the traversal's own kernel.
+    ///
+    /// A second raw graph, built at `m` 2 and `ef_construction` 16 over
+    /// clustered records in two dimensions with one record in twenty
+    /// admitted, is asked for ten at widths of forty and four hundred from
+    /// every record not admitted, under each of the five admit sets. Many of
+    /// those traversals hold ten admitted records before they reach one of
+    /// the nearest ten, so the page is the exact scan's only where the
+    /// traversal goes on until its heap holds the width.
+    #[test]
+    fn a_traversal_admitting_few_records_returns_the_nearest_it_admits() {
+        let (count, dim) = (1_000usize, 8usize);
+        let vectors = zeusdb_vector_core::test_support::clustered(count, dim, 0x0223);
+        let codec = Arc::new(Int8Codec::fit(dim, &vectors).unwrap());
+        let pq = Arc::new(PQ::new(dim, 4, 4, 16, None));
+        pq.train(&vectors).unwrap();
+        let layers = NB_LAYER_MAX as usize;
+        let graph_of = |kind: &str| -> (VectorGraph, Option<Arc<PQ>>, bool) {
+            match kind {
+                "raw" => (
+                    VectorGraph::new_raw("l2", dim, 8, 64, layers, 50),
+                    None,
+                    false,
+                ),
+                "int8" => (
+                    VectorGraph::new_int8("l2", 8, 64, layers, 50, codec.clone()),
+                    None,
+                    false,
+                ),
+                "pq" => (
+                    VectorGraph::new_pq("l2", 8, 64, layers, 50, pq.clone()),
+                    Some(pq.clone()),
+                    false,
+                ),
+                _ => {
+                    let mut graph = VectorGraph::new_pq("l2", 8, 64, layers, 50, pq.clone());
+                    graph.open_raw_store(dim, 64).unwrap();
+                    (graph, Some(pq.clone()), true)
+                }
+            }
+        };
+        let index_of_kind = |kind: &str| {
+            let (graph, pq, keeps_raw) = graph_of(kind);
+            let mut index = DenseIndex::new(graph, "l2", dim, pq, keeps_raw);
+            for (k, v) in vectors.iter().enumerate() {
+                put(&mut index, 1 + k as u32, v);
+            }
+            index
+        };
+        let admitted: Vec<Position> = (1..=count as u32)
+            .filter(|at| at % 51 == 3)
+            .map(Position)
+            .collect();
+        assert_eq!(admitted.len(), 20);
+        let mut bitmap = Bitmap::with_slots(count + 1);
+        for at in &admitted {
+            bitmap.insert(at.slot());
+        }
+        for kind in ["raw", "int8", "pq", "pq with raw"] {
+            let full = index_of_kind(kind);
+            let mut stranded = index_of_kind(kind);
+            for at in 1..=count as u32 {
+                if at % 51 != 3 {
+                    stranded.remove(Position(at)).unwrap();
+                }
+            }
+            assert!(!stranded.every_node_live);
+            let cases: [(&str, &DenseIndex, &dyn Admit); 5] = [
+                ("stranded", &stranded, &Candidates::All),
+                ("bitmap", &full, &bitmap),
+                ("table", &full, &OneInFiftyOne),
+                ("bitmap and table", &full, &And(&bitmap, &OneInFiftyOne)),
+                ("table and bitmap", &full, &And(&OneInFiftyOne, &bitmap)),
+            ];
+            let exact_kernel = matches!(kind, "raw" | "int8");
+            for (case, index, admit) in cases {
+                for at in &admitted {
+                    let query = &vectors[at.slot() - 1];
+                    let exact = bits_of(&index.score_exact(query, &admitted, 10, false, true));
+                    let every = bits_of(&index.score_exact(query, &admitted, 20, false, true));
+                    for ef in [10, 20, 40, 400] {
+                        let page = index.traverse_under(query, 10, ef, admit);
+                        let label = format!("{kind} {case} query {} width {ef}", at.0);
+                        assert_eq!(page.items.len(), 10, "{label}");
+                        assert!(
+                            page.items.iter().all(|hit| hit.position.0 % 51 == 3),
+                            "{label}"
+                        );
+                        if exact_kernel && ef >= admitted.len() {
+                            assert_eq!(bits_of(&page), exact, "{label}");
+                        }
+                        if ef >= admitted.len() {
+                            let page = index.traverse_under(query, 20, ef, admit);
+                            let label = format!("{label}, every admitted record");
+                            assert_eq!(page.items.len(), 20, "{label}");
+                            assert!(
+                                page.items.iter().all(|hit| hit.position.0 % 51 == 3),
+                                "{label}"
+                            );
+                            if exact_kernel {
+                                assert_eq!(bits_of(&page), every, "{label}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let sparse = zeusdb_vector_core::test_support::clustered(400, 2, 0x0223);
+        let sparse_index = || {
+            let graph = VectorGraph::new_raw("l2", 2, 2, 64, layers, 16);
+            let mut index = DenseIndex::new(graph, "l2", 2, None, false);
+            for (k, v) in sparse.iter().enumerate() {
+                put(&mut index, 1 + k as u32, v);
+            }
+            index
+        };
+        let full = sparse_index();
+        let mut stranded = sparse_index();
+        let admitted: Vec<Position> = (1..=400u32)
+            .filter(|at| at % 20 == 4)
+            .map(Position)
+            .collect();
+        assert_eq!(admitted.len(), 20);
+        for at in (1..=400u32).filter(|at| at % 20 != 4) {
+            stranded.remove(Position(at)).unwrap();
+        }
+        let mut bitmap = Bitmap::with_slots(401);
+        for at in &admitted {
+            bitmap.insert(at.slot());
+        }
+        let cases: [(&str, &DenseIndex, &dyn Admit); 5] = [
+            ("stranded", &stranded, &Candidates::All),
+            ("bitmap", &full, &bitmap),
+            ("table", &full, &OneInTwenty),
+            ("bitmap and table", &full, &And(&bitmap, &OneInTwenty)),
+            ("table and bitmap", &full, &And(&OneInTwenty, &bitmap)),
+        ];
+        for (case, index, admit) in cases {
+            for at in (1..=400u32).filter(|at| at % 20 != 4) {
+                let query = &sparse[at as usize - 1];
+                let exact = bits_of(&index.score_exact(query, &admitted, 10, false, true));
+                for ef in [40, 400] {
+                    let page = index.traverse_under(query, 10, ef, admit);
+                    assert_eq!(
+                        bits_of(&page),
+                        exact,
+                        "sparse graph {case} query {at} width {ef}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A search admitting every record, on an index holding fewer records
+    /// than its width with a node stranded, scores every record held, so it
+    /// returns a record whose node no traversal from the entry point reaches.
+    ///
+    /// Six records lie one from a hub, at the top vertex of an icosahedron and
+    /// its five neighbours, so each lies more than sixty degrees from every
+    /// other, and eight lie a hundred behind the hub. Each of the six selects
+    /// the hub alone, the hub's list holds the only link to each, and at its
+    /// budget of four the hub drops a link no other list holds, leaving a
+    /// record no list names. The graph's own traversal admitting every node,
+    /// as wide as the graph, does not return that record. Once a node is
+    /// stranded the index scores the records it holds, and the search returns
+    /// that record first, at distance zero.
+    #[test]
+    fn a_search_admitting_every_record_returns_one_no_traversal_reaches() {
+        let phi = (1.0 + 5f32.sqrt()) / 2.0;
+        let unit = |v: [f32; 3]| {
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            vec![v[0] / norm, v[1] / norm, v[2] / norm]
+        };
+        let top = unit([0.0, 1.0, phi]);
+        let mut vectors: Vec<Vec<f32>> = (0..8)
+            .map(|k| {
+                vec![
+                    -100.0 * top[0] + k as f32 * 0.5,
+                    -100.0 * top[1],
+                    -100.0 * top[2],
+                ]
+            })
+            .collect();
+        vectors.push(vec![0.0, 0.0, 0.0]);
+        for v in [
+            [0.0, 1.0, phi],
+            [0.0, -1.0, phi],
+            [1.0, phi, 0.0],
+            [-1.0, phi, 0.0],
+            [phi, 0.0, 1.0],
+            [-phi, 0.0, 1.0],
+        ] {
+            vectors.push(unit(v));
+        }
+        let graph = VectorGraph::new_raw("l2", 3, 2, 16, NB_LAYER_MAX as usize, 16);
+        let mut index = DenseIndex::new(graph, "l2", 3, None, false);
+        for (i, v) in vectors.iter().enumerate() {
+            put(&mut index, i as u32 + 1, v);
+        }
+        let nodes = index.graph().nb_points();
+        let unreached: Vec<u32> = (1..=vectors.len() as u32)
+            .filter(|&id| {
+                index
+                    .graph()
+                    .search(
+                        &vectors[id as usize - 1],
+                        nodes,
+                        nodes,
+                        None::<&fn(&usize) -> bool>,
+                    )
+                    .unwrap()
+                    .iter()
+                    .all(|hit| hit.position != id as usize)
+            })
+            .collect();
+        assert!(
+            !unreached.is_empty(),
+            "every record is reached from the entry point"
+        );
+
+        index.remove(Position(1)).unwrap();
+        assert!(!index.every_node_live);
+        for &id in &unreached {
+            let page = index
+                .search(
+                    &vectors[id as usize - 1],
+                    10,
+                    &Candidates::All,
+                    &Budget::default(),
+                )
+                .unwrap();
+            assert!(
+                page.exact,
+                "record {id}: the {} records held under a width of 150 are scored",
+                index.len()
+            );
+            assert_eq!(
+                (page.items[0].position.0, page.items[0].score),
+                (id, 0.0),
+                "record {id}, which no traversal reaches, is returned first"
+            );
+        }
+    }
+
+    /// A search admitting every record whose `ef` is below the record count
+    /// and whose `k` is above it, on an index with a node stranded, scores
+    /// every record held, since its traversal runs at the larger of the two
+    /// and could not fill its heap. It returns a record whose node no
+    /// traversal from the entry point reaches.
+    #[test]
+    fn a_search_whose_k_is_above_the_records_held_scans_whatever_its_ef() {
+        let phi = (1.0 + 5f32.sqrt()) / 2.0;
+        let unit = |v: [f32; 3]| {
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            vec![v[0] / norm, v[1] / norm, v[2] / norm]
+        };
+        let top = unit([0.0, 1.0, phi]);
+        let mut vectors: Vec<Vec<f32>> = (0..8)
+            .map(|k| {
+                vec![
+                    -100.0 * top[0] + k as f32 * 0.5,
+                    -100.0 * top[1],
+                    -100.0 * top[2],
+                ]
+            })
+            .collect();
+        vectors.push(vec![0.0, 0.0, 0.0]);
+        for v in [
+            [0.0, 1.0, phi],
+            [0.0, -1.0, phi],
+            [1.0, phi, 0.0],
+            [-1.0, phi, 0.0],
+            [phi, 0.0, 1.0],
+            [-phi, 0.0, 1.0],
+        ] {
+            vectors.push(unit(v));
+        }
+        let graph = VectorGraph::new_raw("l2", 3, 2, 16, NB_LAYER_MAX as usize, 16);
+        let mut index = DenseIndex::new(graph, "l2", 3, None, false);
+        for (i, v) in vectors.iter().enumerate() {
+            put(&mut index, i as u32 + 1, v);
+        }
+        let nodes = index.graph().nb_points();
+        let unreached: Vec<u32> = (1..=vectors.len() as u32)
+            .filter(|&id| {
+                index
+                    .graph()
+                    .search(
+                        &vectors[id as usize - 1],
+                        nodes,
+                        nodes,
+                        None::<&fn(&usize) -> bool>,
+                    )
+                    .unwrap()
+                    .iter()
+                    .all(|hit| hit.position != id as usize)
+            })
+            .collect();
+        assert!(
+            !unreached.is_empty(),
+            "every record is reached from the entry point"
+        );
+
+        index.remove(Position(1)).unwrap();
+        assert!(!index.every_node_live);
+        let held = index.len();
+        let budget = Budget {
+            ef: Some(5),
+            ..Budget::default()
+        };
+        assert!(5 < held && held < 20, "ef below the records held, k above");
+        for &id in &unreached {
+            let page = index
+                .search(&vectors[id as usize - 1], 20, &Candidates::All, &budget)
+                .unwrap();
+            assert!(
+                page.exact,
+                "record {id}: the {held} records held under an ef of 5 and a k of 20 are scored"
+            );
+            assert_eq!(
+                (page.items[0].position.0, page.items[0].score),
+                (id, 0.0),
+                "record {id}, which no traversal reaches, is returned first"
+            );
         }
     }
 }

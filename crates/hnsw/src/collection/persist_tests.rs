@@ -4,22 +4,27 @@
 //! same page: a dense space alone, a dense and a sparse space, and both with
 //! a text layer. What the directory holds, what the manifest declares, what
 //! an older reader would meet, and what a tokenizer the engine cannot write
-//! down does to a load.
+//! down does to a load. And what runs beside a save held between two of its
+//! phases.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
 use zeusdb_vector_core::{
-    compile_filter, Error, FsDir, IdfScope, Operation, Position, SparseVector, VectorGraph,
-    VectorIndex, DUMP_FILENAME, NB_LAYER_MAX,
+    compile_filter, pause_arm, pause_disarm, Error, FsDir, IdfScope, KillPoint, Operation, Pause,
+    PauseAt, PauseState, Position, SparseVector, VectorGraph, VectorIndex, DUMP_FILENAME,
+    NB_LAYER_MAX,
 };
 use zeusdb_vector_sparse::{SparseConfig, Weighting};
 use zeusdb_vector_text::{SimpleTokenizer, Tokenizer, TokenizerConfig};
 
-use super::{Collection, Declaration, ParsedRecord, SpaceConfig, SparseHalf};
+use super::journal_support::{answer_after, say_waits, waited_among, Said};
+use super::{Collection, Declaration, ParsedRecord, SpaceConfig, SparseHalf, StorageMode};
 use crate::journal::Durability;
+use crate::locks::lock_name;
 
 /// A directory under the system's temporary directory, removed on drop.
 struct TempDir(std::path::PathBuf);
@@ -177,7 +182,7 @@ fn a_dense_only_directory_keeps_the_flat_names() {
     let path = dir.path().join("dense.zdb");
     collection.save(path.to_str().unwrap()).unwrap();
     let m = manifest(&path);
-    assert_eq!(m["features"], json!({"identity": "compatible"}));
+    assert_eq!(m["features"], json!({}));
     assert!(!m["files_included"]
         .as_array()
         .unwrap()
@@ -246,10 +251,7 @@ fn a_sparse_space_round_trips_through_the_directory() {
     collection.save(path.to_str().unwrap()).unwrap();
 
     let m = manifest(&path);
-    assert_eq!(
-        m["features"],
-        json!({"identity": "compatible", "sparse": "incompatible"})
-    );
+    assert_eq!(m["features"], json!({"sparse": "incompatible"}));
     let names: Vec<&str> = m["files_included"]
         .as_array()
         .unwrap()
@@ -356,7 +358,7 @@ fn a_text_layer_round_trips_with_its_dictionary() {
     let m = manifest(&path);
     assert_eq!(
         m["features"],
-        json!({"identity": "compatible", "sparse": "incompatible", "text": "incompatible"})
+        json!({"sparse": "incompatible", "text": "incompatible"})
     );
     assert!(path.join("spaces/text/terms.zdbdict").exists());
     let digest = &m["file_digests"]["spaces/text/terms.zdbdict"];
@@ -463,7 +465,7 @@ fn an_external_tokenizer_must_be_handed_back() {
 }
 
 /// The version rule in both directions, as this build sees it. A 1.x
-/// manifest declaring a space is refused, a 5.x manifest is refused naming
+/// manifest declaring a space is refused, a 6.x manifest is refused naming
 /// the majors this build reads, and a 2.x dense-only manifest opens.
 #[test]
 fn the_version_rule_holds_in_both_directions() {
@@ -487,28 +489,28 @@ fn the_version_rule_holds_in_both_directions() {
         other => panic!("expected a refusal, got {:?}", other.map(|_| ())),
     }
 
-    // A later major, refused with the majors this build reads. Four is the
-    // major this build writes and reads, so the refusal starts at five.
+    // A later major, refused with the majors this build reads. Five is the
+    // major this build writes and reads, so the refusal starts at six.
     let future = dir.path().join("future.zdb");
     copy_dir(&path, &future);
-    rewrite_manifest(&future, |m| m["format_version"] = json!("5.0.0"));
+    rewrite_manifest(&future, |m| m["format_version"] = json!("6.0.0"));
     let message = Collection::load(future.to_str().unwrap())
         .err()
         .unwrap()
         .to_string();
     assert!(
-        message.contains("format version 5.0.0 cannot be opened"),
+        message.contains("format version 6.0.0 cannot be opened"),
         "{message}"
     );
-    assert!(message.contains("1.x, 2.x, 3.x and 4.x"), "{message}");
+    assert!(message.contains("1.x, 2.x, 3.x, 4.x and 5.x"), "{message}");
     assert!(message.contains("newer"), "{message}");
 
-    // A 2.x label on a dense-only directory opens, since the minor and the
-    // major are both read.
+    // A 2.x label on a dense-only directory written as one before format
+    // 5.0.0 opens, since the minor and the major are both read.
     let plain = Collection::build(base(), None);
     let plain_path = dir.path().join("plain.zdb");
     plain.save(plain_path.to_str().unwrap()).unwrap();
-    rewrite_manifest(&plain_path, |m| m["format_version"] = json!("2.3.0"));
+    crate::persistence::older::rewrite_before_five(&plain_path, "2.3.0");
     assert!(Collection::load(plain_path.to_str().unwrap()).is_ok());
 
     // A space declared under a name the collection refuses.
@@ -516,21 +518,15 @@ fn the_version_rule_holds_in_both_directions() {
     copy_dir(&path, &renamed);
     let mut c = config(&renamed);
     c["spaces"][0]["name"] = json!("default");
-    std::fs::write(
-        renamed.join("config.json"),
-        serde_json::to_string_pretty(&c).unwrap(),
-    )
-    .unwrap();
-    let mut m = manifest(&renamed);
-    m["file_digests"]
-        .as_object_mut()
-        .unwrap()
-        .remove("config.json");
-    std::fs::write(
-        renamed.join("manifest.json"),
-        serde_json::to_string_pretty(&m).unwrap(),
-    )
-    .unwrap();
+    let text = serde_json::to_string_pretty(&c).unwrap();
+    std::fs::write(renamed.join("config.json"), &text).unwrap();
+    rewrite_manifest(&renamed, |m| {
+        m["file_digests"]["config.json"] = json!({
+            "bytes": text.len(),
+            "checksum": format!("{:016x}", zeusdb_vector_core::checksum_of(text.as_bytes())),
+        });
+        super::journal_support::resized(m);
+    });
     assert!(matches!(
         Collection::load(renamed.to_str().unwrap()),
         Err(Error::SpaceRecordInvalid { .. })
@@ -578,6 +574,7 @@ fn a_space_out_of_step_with_the_mappings_is_refused() {
     rewrite_manifest(&shrunk, |m| {
         m["file_digests"]["spaces/text/postings.zdbsparse"] =
             stale_manifest["file_digests"]["spaces/text/postings.zdbsparse"].clone();
+        super::journal_support::resized(m);
     });
     match Collection::load(shrunk.to_str().unwrap()) {
         Err(Error::SparseRecordUnmapped { space, id }) => {
@@ -613,6 +610,7 @@ fn a_space_out_of_step_with_the_mappings_is_refused() {
     rewrite_manifest(&short, |m| {
         m["file_digests"]["spaces/text/terms.zdbdict"] =
             fewer_manifest["file_digests"]["spaces/text/terms.zdbdict"].clone();
+        super::journal_support::resized(m);
     });
     match Collection::load(short.to_str().unwrap()) {
         Err(Error::TermIdBeyondDictionary { term, terms, .. }) => {
@@ -635,10 +633,11 @@ fn a_space_out_of_step_with_the_mappings_is_refused() {
     }
 }
 
-/// The graph's rebuild fallback keeps every internal id the mappings name,
-/// so the sparse space, restored under those ids before the graph, needs
-/// nothing carried through it: the loaded collection answers the same sparse
-/// page and holds the ids and the counter a load from the dump holds.
+/// The graph's rebuild from the dump's rows keeps every internal id the
+/// mappings name, so the sparse space, restored under those ids before the
+/// graph, needs nothing carried through it: the loaded collection answers the
+/// same sparse page and holds the ids and the counter a load from the dump
+/// holds.
 #[test]
 fn the_graph_rebuild_fallback_carries_the_sparse_space() {
     let declaration = base()
@@ -650,8 +649,9 @@ fn the_graph_rebuild_fallback_carries_the_sparse_space() {
     let dir = TempDir::new();
     let path = dir.path().join("both.zdb");
     collection.save(path.to_str().unwrap()).unwrap();
-    // Without its dump the loader rebuilds the graph from the records.
-    std::fs::remove_file(path.join("hnsw_index.zdbgraph")).unwrap();
+    // With its dump's topology damaged the loader rebuilds the graph from
+    // the rows the dump holds.
+    super::journal_support::break_topology(&path);
     let loaded = Collection::load(path.to_str().unwrap()).unwrap();
     assert_eq!(loaded.len(), 60);
     let after = pages(&loaded);
@@ -663,11 +663,10 @@ fn the_graph_rebuild_fallback_carries_the_sparse_space() {
     assert_eq!(loaded.id_counter(), collection.id_counter());
 }
 
-/// The raw rebuild fallback keeps every internal id the mappings name and
-/// the counter `config.json` records, so a directory loaded through it is
-/// the directory its own artefacts describe. It used to route every record
-/// through `add` with overwrite, which reissued every id above the saved
-/// counter and left the counter doubled.
+/// The raw rebuild from the dump's rows keeps every internal id the mappings
+/// name and the counter `config.json` records, so a directory loaded through
+/// it is the directory its own artefacts describe, and a stranded node's row
+/// is dropped.
 #[test]
 fn the_raw_rebuild_fallback_keeps_every_internal_id_and_the_counter() {
     let collection = Collection::build(base(), None);
@@ -706,7 +705,7 @@ fn the_raw_rebuild_fallback_keeps_every_internal_id_and_the_counter() {
     assert_eq!(config(&path)["id_counter"], 301);
     let fallback = dir.path().join("fallback.zdb");
     copy_dir(&path, &fallback);
-    std::fs::remove_file(fallback.join("hnsw_index.zdbgraph")).unwrap();
+    super::journal_support::break_topology(&fallback);
 
     let from_dump = Collection::load(path.to_str().unwrap()).unwrap();
     let rebuilt = Collection::load(fallback.to_str().unwrap()).unwrap();
@@ -840,7 +839,7 @@ fn every_mutating_path_keeps_the_saved_shape_correct() {
     let m = manifest(&cleared);
     assert_eq!(
         m["features"],
-        json!({"identity": "compatible", "sparse": "incompatible", "text": "incompatible"})
+        json!({"sparse": "incompatible", "text": "incompatible"})
     );
     assert!(cleared.join("spaces/text/postings.zdbsparse").exists());
     let loaded = Collection::load(cleared.to_str().unwrap()).unwrap();
@@ -1099,21 +1098,22 @@ fn a_directory_at_the_largest_m_and_the_smallest_dimension_reads_its_dump_and_wr
     );
 }
 
-/// Lists at or below their owners' levels that a graph dump leaves empty, the
-/// trailing ones the writer trims included, read off the file.
+/// Lists at or below their owners' levels that a version 2 graph dump
+/// leaves empty, the trailing ones the writer trims included, read off the
+/// file.
 fn empty_lists_at_or_below_levels(dump: &[u8]) -> usize {
-    let word = |at: usize| u64::from_le_bytes(dump[at..at + 8].try_into().unwrap()) as usize;
+    let length = |at: usize| u64::from_le_bytes(dump[at..at + 8].try_into().unwrap()) as usize;
     let count = |at: usize| u32::from_le_bytes(dump[at..at + 4].try_into().unwrap()) as usize;
     let layers = NB_LAYER_MAX as usize;
-    let mut at = 96 + 4 * layers + 8 * word(40);
+    let mut at = 128 + length(48) + length(56);
     let mut empty = 0;
     for level in 0..layers {
-        for _ in 0..count(96 + 4 * level) {
+        for _ in 0..count(128 + 4 * level) {
             let lists = dump[at] as usize;
             at += 1;
             for layer in 0..lists {
-                let entries = count(at);
-                at += 4 + 9 * entries;
+                let entries = u16::from_le_bytes([dump[at], dump[at + 1]]) as usize;
+                at += 2 + 4 * entries;
                 if (1..=level).contains(&layer) && entries == 0 {
                     empty += 1;
                 }
@@ -1124,14 +1124,14 @@ fn empty_lists_at_or_below_levels(dump: &[u8]) -> usize {
     empty
 }
 
-/// The largest origin id a graph dump names, read off the file.
+/// The largest origin id a version 2 graph dump names, read off the file.
 fn largest_origin_id(dump: &[u8]) -> u64 {
-    let nodes = u64::from_le_bytes(dump[40..48].try_into().unwrap()) as usize;
-    let first = 96 + 4 * NB_LAYER_MAX as usize;
+    let nodes = u32::from_le_bytes(dump[32..36].try_into().unwrap()) as usize;
+    let first = 128 + 4 * NB_LAYER_MAX as usize;
     (0..nodes)
         .map(|node| {
-            let at = first + 8 * node;
-            u64::from_le_bytes(dump[at..at + 8].try_into().unwrap())
+            let at = first + 4 * node;
+            u32::from_le_bytes(dump[at..at + 4].try_into().unwrap()) as u64
         })
         .max()
         .unwrap_or(0)
@@ -1327,4 +1327,141 @@ fn a_directory_whose_counter_is_above_its_largest_id_reads_its_dump_and_writes_i
         0
     );
     assert!(ids_of(&loaded).contains(&("late".to_string(), 301)));
+}
+
+// ============================================================================
+// WHAT RUNS BESIDE A SAVE
+// ============================================================================
+
+/// How long a check waits for a thread beside it, and the longest the
+/// pause holds the save, which is the tests' own bound on a hang.
+const LIMIT: Duration = Duration::from_secs(20);
+
+/// A vector of width eight for record `i`, the same every time.
+fn wide(i: usize) -> Vec<f32> {
+    (0..8)
+        .map(|d| ((i * 7 + d * 13) % 29) as f32 * 0.25 - 3.5)
+        .collect()
+}
+
+/// Run `write` on a thread of `scope`, and give what that thread says in
+/// order: each guard it begins to wait at, then its return.
+fn spawn_writer<'scope>(
+    scope: &'scope std::thread::Scope<'scope, '_>,
+    write: impl FnOnce() + Send + 'scope,
+) -> mpsc::Receiver<Said<()>> {
+    let (said_tx, said) = mpsc::channel::<Said<()>>();
+    scope.spawn(move || {
+        say_waits(&said_tx);
+        write();
+        let _ = said_tx.send(Said::Done(()));
+    });
+    said
+}
+
+/// A save holds the mutation guard from its first phase to its last and no
+/// guard a reader waits for. Held between its artefacts and its graph dump,
+/// at `save:after_artefacts`, it lets a search, a count and a page of `list`
+/// answer from this thread while the pause still holds it. A removal and an
+/// add made on two more threads each reach their wait at `writers` before
+/// they can return. Once the save is let go, the directory it wrote loads
+/// with exactly the records the collection held as the save began, and the
+/// removal and the add land after it. On a raw declaration and on a product
+/// quantized one.
+#[test]
+fn a_save_held_between_its_phases_answers_searches_and_holds_writers_back() {
+    for quantized in [false, true] {
+        let declaration =
+            Declaration::validate(8, "l2", 8, 50, 4000, vec!["cat".to_string()]).unwrap();
+        let quantization = quantized.then(|| {
+            declaration
+                .quantization(4, 4, 1000, None, StorageMode::QuantizedWithRaw)
+                .unwrap()
+        });
+        let collection = Collection::build(declaration, quantization);
+        let records: Vec<ParsedRecord> = (0..1200)
+            .map(|i| {
+                let cat = if i % 2 == 0 { "a" } else { "b" };
+                record(&format!("r{i}"), &wide(i), None, cat)
+            })
+            .collect();
+        let added = collection.add_records(records, vec![], false);
+        assert_eq!(added.total_errors, 0, "{:?}", added.errors);
+        assert_eq!(collection.is_quantized(), quantized);
+        let cat_a = compile_filter(&HashMap::from([("cat".to_string(), json!("a"))])).unwrap();
+        let temp = TempDir::new();
+        let dir = temp.path().join("held.zdb");
+        let pause = Arc::new(Pause::new(LIMIT));
+
+        std::thread::scope(|scope| {
+            let saver = {
+                let (collection, pause, dir) = (&collection, Arc::clone(&pause), &dir);
+                scope.spawn(move || {
+                    pause_arm(PauseAt::Kill(KillPoint::SaveAfterArtefacts), pause);
+                    let saved = collection.save(dir.to_str().unwrap());
+                    pause_disarm();
+                    saved
+                })
+            };
+            assert_eq!(
+                pause.wait_reached(LIMIT).reached(),
+                Some("save:after_artefacts"),
+                "the save never reached save:after_artefacts"
+            );
+
+            // The readers, on this thread, while the save waits.
+            let params = collection.search_params(5, None, false, None).unwrap();
+            let page = collection.search_one(&wide(7), None, params).unwrap();
+            let count = collection.count(Some(&cat_a));
+            let listed = collection.list(10, 0, None).unwrap();
+            assert_eq!(
+                pause.state(),
+                PauseState::Waiting("save:after_artefacts"),
+                "a reader waited for the save"
+            );
+
+            // The writers, each on a thread of its own, reach their wait.
+            let removal = spawn_writer(scope, || {
+                assert!(collection.remove_point("r0".to_string()).unwrap());
+            });
+            let addition = spawn_writer(scope, || {
+                let late = record("late", &wide(5_000), None, "a");
+                let added = collection.add_records(vec![late], vec![], false);
+                assert_eq!(added.total_errors, 0, "{:?}", added.errors);
+            });
+            // The save holds `writers` alone at its pause, by the rule this
+            // test holds, so that is the guard each writer waits at.
+            let save_held = [lock_name("writers")];
+            for (name, said) in [("removal", &removal), ("add", &addition)] {
+                waited_among(
+                    said,
+                    LIMIT,
+                    &save_held,
+                    &format!("the {name} waits at the mutation guard the save holds"),
+                );
+            }
+            assert!(pause.release(), "the save was not waiting at its pause");
+            saver.join().unwrap().unwrap();
+            for (name, said) in [("removal", &removal), ("add", &addition)] {
+                answer_after(
+                    said,
+                    LIMIT,
+                    &format!("the {name} returns once the save is done"),
+                );
+            }
+            assert_eq!(page.len(), 5);
+            assert_eq!(count, 600);
+            assert_eq!(listed.len(), 10);
+        });
+
+        let loaded = Collection::load(dir.to_str().unwrap()).unwrap();
+        assert_eq!(
+            loaded.len(),
+            1200,
+            "the directory holds the records the collection held as the save began"
+        );
+        assert!(loaded.contains("r0") && !loaded.contains("late"));
+        assert!(!collection.contains("r0") && collection.contains("late"));
+        assert_eq!(loaded.is_quantized(), quantized);
+    }
 }

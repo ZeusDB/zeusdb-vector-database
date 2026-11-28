@@ -681,16 +681,13 @@ fn a_journal_replays_into_a_collection_whose_ids_are_sparse() {
     assert_eq!(extents(&again), reach(240 + 20, false));
 }
 
-/// A record the mappings lack is handed the next internal id by the load's
-/// rebuild fallback, from records and from codes alike, up to the last id a
-/// collection issues. The id past it is refused in the loader's words before
-/// the id store is touched, so no record is filed under an id cut to 32 bits.
+/// A record the mappings lack is refused by the load's rebuild fallback,
+/// from records and from codes alike, in the words the readers of the two
+/// stores refuse one in, the least such id named, before the id store or the
+/// counter is touched, so no record is filed under an internal id the
+/// directory never gave it.
 #[test]
-fn the_rebuild_refuses_an_id_past_the_last_one_for_a_record_the_mappings_lack() {
-    let past = format!(
-        "internal id {} is above what the id store can hold",
-        MAX_INTERNAL_ID + 1
-    );
+fn the_rebuild_refuses_a_record_the_mappings_lack() {
     let positions_of = |collection: &Collection| -> Vec<u32> {
         let mut positions: Vec<u32> = ids_of(collection)
             .into_iter()
@@ -699,30 +696,31 @@ fn the_rebuild_refuses_an_id_past_the_last_one_for_a_record_the_mappings_lack() 
         positions.sort_unstable();
         positions
     };
+    let unmapped = |file: &str, id: &str| {
+        format!(
+            "Failed to deserialize {}: names record '{}', which mappings.bin does not hold",
+            file, id
+        )
+    };
 
-    // From records, with the counter at the last id and one below it.
-    for (counter, refused) in [(MAX_INTERNAL_ID, true), (MAX_INTERNAL_ID - 1, false)] {
-        let mut collection = Collection::build(declaration(100, false), None);
-        add(&collection, 0..3, false);
-        collection.set_counters(counter, 3);
-        let mut positions = positions_of(&collection);
-        let records = (0..4).map(|i| (format!("r{i}"), vector(i))).collect();
-        let rebuilt = collection.rebuild_from_records(records, &mut positions);
-        if refused {
-            assert_eq!(rebuilt.unwrap_err().to_string(), past);
-            assert_eq!(ids_of(&collection).len(), 3, "the id store was not touched");
-            assert_eq!(positions.len(), 3);
-        } else {
-            assert_eq!(rebuilt.unwrap(), 4);
-            assert_eq!(
-                ids_of(&collection).last(),
-                Some(&("r3".to_string(), MAX_INTERNAL_ID))
-            );
-            assert_eq!(positions.last(), Some(&(MAX_INTERNAL_ID as u32)));
-        }
-    }
+    // From records, two of them unmapped, the lesser named.
+    let collection = Collection::build(declaration(100, false), None);
+    add(&collection, 0..3, false);
+    let positions = positions_of(&collection);
+    let counter = collection.id_counter();
+    let records = [0u32, 1, 2, 7, 3]
+        .into_iter()
+        .map(|i| (format!("r{i}"), vector(i)))
+        .collect();
+    let refused = collection
+        .rebuild_from_records(records, &positions)
+        .unwrap_err();
+    assert_eq!(refused.to_string(), unmapped("vectors.bin", "r3"));
+    assert_eq!(ids_of(&collection).len(), 3, "the id store was not touched");
+    assert_eq!(collection.id_counter(), counter, "no id was issued");
 
-    // From codes, on a trained product quantized collection.
+    // From codes, on a trained product quantized collection, a code and a
+    // raw vector each naming a record the mappings lack.
     let vectors = zeusdb_vector_core::test_support::clustered(1_010, 16, 0x0020_8b02);
     let declaration = Declaration::validate(16, "l2", 8, 40, 100, vec![]).unwrap();
     let quantization = declaration
@@ -740,28 +738,96 @@ fn the_rebuild_refuses_an_id_past_the_last_one_for_a_record_the_mappings_lack() 
     let added = collection.add_records(records, vec![], false);
     assert_eq!(added.total_errors, 0, "{:?}", added.errors);
     assert!(collection.is_quantized());
-    let mut codes = collection.dense().pq_codes.read().unwrap().clone();
-    let held = codes.len();
-    codes.insert("lost".to_string(), codes["r0"].clone());
-    let count = collection.vector_count();
-    for (counter, refused) in [(MAX_INTERNAL_ID, true), (MAX_INTERNAL_ID - 1, false)] {
-        collection.set_counters(counter, count);
-        let mut positions = positions_of(&collection);
-        let rebuilt = collection.rebuild_graph_from_codes(&codes, &HashMap::new(), &mut positions);
-        if refused {
-            assert_eq!(rebuilt.unwrap_err(), past);
-            assert_eq!(
-                ids_of(&collection).len(),
-                held,
-                "the id store was not touched"
-            );
-            assert_eq!(positions.len(), held);
-        } else {
-            assert_eq!(rebuilt.unwrap(), (held + 1, 0, 1));
-            assert!(ids_of(&collection).contains(&("lost".to_string(), MAX_INTERNAL_ID)));
-            assert_eq!(positions.last(), Some(&(MAX_INTERNAL_ID as u32)));
+    let held = collection.dense().pq_codes.read().unwrap().clone();
+    let positions = positions_of(&collection);
+    let counter = collection.id_counter();
+    for (code, raw, named) in [
+        (Some("lost"), None, unmapped("pq_codes.bin", "lost")),
+        (None, Some("astray"), unmapped("vectors.bin", "astray")),
+        (
+            Some("lost"),
+            Some("astray"),
+            unmapped("vectors.bin", "astray"),
+        ),
+    ] {
+        let mut codes = held.clone();
+        if let Some(id) = code {
+            codes.insert(id.to_string(), held["r0"].clone());
         }
+        let raws: HashMap<String, Vec<f32>> = raw
+            .map(|id| (id.to_string(), vectors[0].clone()))
+            .into_iter()
+            .collect();
+        let refused = collection
+            .rebuild_graph_from_codes(&codes, &raws, &positions)
+            .unwrap_err();
+        assert_eq!(refused.to_string(), named);
+        assert_eq!(
+            ids_of(&collection).len(),
+            held.len(),
+            "the id store was not touched"
+        );
+        assert_eq!(collection.id_counter(), counter, "no id was issued");
     }
+}
+
+/// A version 1 journal's insert past the last id, which a release before
+/// 0.12.0 issued and its id store then refused, is passed over by the
+/// replay where the counter stands at the last id, between two held
+/// records and with a clear after it, so the replay holds the records and
+/// the counter that release held. The same insert is refused from a version
+/// 2 journal, whose writer refuses such an id before issuing it, and from a
+/// version 1 journal whose counter stands below the last id, since no
+/// release issued one there.
+#[test]
+fn a_version_1_insert_past_the_last_id_is_passed_over_at_the_last_id() {
+    let insert = |id: &str, internal_id: u64, i: u32| Operation::Insert {
+        id: id.to_string(),
+        internal_id,
+        level: 0,
+        vector: vector(i),
+        metadata: serde_json::Map::new(),
+        sparse: None,
+    };
+    let last = MAX_INTERNAL_ID as u64;
+    let mut collection = Collection::build(declaration(100, false), None);
+    collection.set_counters(MAX_INTERNAL_ID - 1, 0);
+    collection.apply_legacy(insert("held", last, 1)).unwrap();
+    for past in [last + 1, last + 2] {
+        collection
+            .apply_legacy(insert(&format!("refused{past}"), past, 2))
+            .unwrap();
+    }
+    assert_eq!(
+        ids_of(&collection),
+        vec![("held".to_string(), MAX_INTERNAL_ID)]
+    );
+    assert_eq!(collection.id_counter(), MAX_INTERNAL_ID);
+    assert_eq!(collection.vector_count(), 1);
+
+    collection.apply_legacy(Operation::Clear).unwrap();
+    collection.apply_legacy(insert("after", 1, 3)).unwrap();
+    assert_eq!(ids_of(&collection), vec![("after".to_string(), 1)]);
+    assert_eq!(collection.id_counter(), 1);
+
+    let refused = |result: Result<(), zeusdb_vector_core::Error>| {
+        assert!(
+            matches!(
+                result,
+                Err(zeusdb_vector_core::Error::JournalReplayMismatch { ref detail })
+                    if detail.ends_with("above the id ceiling")
+            ),
+            "{result:?}"
+        );
+    };
+    let mut second = Collection::build(declaration(100, false), None);
+    second.set_counters(MAX_INTERNAL_ID, 0);
+    refused(second.apply(insert("refused", last + 1, 2)));
+    let mut early = Collection::build(declaration(100, false), None);
+    early.set_counters(7, 0);
+    refused(early.apply_legacy(insert("refused", last + 1, 2)));
+    assert_eq!(early.id_counter(), 7);
+    assert!(ids_of(&early).is_empty());
 }
 
 /// A collection with a sparse space whose newest record has gone saves a

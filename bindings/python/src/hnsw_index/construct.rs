@@ -134,7 +134,7 @@ fn declare_sparse(
 /// The Python factory checks the pair a caller passes to `create()` and this
 /// checks the pair a caller passes to `rebuild()`, so the same misconfiguration
 /// reads the same either way.
-/// `the_two_warnings_are_the_same_sentence` in `tests/test_index_lifecycle.py`
+/// `test_the_two_warnings_are_the_same_sentence` in `tests/test_rebuild.py`
 /// holds the two texts equal, which is what stops one drifting from the other.
 ///
 /// The reasoning behind the threshold is in `_warn_if_selection_disabled` in
@@ -169,7 +169,7 @@ pub(super) fn warn_if_selection_disabled(
     };
     let message = format!(
         "ef_construction={} is not greater than 2*m={}, so the neighbour selection \
-         heuristic does not run. Layer zero insertion keeps every candidate the \
+         heuristic does not run at layer zero. Layer zero insertion keeps every candidate the \
          construction search returns, in distance order, and prunes none of them. \
          {}, to run it.",
         ef_construction, budget, remedy

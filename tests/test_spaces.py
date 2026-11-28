@@ -20,7 +20,7 @@ import threading
 
 import numpy as np
 import pytest
-from helpers import repair_manifest
+from helpers import break_topology, repair_manifest
 from zeusdb_vector_database import VectorDatabase, _engine
 
 DIM = 4
@@ -212,15 +212,14 @@ def test_create_with_a_tokenizer_weights_by_term_frequency_by_default(tmp_path):
     ({"tokenizer": 3}, TypeError, "must be 'simple' or a callable"),
 ])
 def test_create_refuses_a_bad_sparse_declaration(sparse, klass, fragment):
-    """Through the engine's own door the class is the binding's; through
-    create() every backend refusal is wrapped in a RuntimeError, as every
-    other backend validation has always been."""
+    """Through the engine's own door and through create() alike, the class is
+    the binding's and the words are the engine's."""
     with pytest.raises(klass) as raised:
         CREATE(dim=DIM, space="l2", m=8, ef_construction=50, expected_size=50, sparse=sparse)
     assert fragment in str(raised.value)
-    with pytest.raises(RuntimeError, match="Failed to create HNSW index") as wrapped:
+    with pytest.raises(klass) as created:
         VectorDatabase().create("hnsw", dim=DIM, space="l2", expected_size=50, sparse=sparse)
-    assert fragment in str(wrapped.value)
+    assert str(created.value) == str(raised.value)
 
 
 def test_create_refuses_a_sparse_declaration_that_is_not_a_mapping():
@@ -410,7 +409,7 @@ def one_error(index, record):
 
 
 @pytest.mark.parametrize("sparse,fragment", [
-    ("nope", "'sparse' must be a mapping {'dims': [...], 'values': [...]}, got str"),
+    ("nope", "'sparse' must be a dict {'dims': [...], 'values': [...]}, got str"),
     ({"values": [1.0]}, "'sparse' is missing 'dims'"),
     ({"dims": [1]}, "'sparse' is missing 'values'"),
     ({"dims": [1], "values": [1.0], "extra": 1},
@@ -482,6 +481,107 @@ def test_add_refuses_a_value_that_is_not_a_whole_number_under_term_frequency_wei
             r"value at index 1 is 0\.5, and a space weighted by term frequency takes whole "
             r"numbers alone")):
         VectorDatabase().load(str(path))
+
+
+# 2^40, the largest magnitude of a sparse value add() stores and query()
+# scores with, and the largest term weighting k1 create() takes.
+SPARSE_BOUND = 2.0 ** 40
+# The float32 just past it.
+PAST_SPARSE_BOUND = float(np.nextafter(np.float32(SPARSE_BOUND), np.float32(np.inf)))
+
+
+def past_sparse_bound(index, value):
+    """The words a sparse value past the bound is refused in, `value` as the
+    engine writes it."""
+    return (f"Sparse vector value at index {index} is {value}, and a sparse space takes values "
+            "of at most 2^40, 1.099511627776e12, in magnitude")
+
+
+def test_add_refuses_a_sparse_value_past_the_bound_on_its_magnitude():
+    """A record whose sparse vector holds a value past 2^40 in magnitude is
+    refused by name and leaves nothing behind: under the dot product, under
+    term frequency weighting before the rules a count keeps, and on a space
+    with a text layer before that space's own rule. A value at 2^40 is taken
+    either side of zero, and a query at the bound scores it finite."""
+    index = with_sparse()
+    for sparse, words in [
+        (sparse_vector((1, 1.0), (2, 2e12)), past_sparse_bound(1, "2e12")),
+        (sparse_vector((1, -2e12)), past_sparse_bound(0, "-2e12")),
+        (sparse_vector((1, PAST_SPARSE_BOUND)), past_sparse_bound(0, "1.0995118e12")),
+        (sparse_vector((1, 3.4028234663852886e38)), past_sparse_bound(0, "3.4028235e38")),
+    ]:
+        assert one_error(index, {"id": "big", "vector": vec(1), "sparse": sparse}) == \
+            "Vector big: ValueError: " + words
+        assert "big" not in index and len(index) == 0
+    assert sparse_keys(index)["sparse_records"] == "0"
+    assert index.add({"id": "at", "vector": vec(1),
+                      "sparse": sparse_vector((1, SPARSE_BOUND), (2, -SPARSE_BOUND))}).is_success()
+    [hit] = index.query(arms=[{"sparse": sparse_vector((1, SPARSE_BOUND))}], top_k=5)
+    assert (hit["id"], hit["score"]) == ("at", 2.0 ** 80)
+
+    counts = with_sparse(weighting="bm25")
+    assert one_error(counts, {"id": "big", "vector": vec(1),
+                              "sparse": sparse_vector((1, 2e12))}) == \
+        "Vector big: ValueError: " + past_sparse_bound(0, "2e12")
+    assert counts.add({"id": "at", "vector": vec(1),
+                       "sparse": sparse_vector((1, SPARSE_BOUND))}).is_success()
+    for text in (with_text(), with_text(weighting="dot")):
+        assert one_error(text, {"id": "big", "vector": vec(1),
+                                "sparse": sparse_vector((0, 2e12))}) == \
+            "Vector big: ValueError: " + past_sparse_bound(0, "2e12")
+        assert len(text) == 0 and sparse_keys(text)["term_count"] == "0"
+
+
+def test_query_refuses_a_sparse_arm_past_the_bound_on_its_magnitude():
+    """A sparse arm whose vector holds a value past 2^40 in magnitude is
+    refused with ValueError naming the value and its place, by query and by
+    explain, alone and beside a dense arm, on a space that takes term ids and
+    on one with a text layer before that space's own rule. An arm at the
+    bound scores finite."""
+    index = with_sparse()
+    index.add({"id": "a", "vector": vec(1), "sparse": sparse_vector((1, 1.0), (2, 1.0))})
+    arm = {"sparse": sparse_vector((1, 1.0), (2, 2e12))}
+    for method in (index.query, index.explain):
+        for arms in ([arm], [{"vector": vec(1)}, arm]):
+            with pytest.raises(ValueError) as refused:
+                method(arms=arms, top_k=5)
+            assert str(refused.value) == past_sparse_bound(1, "2e12")
+    [hit] = index.query(arms=[{"sparse": sparse_vector((1, SPARSE_BOUND), (2, SPARSE_BOUND))}],
+                        top_k=5)
+    assert (hit["id"], hit["score"]) == ("a", 2.0 ** 41)
+    text = with_text()
+    text.add({"id": "a", "vector": vec(1), "text": "alpha"})
+    for method in (text.query, text.explain):
+        with pytest.raises(ValueError) as refused:
+            method(arms=[{"sparse": sparse_vector((0, -2e12))}])
+        assert str(refused.value) == past_sparse_bound(0, "-2e12")
+
+
+def test_create_refuses_a_term_weighting_k1_past_the_bound():
+    """A term weighting k1 past 2^40 is refused through the engine's own door
+    and through create() alike, with the whole rule named. A k1 at 2^40 is
+    taken, beside a text layer as well, and its scores are finite."""
+    words = ("Term weighting parameter k1 is 2000000000000, and it must be finite, at least zero "
+             "and at most 2^40, 1.099511627776e12")
+    sparse = {"weighting": {"type": "bm25", "k1": 2e12}}
+    with pytest.raises(ValueError) as raised:
+        CREATE(dim=DIM, space="l2", m=8, ef_construction=50, expected_size=50, sparse=sparse)
+    assert str(raised.value) == words
+    with pytest.raises(ValueError) as created:
+        VectorDatabase().create("hnsw", dim=DIM, space="l2", expected_size=50, sparse=sparse)
+    assert str(created.value) == words
+    at = {"type": "bm25", "k1": SPARSE_BOUND}
+    text = with_text(weighting=at)
+    text.add([{"id": "a", "vector": vec(1), "text": "alpha alpha beta"},
+              {"id": "b", "vector": vec(2), "text": "beta"}])
+    page = text.query(arms=[{"text": "alpha beta"}], top_k=5)
+    assert ids(page) == ["a", "b"]
+    assert all(math.isfinite(hit["score"]) for hit in page), page
+    counts = with_sparse(weighting=at)
+    assert counts.add({"id": "c", "vector": vec(3),
+                       "sparse": sparse_vector((1, SPARSE_BOUND))}).is_success()
+    [hit] = counts.query(arms=[{"sparse": sparse_vector((1, SPARSE_BOUND))}], top_k=5)
+    assert hit["id"] == "c" and math.isfinite(hit["score"]), hit
 
 
 def test_add_refuses_a_sparse_half_where_there_is_no_space_or_no_layer():
@@ -878,6 +978,33 @@ def test_idf_scope_reads_the_admitted_corpus_by_default_and_the_whole_index_on_r
     assert filtered_corpus[0]["score"] != filtered_global[0]["score"]
 
 
+def test_declaring_a_field_changes_no_bm25_page_under_corpus_idf():
+    """A filter returns the same page whether or not its field is declared,
+    as indexed_fields says, and that holds for a bm25 arm under idf corpus,
+    whose rarity is counted over the records the filter admits whether they
+    are tested one by one or read from the field's bitmap."""
+    query = [{"sparse": {"dims": [1, 2], "values": [1.0, 1.0]}, "idf": "corpus"}]
+    pages, shapes = {}, {}
+    for fields in ((), ("lang",)):
+        index = VectorDatabase().create("hnsw", dim=2, space="l2", expected_size=12000,
+                                        indexed_fields=list(fields),
+                                        sparse={"weighting": "bm25"})
+        records = []
+        for i in range(11500):
+            lang = "en" if i < 5500 else "fr"
+            term = 1 if i < 5000 else 2
+            records.append({"id": f"d{i:05d}", "values": [float(i % 7), float(i % 11)],
+                            "sparse": {"dims": [term], "values": [1.0]},
+                            "metadata": {"lang": lang}})
+        added = index.add(records)
+        assert added.is_success(), added.errors[:3]
+        shapes[fields] = index.explain(query, filter={"lang": "en"})["admit"]["shape"]
+        hits = index.query(query, filter={"lang": "en"}, top_k=10)
+        pages[fields] = [(hit["id"], round(hit["score"], 6)) for hit in hits]
+    assert shapes == {(): "predicate", ("lang",): "bitmap"}, shapes
+    assert pages[()] == pages[("lang",)], pages
+
+
 def rrf_by_hand(pages, k=60.0):
     fused = {}
     for arm, page in enumerate(pages):
@@ -962,11 +1089,11 @@ def test_explain_reports_the_plan_without_running_the_query():
 
 
 @pytest.mark.parametrize("arms,klass,fragment", [
-    ("nope", TypeError, "arms must be a list of mappings"),
-    ({"vector": [1.0] * DIM}, TypeError, "arms must be a list of mappings"),
+    ("nope", TypeError, "arms must be a list of dicts"),
+    ({"vector": [1.0] * DIM}, TypeError, "arms must be a list of dicts"),
     ([], ValueError, "A query needs at least one arm"),
     ([{"vector": [1.0] * DIM}] * 9, ValueError, "A query names at most 8 arms, got 9"),
-    ([[1.0] * DIM], TypeError, "arms[0] must be a mapping naming one of 'vector', 'sparse' or 'text', got list"),
+    ([[1.0] * DIM], TypeError, "arms[0] must be a dict naming one of 'vector', 'sparse' or 'text', got list"),
     ([{}], ValueError, "arms[0] names none of 'vector', 'sparse' or 'text'"),
     ([{"vector": None, "text": None}], ValueError, "arms[0] names none of"),
     ([{"vector": [1.0] * DIM, "text": "x"}], ValueError, "arms[0] names 'vector' and 'text'"),
@@ -987,7 +1114,7 @@ def test_explain_reports_the_plan_without_running_the_query():
      "Sparse vector dims must be strictly increasing"),
     ([{"sparse": {"dims": [1], "values": [1.0, 2.0]}}], ValueError, "Sparse vector has 1 dims and 2 values"),
     ([{"sparse": {"dims": [1], "values": [math.inf]}}], ValueError, "Sparse vector contains invalid value"),
-    ([{"sparse": [1, 2]}], ValueError, "arms[0] 'sparse' must be a mapping {'dims': [...], 'values': [...]}, got list"),
+    ([{"sparse": [1, 2]}], ValueError, "arms[0] 'sparse' must be a dict {'dims': [...], 'values': [...]}, got list"),
     ([{"sparse": {"dims": [-1], "values": [1.0]}}], ValueError, "arms[0] 'sparse' dim -1 is outside"),
     ([{"text": 5}], TypeError, "arms[0]['text'] must be a str, got int"),
     ([{"text": "x", "idf": "sometimes"}], ValueError, "arms[0]['idf'] is 'sometimes', and it is 'corpus'"),
@@ -1016,7 +1143,7 @@ def test_query_and_explain_refuse_a_malformed_query(arms, klass, fragment):
      "fusion carries 'weights', and a fusion is {'type': 'rrf', 'k': 60.0}"),
     ({"fusion": {"k": 3}}, ValueError, "fusion is missing 'type'"),
     ({"fusion": {"type": "rrf", "k": "x"}}, TypeError, "fusion['k'] must be a number"),
-    ({"fusion": 60}, TypeError, "fusion must be 'rrf' or a mapping"),
+    ({"fusion": 60}, TypeError, "fusion must be 'rrf' or a dict"),
     ({"filter": {"cat": {"regex": "x"}}}, ValueError, "Unknown filter operation: regex"),
 ])
 def test_query_and_explain_refuse_bad_query_arguments(kwargs, klass, fragment):
@@ -1123,7 +1250,7 @@ def test_a_dense_only_directory_stays_what_it_was(tmp_path):
     path = tmp_path / "dense.zdb"
     index.save(str(path))
     manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["features"] == {"identity": "compatible"}
+    assert manifest["features"] == {}
     assert not (path / "spaces").exists()
     assert "spaces" not in json.loads((path / "config.json").read_text(encoding="utf-8"))
     loaded = VectorDatabase().load(str(path))
@@ -1140,7 +1267,7 @@ def test_a_dense_and_sparse_directory_round_trips(tmp_path):
     path = tmp_path / "both.zdb"
     index.save(str(path))
     manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["features"] == {"identity": "compatible", "sparse": "incompatible"}
+    assert manifest["features"] == {"sparse": "incompatible"}
     assert "spaces/terms/postings.zdbsparse" in manifest["files_included"]
     assert "checksum" not in manifest["file_digests"]["spaces/terms/postings.zdbsparse"]
     assert (path / "spaces" / "terms" / "postings.zdbsparse").exists()
@@ -1176,7 +1303,7 @@ def test_a_text_directory_round_trips_with_its_dictionary(tmp_path):
     path = tmp_path / "text.zdb"
     index.save(str(path))
     manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["features"] == {"identity": "compatible", "sparse": "incompatible", "text": "incompatible"}
+    assert manifest["features"] == {"sparse": "incompatible", "text": "incompatible"}
     assert "spaces/text/terms.zdbdict" in manifest["files_included"]
     config = json.loads((path / "config.json").read_text(encoding="utf-8"))
     assert config["spaces"][0]["tokenizer"] == "simple"
@@ -1285,8 +1412,9 @@ def test_the_graph_rebuild_fallback_carries_the_sparse_space(tmp_path):
     before = pages_of(index, records)
     path = tmp_path / "rebuild.zdb"
     index.save(str(path))
-    (path / "hnsw_index.zdbgraph").unlink()
+    break_topology(path / "hnsw_index.zdbgraph")
     loaded = VectorDatabase().load(str(path))
+    assert loaded.recovery["graph_rebuilt"] is True
     assert len(loaded) == 60
     after = pages_of(loaded, records)
     # The sparse pages are exact and identical; the dense page is the rebuilt
@@ -1380,7 +1508,7 @@ def test_clear_compact_and_removal_keep_the_sparse_space_correct(tmp_path):
     cleared = tmp_path / "cleared.zdb"
     index.save(str(cleared))
     manifest = json.loads((cleared / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["features"] == {"identity": "compatible", "sparse": "incompatible", "text": "incompatible"}
+    assert manifest["features"] == {"sparse": "incompatible", "text": "incompatible"}
     loaded = VectorDatabase().load(str(cleared))
     assert len(loaded) == 0
     loaded.add({"id": "fresh", "vector": vec(1), "text": "fresh start"})
@@ -1523,3 +1651,55 @@ def test_a_text_query_never_returns_a_record_that_never_held_the_term_under_conc
     settled = generation[0]
     assert len(index) == 1
     assert ids(index.query(arms=[{"text": f"only{settled}"}], top_k=5)) == [f"r{settled}"]
+
+
+# ------------------------------------------------------------
+# A cosine vector whose squares underflow
+# ------------------------------------------------------------
+def norm(values):
+    return math.sqrt(sum(float(value) * float(value) for value in values))
+
+
+@pytest.mark.parametrize("values", [[3e-23, 0, 0, 0], [3e-23, 3e-23, 0, 0], [1e-21, 2e-22, 0, 0],
+                                    [1e-30, 0, 0, 0]])
+def test_a_cosine_vector_whose_sum_of_squares_underflows_is_stored_at_unit_length(values):
+    """A vector whose float32 sum of squares falls below the smallest normal
+    float32 is normalized in float64, so it is stored at unit length whether
+    its squares underflow in full or in part."""
+    index = VectorDatabase().create("hnsw", dim=DIM, space="cosine", expected_size=10)
+    added = index.add({"ids": ["tiny"], "embeddings": np.array([values], dtype=np.float32)})
+    assert added.is_success(), added.errors
+    stored = index.get_records(["tiny"], return_vector=True)[0]["vector"]
+    assert abs(norm(stored) - 1.0) < 1e-6, stored
+
+
+def test_a_cosine_query_whose_sum_of_squares_underflows_scores_as_its_direction():
+    index = VectorDatabase().create("hnsw", dim=DIM, space="cosine", expected_size=10)
+    assert index.add({"ids": ["x"], "embeddings": np.array([[1.0, 0, 0, 0]], dtype=np.float32)}
+                     ).is_success()
+    [hit] = index.search([3e-23, 0.0, 0.0, 0.0], top_k=1)
+    assert hit["id"] == "x" and abs(hit["score"]) < 1e-6, hit
+
+
+# ------------------------------------------------------------
+# A sparse value and a fusion constant past what a float32 holds
+# ------------------------------------------------------------
+def test_a_sparse_value_and_a_fusion_constant_past_the_float32_range_are_named_as_given():
+    """A sparse value and the k of a fusion are read as float32 as well, and
+    a finite one past what a float32 holds is refused naming it as given, in
+    add() and in query()."""
+    index = VectorDatabase().create("hnsw", dim=2, space="l2", expected_size=10, sparse={})
+    index.add({"id": "s0", "values": [0.1, 0.2], "sparse": {"dims": [1], "values": [1.0]}})
+    added = index.add({"id": "s", "values": [0.1, 0.2],
+                       "sparse": {"dims": [1], "values": [1e39]}})
+    assert added.errors == [
+        "Vector s: 'sparse' value at index 0 is 1e39, which a float32 holds as inf"
+    ], added.errors
+    with pytest.raises(ValueError) as refusal:
+        index.query(arms=[{"sparse": {"dims": [1], "values": [1e39]}}])
+    assert str(refusal.value) == (
+        "arms[0] 'sparse' value at index 0 is 1e39, which a float32 holds as inf")
+    with pytest.raises(ValueError) as refusal:
+        index.query(arms=[{"vector": [0.1, 0.2]}, {"sparse": {"dims": [1], "values": [1.0]}}],
+                    fusion={"type": "rrf", "k": 1e39})
+    assert str(refusal.value) == "fusion['k'] is 1e39, which a float32 holds as inf"

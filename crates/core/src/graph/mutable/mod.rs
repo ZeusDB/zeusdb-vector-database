@@ -37,10 +37,10 @@
 //! zero slab of `2 * m + 1` slots used to spend half its bytes on. What the
 //! builder reads is bounded: a reverse link is placed into a list that is
 //! already ordered, so [`MutableGraph::place_last`] evaluates the distance to
-//! the entries a binary search touches and to nothing else. The dump writer
-//! recomputes every edge's distance at save time, so the file carries what it
-//! carried when the distances were stored. The traversal reads no stored
-//! distance, since it scores every neighbour against the query.
+//! the entries a binary search touches and to nothing else. A dump records each
+//! list in the order the graph holds it, with no distance, and a load installs
+//! it in that order. The traversal reads no stored distance, since it scores
+//! every neighbour against the query.
 //!
 //! ## The capacity is one slot above the vendored threshold
 //!
@@ -124,19 +124,24 @@
 //! which carries a recorded read-then-act race on the parallel insertion path.
 //! These are plain integers because the mutator is serialised.
 
+#[cfg(any(test, feature = "test-support"))]
 use super::dump::EachNeighbourhood;
 #[cfg(test)]
 use super::dump::LoadedPoint;
-use super::dump::{AdjacencyWalk, LoadedEdge, PointId};
+use super::dump::{EachLists, ListWalk, LoadedEdge, PointId};
 use super::store::VectorStore;
 use super::traverse::{self, Topology, LAYERS};
-use super::{Distance, GraphHit};
+use super::{Distance, GraphHit, Held, Path};
+use crate::error::Error;
 use crate::space::Position;
 
 mod insert;
 // The layout of the struct the traversal borrows, held to recorded figures.
 #[cfg(test)]
 mod layout_tests;
+// The ceilings and the room an insertion is admitted under.
+#[cfg(test)]
+mod room_tests;
 
 /// What phase one hands phase two, re-exported so the seam can name it without
 /// the arena's own module being visible outside `mutable`.
@@ -152,10 +157,212 @@ const WORD_EMPTY: u32 = u32::MAX;
 /// rather than a target.
 ///
 /// A target is a node index, so a node index has to stay below this bit and
-/// away from [`WORD_EMPTY`]. [`MutableGraph::append_node`] refuses the node
-/// that would reach it, which is the 2,147,483,648th; at the smallest layer
-/// zero slab a graph of that many nodes holds twenty gigabytes of targets.
+/// away from [`WORD_EMPTY`], and so does a wide descriptor's index. Both are
+/// held there by their ceilings, [`MAX_NODES`] and [`MAX_WIDE_LISTS`]; at the
+/// smallest layer zero slab a graph of that many nodes holds twenty gigabytes
+/// of targets.
 const WORD_WIDE: u32 = 1 << 31;
+
+/// The most nodes a graph holds, so that every node index is below
+/// [`WORD_WIDE`].
+const MAX_NODES: usize = WORD_WIDE as usize;
+
+/// The most upper list words a graph holds. A node names its first word by a
+/// `u32` offset and [`NO_UPPER`] names none, so a run that ends within this
+/// ceiling starts below the marker.
+const MAX_WORDS: usize = NO_UPPER as usize;
+
+/// The most wide upper lists a graph holds, so that every wide descriptor's
+/// index is below [`WORD_WIDE`].
+const MAX_WIDE_LISTS: usize = WORD_WIDE as usize;
+
+/// The most upper list slots a graph holds. A wide list names its first slot
+/// by a `u32` offset, so a list that ends within this ceiling starts within
+/// one.
+const MAX_SLOTS: usize = u32::MAX as usize;
+
+/// What each of a graph's four growing arenas can address.
+///
+/// The room an insertion is admitted under holds a graph to these, and so do
+/// the loading constructors. A test lowers them through
+/// [`GRAPH_CEILINGS`] to reach the refusals without gigabytes of graph.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GraphCeilings {
+    /// Nodes.
+    pub nodes: usize,
+    /// Upper list words.
+    pub words: usize,
+    /// Wide upper lists.
+    pub wide_lists: usize,
+    /// Upper list slots.
+    pub slots: usize,
+}
+
+impl GraphCeilings {
+    /// The ceilings the layout sets.
+    pub const LAYOUT: GraphCeilings = GraphCeilings {
+        nodes: MAX_NODES,
+        words: MAX_WORDS,
+        wide_lists: MAX_WIDE_LISTS,
+        slots: MAX_SLOTS,
+    };
+
+    /// The ceilings in the order [`ARENAS`] names the arenas.
+    fn each(&self) -> [usize; 4] {
+        [self.nodes, self.words, self.wide_lists, self.slots]
+    }
+}
+
+// The ceilings this thread's graphs are held to, which a test lowers to reach
+// the refusals without gigabytes of graph. Nothing outside the tests sees it.
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    pub static GRAPH_CEILINGS: std::cell::Cell<GraphCeilings> =
+        const { std::cell::Cell::new(GraphCeilings::LAYOUT) };
+}
+
+/// The ceilings a graph is held to.
+#[cfg(any(test, feature = "test-support"))]
+fn ceilings() -> GraphCeilings {
+    GRAPH_CEILINGS.with(std::cell::Cell::get)
+}
+
+/// The ceilings a graph is held to.
+#[cfg(not(any(test, feature = "test-support")))]
+fn ceilings() -> GraphCeilings {
+    GraphCeilings::LAYOUT
+}
+
+/// The four arenas a refusal names, in the order the room counts them.
+const ARENAS: [&str; 4] = [
+    "nodes",
+    "upper list words",
+    "wide upper lists",
+    "upper list slots",
+];
+
+/// Where the nodes, the words, the wide lists and the slots sit in [`ARENAS`].
+const NODES: usize = 0;
+const WORDS: usize = 1;
+const WIDE_LISTS: usize = 2;
+const SLOTS: usize = 3;
+
+/// What an insertion growing an arena past its ceiling breaks, which the room
+/// the insertion was admitted under rules out.
+const ADMITTED: &str = "an insertion is admitted under the room its level leaves, which holds \
+                        every arena it grows within its ceiling";
+
+/// Refuse `more` entries where an arena holding `held` cannot take them under
+/// `ceiling`, in the words a loading constructor refuses a dump in.
+fn within(arena: usize, held: usize, more: usize, ceiling: usize) -> Result<(), String> {
+    let total = held.saturating_add(more);
+    if total > ceiling {
+        return Err(format!(
+            "the graph's {} would number {} and the graph can address {}",
+            ARENAS[arena], total, ceiling
+        ));
+    }
+    Ok(())
+}
+
+/// The room a graph has for insertions, and what the insertions a caller has
+/// admitted and not yet installed may take of it.
+///
+/// One insertion at level `L`, meeting an entry level `E`, grows each arena by
+/// at most what [`GraphRoom::bound`] gives, whatever the records around it
+/// do. It appends one node. Its own run of words is the higher of `L` and the
+/// highest layer its descent files an edge at, which is at most `E`, and
+/// where `L` is above `E` the old entry point is named at layer `L` and its
+/// run is regrown to `L` words. It opens a wide list at every layer up to
+/// `L`, and its search promotes at most one list a layer it visits, being the
+/// list of the node a layer's search starts from, since a node any list
+/// names at a layer already holds a wide list there. Each wide list takes
+/// `m + 1` slots.
+///
+/// The admitted insertions install in the order they were admitted, so each
+/// meets the higher of the graph's entry level and the levels admitted before
+/// it, which is the entry level the room carries forward.
+pub struct GraphRoom {
+    /// `max_nb_connection`, which sets a wide list's slots.
+    m: usize,
+    /// The graph's own entry level, which an insertion admitted alone meets,
+    /// and `None` where the graph holds no node.
+    entry: Option<usize>,
+    /// The entry level the next admitted insertion meets, and `None` where
+    /// neither the graph nor an admitted insertion holds a node.
+    top: Option<usize>,
+    /// What each arena holds, in the order of [`ARENAS`].
+    held: [usize; 4],
+    /// What the admitted insertions may add to each.
+    admitted: [usize; 4],
+    /// What each arena can address.
+    ceilings: [usize; 4],
+}
+
+impl GraphRoom {
+    /// The most one insertion at `level` can add to each arena, meeting the
+    /// entry level `top`. The first node of an empty graph searches nothing,
+    /// so it adds its own run and its own lists alone.
+    fn bound(&self, level: usize, top: Option<usize>) -> [usize; 4] {
+        let (words, wide) = match top {
+            None => (level, level),
+            Some(top) => {
+                let reach = top.max(level);
+                let regrown = if level > top { level } else { 0 };
+                (reach + regrown, level + reach)
+            }
+        };
+        [1, words, wide, wide.saturating_mul(self.m + 1)]
+    }
+
+    /// What each arena holds, as nodes, upper list words, wide upper lists
+    /// and upper list slots, for a test that sets a ceiling against them.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn held(&self) -> [usize; 4] {
+        self.held
+    }
+
+    /// Admit one insertion at `level`, or refuse it with the arena it could
+    /// take past its ceiling.
+    ///
+    /// The refusal says whether the insertion would have fit with nothing
+    /// admitted before it. Where it would, the graph has room for it and the
+    /// call admitting it is what is too large to place at once, and where it
+    /// would not, the graph is full for an insertion at that level. A refused
+    /// insertion adds nothing to what the room has admitted.
+    pub fn take(&mut self, level: usize) -> Result<(), Error> {
+        let needed = self.bound(level, self.top);
+        let passes = |admitted: &[usize; 4], needed: &[usize; 4]| {
+            (0..ARENAS.len()).find(|&arena| {
+                self.held[arena]
+                    .saturating_add(admitted[arena])
+                    .saturating_add(needed[arena])
+                    > self.ceilings[arena]
+            })
+        };
+        let Some(arena) = passes(&self.admitted, &needed) else {
+            for (admitted, needed) in self.admitted.iter_mut().zip(needed) {
+                *admitted = admitted.saturating_add(needed);
+            }
+            self.top = Some(self.top.map_or(level, |top| top.max(level)));
+            return Ok(());
+        };
+        let alone = self.bound(level, self.entry);
+        let (arena, needed, call) = match passes(&[0; 4], &alone) {
+            None => (arena, needed[arena], true),
+            Some(full) => (full, alone[full], false),
+        };
+        Err(Error::GraphFull {
+            arena: ARENAS[arena],
+            held: self.held[arena],
+            admitted: self.admitted[arena],
+            needed,
+            ceiling: self.ceilings[arena],
+            call,
+            rebuild: false,
+        })
+    }
+}
 
 /// Bytes the creation-time reservation may ask the allocator for.
 ///
@@ -176,7 +383,7 @@ const WORD_WIDE: u32 = 1 << 31;
 ///
 /// What it costs is reallocation on a build past the budget. The arenas grow
 /// geometrically, so a 50,000 record build at dimension 1,536 crosses it twice
-/// and moves roughly 400 MB in total, against a build that takes 70 seconds.
+/// and moves roughly 400 MB in total.
 pub(super) const RESERVE_BYTES: usize = 1 << 27;
 
 /// Records the reservation is taken for, being `expected_size` or as many as
@@ -226,6 +433,10 @@ fn wide_lists_per(m: usize) -> usize {
 /// entry level down to its own level plus one, so a node's span is the entry
 /// level at the moment it arrived. `log(n) / log(m)` is where the top of an
 /// exponential level distribution at scale `1 / ln(m)` lands.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "a span from f64, a cast that saturates, held below LAYERS by the min on its line"
+)]
 fn expected_span(m: usize, expected_size: usize) -> usize {
     if expected_size < 2 || m < 2 {
         return 0;
@@ -410,9 +621,10 @@ where
     /// caps a list at what the guarded pop needs. A refusal reaches the loader's
     /// rebuild path, which is what every other refusal reaches too.
     ///
-    /// The file's distances order each list and are then dropped, since the
-    /// structure holds targets alone. Every one of them is checked finite
-    /// first, which is the rule the vendored constructor applied to them.
+    /// Each list is ordered by its entries' distances and the distances are
+    /// then dropped, since the structure holds targets alone. Every one is
+    /// checked finite first. A parse of a version 2 dump gives every entry a
+    /// distance of zero, so its lists keep the order they were written in.
     ///
     /// Nodes are numbered in the order the dump streams them, which is layer
     /// major, so a loaded graph's node indices match the dump's exactly. Each
@@ -506,8 +718,8 @@ where
         );
 
         let mut store = VectorStore::with_capacity(dim, nb_point);
-        let mut lists: Vec<Vec<(f32, u32)>> = Vec::new();
-        let mut targets: Vec<u32> = Vec::new();
+        let mut lists: Vec<Vec<u32>> = Vec::new();
+        let mut ordered: Vec<(f32, u32)> = Vec::new();
         for (layer, &count) in layer_counts_in.iter().enumerate() {
             for rank in 0..count {
                 let point = next()?;
@@ -537,32 +749,30 @@ where
 
                 lists.clear();
                 for list in point.neighbours.into_iter() {
-                    let mut edges: Vec<(f32, u32)> = Vec::with_capacity(list.len());
-                    ordered_list(&list, &layer_offsets, &mut edges)?;
-                    lists.push(edges);
+                    let mut targets: Vec<u32> = Vec::with_capacity(list.len());
+                    ordered_targets(&list, &layer_offsets, &mut ordered, &mut targets)?;
+                    lists.push(targets);
                 }
-                graph.install_point(node, layer, rank, &lists, &mut targets)?;
+                graph.install_point(node, layer, rank, &lists)?;
             }
         }
         graph.finish_loading(entry_point, &layer_offsets)?;
         Ok((graph, store))
     }
 
-    /// Build the graph a dump's adjacency describes, walked point by point in
-    /// (layer, rank) order, `layer_counts[l]` points at layer `l`, the points
-    /// taking `origin_ids` in the same order and the positions `record_of`
-    /// gives them, which the reader numbered against the mappings.
+    /// Build the graph a dump's lists describe, walked node by node in layer
+    /// then rank order, `layer_counts[l]` nodes at layer `l`, the nodes taking
+    /// `origin_ids` in the same order and the positions `record_of` gives
+    /// them, which the reader numbered against the mappings.
     ///
-    /// Every list goes from the region's bytes into the slab its node owns,
-    /// ordered by the file's distances, through buffers kept from one point to
-    /// the next, so the walk allocates nothing a list. The rules are the ones
-    /// the tests' `from_points` applies, in the same order and in the same words,
-    /// and a refusal reaches the loader's rebuild path as every other refusal
-    /// does.
+    /// Every list goes from the walk into the slab its node owns, in the order
+    /// the walk hands it, through buffers kept from one node to the next, so
+    /// the build allocates nothing a list. The rules are the ones the tests'
+    /// `from_points` applies, in the same order and in the same words. A
+    /// refusal hands `origin_ids` and `record_of` back, so a reader whose
+    /// topology will not build still holds what its rows are filed by.
     ///
-    /// The vectors are not part of it. The reader streams them into the store
-    /// once the region's block is gone, so the region and the store are never
-    /// held together.
+    /// The rows are not part of it. The reader streams them into the store.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn from_adjacency(
         layer_counts_in: &[usize],
@@ -574,16 +784,29 @@ where
         dist_f: D,
         origin_ids: Vec<usize>,
         record_of: Vec<u32>,
-        mut walk: AdjacencyWalk<'_>,
-    ) -> Result<Self, String> {
+        mut walk: impl ListWalk,
+    ) -> Result<Self, NotBuilt> {
         let (layer_counts, layer_offsets, nb_point) =
-            loading_layout(layer_counts_in, m, level_scale)?;
+            match loading_layout(layer_counts_in, m, level_scale) {
+                Ok(layout) => layout,
+                Err(reason) => {
+                    return Err(NotBuilt {
+                        reason,
+                        origin_ids,
+                        record_of,
+                    })
+                }
+            };
         if origin_ids.len() != nb_point {
-            return Err(format!(
-                "the graph holds {} points and {} origin ids",
-                nb_point,
-                origin_ids.len()
-            ));
+            return Err(NotBuilt {
+                reason: format!(
+                    "the graph holds {} points and {} origin ids",
+                    nb_point,
+                    origin_ids.len()
+                ),
+                origin_ids,
+                record_of,
+            });
         }
         debug_assert_eq!(
             record_of.len(),
@@ -602,33 +825,48 @@ where
             record_of,
         );
 
-        let mut carried: Vec<Vec<LoadedEdge>> = Vec::new();
-        let mut lists: Vec<Vec<(f32, u32)>> = Vec::new();
-        let mut targets: Vec<u32> = Vec::new();
+        let mut lists: Vec<Vec<u32>> = Vec::new();
         for (layer, &count) in layer_counts_in.iter().enumerate() {
             for rank in 0..count {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "a rank within its layer's count, which loading_layout holds below 2^31"
+                )]
                 let node = layer_offsets[layer] + rank as u32;
-                let list_count = walk.next_point(&mut carried);
+                let list_count = match walk.next_lists(&layer_offsets, &mut lists) {
+                    Ok(list_count) => list_count,
+                    Err(reason) => return Err(graph.not_built(reason)),
+                };
                 if list_count > LAYERS {
-                    return Err(format!(
+                    return Err(graph.not_built(format!(
                         "the point at layer {} rank {} carries adjacency for {} layers and \
                          a point carries at most {}",
                         layer, rank, list_count, LAYERS
-                    ));
+                    )));
                 }
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "a layer of the layer table, below LAYERS, 16"
+                )]
                 graph.levels.push(layer as u8);
-
-                while lists.len() < list_count {
-                    lists.push(Vec::new());
+                if let Err(reason) = graph.install_point(node, layer, rank, &lists[..list_count]) {
+                    return Err(graph.not_built(reason));
                 }
-                for (list, edges) in carried.iter().zip(lists.iter_mut()).take(list_count) {
-                    ordered_list(list, &layer_offsets, edges)?;
-                }
-                graph.install_point(node, layer, rank, &lists[..list_count], &mut targets)?;
             }
         }
-        graph.finish_loading(entry_point, &layer_offsets)?;
+        if let Err(reason) = graph.finish_loading(entry_point, &layer_offsets) {
+            return Err(graph.not_built(reason));
+        }
         Ok(graph)
+    }
+
+    /// A refusal of the loading constructor, carrying back what it took.
+    fn not_built(self, reason: String) -> NotBuilt {
+        NotBuilt {
+            reason,
+            origin_ids: self.origin_ids,
+            record_of: self.record_of,
+        }
     }
 
     /// The graph a loading constructor fills: the per node arrays sized for
@@ -694,8 +932,7 @@ where
         node: u32,
         layer: usize,
         rank: usize,
-        lists: &[Vec<(f32, u32)>],
-        targets: &mut Vec<u32>,
+        lists: &[Vec<u32>],
     ) -> Result<(), String> {
         let mut span = layer;
         for (list_layer, list) in lists.iter().enumerate() {
@@ -703,9 +940,9 @@ where
                 span = span.max(list_layer);
             }
         }
-        self.open_node(span, |list_layer| {
+        self.try_open_node(span, |list_layer| {
             list_layer <= layer && lists.get(list_layer).is_some_and(|list| !list.is_empty())
-        });
+        })?;
 
         for (list_layer, list) in lists.iter().enumerate() {
             if list.is_empty() {
@@ -727,9 +964,7 @@ where
                     cap
                 ));
             }
-            targets.clear();
-            targets.extend(list.iter().map(|&(_, target)| target));
-            self.install_loaded_list(node, list_layer, targets);
+            self.install_loaded_list(node, list_layer, list)?;
         }
         Ok(())
     }
@@ -754,12 +989,19 @@ where
         // span grown on the way is a node's, and the list it opens is empty,
         // so what the pass reads is the edges the walk installed and nothing
         // else, in the order it would have collected them.
+        //
+        // A span grown or a list promoted here takes words, wide lists and
+        // slots the walk did not, so each is held to its ceiling as it grows.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the node count, held below 2^31 by append_node and loading_layout"
+        )]
         for node in 0..self.origin_ids.len() as u32 {
             for layer in 0..=self.span(node) {
                 for slot in 0..self.list_len(node, layer) {
                     let target = self.target_at(node, layer, slot);
-                    self.grow_span(target, layer);
-                    self.bump_in_degree(target, layer, 1);
+                    self.try_grow_span(target, layer)?;
+                    self.try_bump_in_degree(target, layer, 1)?;
                 }
             }
         }
@@ -1067,6 +1309,10 @@ where
         // is `above_level_edges`. Walking the nodes rather than summing the
         // wide lengths is also what keeps an abandoned word run, which
         // `grow_span` leaves behind, out of the count.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the node count, held below 2^31 by append_node and loading_layout"
+        )]
         let upper: usize = (0..self.origin_ids.len() as u32)
             .map(|node| {
                 (1..=self.levels[node as usize] as usize)
@@ -1079,6 +1325,10 @@ where
 
     /// Edges sitting at layers above their owner's level, which the vendored
     /// descent files and the vendored reverse update adds to.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the node count, held below 2^31 by append_node and loading_layout"
+    )]
     pub(super) fn above_level_edges(&self) -> usize {
         (0..self.origin_ids.len() as u32)
             .map(|node| {
@@ -1104,6 +1354,24 @@ where
     /// Slots the upper target arena holds, allocated rather than filled.
     pub(super) fn upper_slots(&self) -> usize {
         self.upper_targets.len()
+    }
+
+    /// The room this graph has for insertions, with nothing admitted yet.
+    pub(super) fn room(&self) -> GraphRoom {
+        let entry = (!self.origin_ids.is_empty()).then_some(self.entry_level as usize);
+        GraphRoom {
+            m: self.m,
+            entry,
+            top: entry,
+            held: [
+                self.origin_ids.len(),
+                self.upper_word.len(),
+                self.wide_at.len(),
+                self.upper_targets.len(),
+            ],
+            admitted: [0; 4],
+            ceilings: ceilings().each(),
+        }
     }
 
     /// Upper list words by what they hold, as (empty, one entry, wide), for
@@ -1220,6 +1488,10 @@ where
     /// the one place the dump's positional identity is readable from outside a
     /// save. It exists so a round trip can be compared on where each point
     /// landed and not only on what each point holds.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the node count, held below 2^31 by append_node and loading_layout"
+    )]
     pub(super) fn point_ids(&self) -> Vec<PointId> {
         let order = DumpOrder::of(self);
         (0..self.origin_ids.len() as u32)
@@ -1305,42 +1577,60 @@ where
     /// because install site 2 fills it wholesale. A load opens wide only the
     /// ones the dump fills, since nothing fills the rest wholesale afterwards
     /// and a word is promoted the first time its owner is named.
-    fn open_node(&mut self, span: usize, wide: impl Fn(usize) -> bool) {
+    ///
+    /// Refused where the run or a wide list it opens would take an arena past
+    /// its ceiling, which a load reports as a topology it cannot build. An
+    /// insertion opens a node through [`Self::open_node`].
+    fn try_open_node(&mut self, span: usize, wide: impl Fn(usize) -> bool) -> Result<(), String> {
         if span == 0 {
             self.upper_first.push(NO_UPPER);
             self.upper_span.push(0);
-            return;
+            return Ok(());
         }
-        self.upper_first.push(self.upper_word.len() as u32);
+        within(WORDS, self.upper_word.len(), span, ceilings().words)?;
+        let first = u32::try_from(self.upper_word.len())
+            .expect("the word arena is held within its ceiling, which no u32 offset passes");
+        self.upper_first.push(first);
+        #[expect(clippy::cast_possible_truncation, reason = "a span, below LAYERS, 16")]
         self.upper_span.push(span as u8);
         for layer in 1..=span {
             let word = if wide(layer) {
-                WORD_WIDE | self.open_wide()
+                WORD_WIDE | self.try_open_wide()?
             } else {
                 WORD_EMPTY
             };
             self.upper_word.push(word);
         }
+        Ok(())
+    }
+
+    /// [`Self::try_open_node`] for an insertion, which the room it was
+    /// admitted under holds within every ceiling.
+    fn open_node(&mut self, span: usize, wide: impl Fn(usize) -> bool) {
+        self.try_open_node(span, wide).expect(ADMITTED);
     }
 
     /// Append one wide descriptor with its `m + 1` slots, and hand back its
-    /// index.
-    fn open_wide(&mut self) -> u32 {
+    /// index, or refuse where the lists or the slots would pass their
+    /// ceilings.
+    fn try_open_wide(&mut self) -> Result<u32, String> {
+        let ceilings = ceilings();
+        let cap = self.upper_cap_full();
+        within(WIDE_LISTS, self.wide_at.len(), 1, ceilings.wide_lists)?;
+        within(SLOTS, self.upper_targets.len(), cap, ceilings.slots)?;
         let wide = u32::try_from(self.wide_at.len())
-            .expect("a wide list index is a u32 and the arena is checked on every open");
-        assert!(
-            wide < WORD_WIDE,
-            "the graph holds as many wide upper lists as a word names"
-        );
-        self.wide_at.push(self.upper_targets.len() as u32);
+            .expect("the wide lists are held below their ceiling, which is WORD_WIDE");
+        let at = u32::try_from(self.upper_targets.len())
+            .expect("the slot arena is held within its ceiling, which no u32 offset passes");
+        self.wide_at.push(at);
         self.wide_len.push(0);
         self.wide_in_degree.push(0);
-        let cap = self.upper_cap_full();
         self.upper_targets.resize(self.upper_targets.len() + cap, 0);
-        wide
+        Ok(wide)
     }
 
-    /// Raise one node's span so that it owns a list at `layer`.
+    /// Raise one node's span so that it owns a list at `layer`, or refuse
+    /// where its new run would take the words past their ceiling.
     ///
     /// A node's words are consecutive, so extending the run means moving it to
     /// the end of the word arena and leaving the old one behind. A wide list's
@@ -1348,10 +1638,15 @@ where
     /// node is named at a layer above its own level, which happens to the point
     /// that was the entry point when a higher one arrived, so it is on the order
     /// of the entry level per graph rather than per node.
-    fn grow_span(&mut self, node: u32, layer: usize) {
+    ///
+    /// Every node opens a span at least its level, and a span only grows, so
+    /// every layer the run grows to is above the node's level and takes an
+    /// empty word.
+    #[expect(clippy::cast_possible_truncation, reason = "a layer, below LAYERS, 16")]
+    fn try_grow_span(&mut self, node: u32, layer: usize) -> Result<(), String> {
         let old_span = self.span(node);
         if layer <= old_span {
-            return;
+            return Ok(());
         }
         assert!(
             layer < LAYERS,
@@ -1360,46 +1655,65 @@ where
             LAYERS
         );
         let level = self.levels[node as usize] as usize;
+        assert!(
+            old_span >= level,
+            "node {} spans {} layers and its level is {}, and every node opens a span at least \
+             its level",
+            node,
+            old_span,
+            level
+        );
+        within(WORDS, self.upper_word.len(), layer, ceilings().words)?;
         let old_first = self.upper_first[node as usize] as usize;
-        let new_first = self.upper_word.len() as u32;
+        let new_first = u32::try_from(self.upper_word.len())
+            .expect("the word arena is held within its ceiling, which no u32 offset passes");
         for slot in 0..old_span {
             let word = self.upper_word[old_first + slot];
             self.upper_word.push(word);
         }
-        for new_layer in (old_span + 1)..=layer {
-            let word = if new_layer <= level {
-                WORD_WIDE | self.open_wide()
-            } else {
-                WORD_EMPTY
-            };
-            self.upper_word.push(word);
+        for _ in (old_span + 1)..=layer {
+            self.upper_word.push(WORD_EMPTY);
         }
         self.upper_first[node as usize] = new_first;
         self.upper_span[node as usize] = layer as u8;
+        Ok(())
+    }
+
+    /// [`Self::try_grow_span`] for an insertion, which the room it was
+    /// admitted under holds within every ceiling.
+    fn grow_span(&mut self, node: u32, layer: usize) {
+        self.try_grow_span(node, layer).expect(ADMITTED);
     }
 
     /// Promote one list held as a word to a wide list, carrying its entry if it
-    /// holds one, and hand back the wide descriptor's index.
+    /// holds one, and hand back the wide descriptor's index, or refuse where
+    /// the list would take the lists or the slots past their ceilings.
     ///
     /// This is what a second entry needs and what an inbound counter needs,
     /// since both live on the wide descriptor. It fires for the old entry
     /// points' lists above their level and for nothing else on a build, and
     /// on a load also for an empty list at or below its owner's level that an
     /// entry names.
-    fn promote(&mut self, list: usize) -> usize {
+    fn try_promote(&mut self, list: usize) -> Result<usize, String> {
         let word = self.upper_word[list];
         assert!(
             word & WORD_WIDE == 0 || word == WORD_EMPTY,
             "a list is promoted once"
         );
-        let wide = self.open_wide();
+        let wide = self.try_open_wide()?;
         if word != WORD_EMPTY {
             let at = self.wide_at[wide as usize] as usize;
             self.upper_targets[at] = word;
             self.wide_len[wide as usize] = 1;
         }
         self.upper_word[list] = WORD_WIDE | wide;
-        wide as usize
+        Ok(wide as usize)
+    }
+
+    /// [`Self::try_promote`] for an insertion, which the room it was admitted
+    /// under holds within every ceiling.
+    fn promote(&mut self, list: usize) -> usize {
+        self.try_promote(list).expect(ADMITTED)
     }
 
     /// One entry of one list.
@@ -1440,13 +1754,14 @@ where
     /// there rather than assuming one, and promotes a list held as one word,
     /// since the counter lives on the wide descriptor. The vendored counterpart
     /// never has to, since it carries sixteen counters on every point whatever
-    /// its level.
+    /// its level. Refused where the span or the promotion would take an arena
+    /// past its ceiling.
     #[inline]
-    fn bump_in_degree(&mut self, node: u32, layer: usize, delta: i32) {
+    fn try_bump_in_degree(&mut self, node: u32, layer: usize, delta: i32) -> Result<(), String> {
         let slot = if layer == 0 {
             &mut self.base_in_degree[node as usize]
         } else {
-            self.grow_span(node, layer);
+            self.try_grow_span(node, layer)?;
             let list = self
                 .upper_list(node, layer)
                 .expect("the span was just grown to cover this layer");
@@ -1457,7 +1772,7 @@ where
                         delta > 0,
                         "an inbound counter is lowered only on a list that was raised"
                     );
-                    self.promote(list)
+                    self.try_promote(list)?
                 }
             };
             &mut self.wide_in_degree[wide]
@@ -1465,6 +1780,14 @@ where
         *slot = slot
             .checked_add_signed(delta)
             .expect("an inbound counter is moved once per edge installed or evicted");
+        Ok(())
+    }
+
+    /// [`Self::try_bump_in_degree`] for an insertion, which the room it was
+    /// admitted under holds within every ceiling.
+    #[inline]
+    fn bump_in_degree(&mut self, node: u32, layer: usize, delta: i32) {
+        self.try_bump_in_degree(node, layer, delta).expect(ADMITTED);
     }
 
     /// Whether one list already names a node, which the reverse update asks
@@ -1492,10 +1815,18 @@ where
             targets.len()
         );
         match slab {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a list's length, at most 2m + 1 slots, 513 at the largest m"
+            )]
             Slab::Base => {
                 self.base_targets[at..at + targets.len()].copy_from_slice(targets);
                 self.base_len[node as usize] = targets.len() as u16;
             }
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a list's length, at most 2m + 1 slots, 513 at the largest m"
+            )]
             Slab::Wide => {
                 self.upper_targets[at..at + targets.len()].copy_from_slice(targets);
                 let list = self
@@ -1517,8 +1848,14 @@ where
     /// The caller has checked the length against the cap of the layer. A list
     /// above the owner's level holding one entry is the word itself, and one
     /// holding more is promoted first, which is the state a built graph holds
-    /// an old entry point's list in.
-    fn install_loaded_list(&mut self, node: u32, layer: usize, targets: &[u32]) {
+    /// an old entry point's list in. Refused where the promotion would take
+    /// the lists or the slots past their ceilings.
+    fn install_loaded_list(
+        &mut self,
+        node: u32,
+        layer: usize,
+        targets: &[u32],
+    ) -> Result<(), String> {
         if layer > 0 {
             let list = self
                 .upper_list(node, layer)
@@ -1526,12 +1863,13 @@ where
             if self.wide_of(list).is_none() {
                 if targets.len() == 1 {
                     self.upper_word[list] = targets[0];
-                    return;
+                    return Ok(());
                 }
-                self.promote(list);
+                self.try_promote(list)?;
             }
         }
         self.write_list(node, layer, targets);
+        Ok(())
     }
 
     /// Append one edge to one list, which is what the reverse update and the
@@ -1548,6 +1886,10 @@ where
             None => panic!("node {} owns no list at layer {}", node, layer),
         };
         match slab {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a list's length, at most 2m + 1 slots, 513 at the largest m"
+            )]
             Slab::Base => {
                 assert!(
                     len < self.base_cap(),
@@ -1569,6 +1911,10 @@ where
                     self.wide_len[wide] = 2;
                 }
             }
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a list's length, at most 2m + 1 slots, 513 at the largest m"
+            )]
             Slab::Wide => {
                 let cap = self.upper_cap_full();
                 assert!(
@@ -1593,8 +1939,9 @@ where
     ///
     /// Every list is ordered by the distance from its owner to each target
     /// whenever no push is in flight: install site 2 writes a list phase one
-    /// sorted, the descent writes one entry, the loader sorts by the file's
-    /// distances, and an eviction shifts entries without reordering them. So
+    /// sorted, the descent writes one entry, the loader installs a version 2
+    /// list as written and orders a version 1 list by its stored distances,
+    /// and an eviction shifts entries without reordering them. So
     /// the entries before the last are in order and the last is the one whose
     /// place is not known. A binary search over the ordered entries finds it,
     /// evaluating the distance to each entry it probes and to nothing else,
@@ -1608,8 +1955,16 @@ where
     /// order they were filed in. A NaN panics as the sort's comparator did.
     ///
     /// This runs once per reverse link per layer, which is the hottest list
-    /// operation in the insert.
-    fn place_last(&mut self, node: u32, layer: usize, store: &VectorStore<T>, dist: f32) {
+    /// operation in the insert. Every distance it evaluates comes from the
+    /// scorer of `path`.
+    fn place_last<P: Path<T, D>>(
+        &mut self,
+        path: P,
+        node: u32,
+        layer: usize,
+        store: &VectorStore<T>,
+        dist: f32,
+    ) {
         assert!(!dist.is_nan(), "got a NaN in a distance");
         let (at, len, slab) = match self.slice_of(node, layer) {
             Some(found) => found,
@@ -1619,7 +1974,7 @@ where
             return;
         }
         let owner = store.get(node);
-        let dist_f = &self.dist_f;
+        let dist_f = path.scorer(&self.dist_f);
         let ordered = &self.neighbours_at(node, layer)[..len - 1];
         let place = ordered.partition_point(|&target| {
             let d = dist_f.eval(owner, store.get(target));
@@ -1646,6 +2001,10 @@ where
         };
         assert!(slot < len, "slot {} of a list holding {}", slot, len);
         match slab {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a list's length, at most 2m + 1 slots, 513 at the largest m"
+            )]
             Slab::Base => {
                 let removed = self.base_targets[at + slot];
                 self.base_targets
@@ -1653,6 +2012,10 @@ where
                 self.base_len[node as usize] = (len - 1) as u16;
                 removed
             }
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a list's length, at most 2m + 1 slots, 513 at the largest m"
+            )]
             Slab::Wide => {
                 let removed = self.upper_targets[at + slot];
                 self.upper_targets
@@ -1708,12 +2071,9 @@ where
             level,
             LAYERS
         );
+        within(NODES, self.origin_ids.len(), 1, ceilings().nodes).expect(ADMITTED);
         let node = u32::try_from(self.origin_ids.len())
-            .expect("a node index is a u32 and the arena is checked on every append");
-        assert!(
-            node < WORD_WIDE,
-            "the graph holds as many nodes as an upper list word names"
-        );
+            .expect("the nodes are held below their ceiling, which is WORD_WIDE");
 
         debug_assert_eq!(
             store.len(),
@@ -1721,6 +2081,7 @@ where
             "the store is addressed by node index, so it holds one vector per node"
         );
         self.origin_ids.push(origin_id);
+        #[expect(clippy::cast_possible_truncation, reason = "a level, below LAYERS, 16")]
         self.levels.push(level as u8);
         self.record_of.push(position);
         store.push(data);
@@ -1745,6 +2106,7 @@ where
 
     /// Move the traversal's starting point, which insertion does when it draws
     /// a level above every level drawn before it.
+    #[expect(clippy::cast_possible_truncation, reason = "a level, below LAYERS, 16")]
     fn set_entry(&mut self, node: u32, level: usize) {
         self.entry = node;
         self.entry_level = level as u8;
@@ -1798,12 +2160,122 @@ where
     /// property and stay meaningful if the counters are ever wrong.
     pub(super) fn counted_in_degree(&self, layer: usize) -> Vec<u32> {
         let mut counts = vec![0u32; self.origin_ids.len()];
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the node count, held below 2^31 by append_node and loading_layout"
+        )]
         for node in 0..self.origin_ids.len() as u32 {
             for &target in self.neighbours_at(node, layer) {
                 counts[target as usize] += 1;
             }
         }
         counts
+    }
+
+    /// Whether the graph holds its own structure, with the first rule it
+    /// breaks where it does not, read against `store`, the rows it scores.
+    ///
+    /// The rules every insertion and every load leave, whatever the records.
+    /// Every list holds at most its layer's threshold, `2m` at layer zero and
+    /// `m` above, since the overflow slot is filled and emptied within one
+    /// push. No list names its owner, a node twice, or a node the graph does
+    /// not hold. Every list is in order of the distance from its owner to
+    /// each target, ties in either order. Every node owns a list at each
+    /// layer up to its level. The layer table counts the nodes at each
+    /// level. The entry is a node at the highest level, which the graph
+    /// records as the entry's. Every inbound counter equals the lists at its
+    /// layer naming its node, so a node a list names at a layer owns a
+    /// promoted list there. A node may own lists above its level and be named
+    /// above it, which the descent and the reverse update leave, so no rule
+    /// ties a target's level to the layer it is named at.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn structure_holds(&self, store: &VectorStore<T>) -> Result<(), String> {
+        let count = u32::try_from(self.origin_ids.len())
+            .map_err(|_| "the graph holds more nodes than a u32 numbers".to_string())?;
+        let mut at_level = [0u32; LAYERS];
+        let mut highest = 0u8;
+        for node in 0..count {
+            let level = self.levels[node as usize];
+            at_level[usize::from(level)] += 1;
+            highest = highest.max(level);
+            let span = self.span(node);
+            if span < usize::from(level) {
+                return Err(format!(
+                    "node {node} is at level {level} and owns lists to layer {span}"
+                ));
+            }
+            let owner = store.get(node);
+            for layer in 0..=span {
+                let list = self.neighbours_at(node, layer);
+                let threshold = if layer == 0 { 2 * self.m } else { self.m };
+                if list.len() > threshold {
+                    return Err(format!(
+                        "node {node} holds {} entries at layer {layer}, and its threshold is \
+                         {threshold}",
+                        list.len()
+                    ));
+                }
+                let mut nearer: Option<f32> = None;
+                for (slot, &target) in list.iter().enumerate() {
+                    if target >= count {
+                        return Err(format!(
+                            "node {node} names node {target} at layer {layer}, and the graph \
+                             holds {count}"
+                        ));
+                    }
+                    if target == node {
+                        return Err(format!("node {node} names itself at layer {layer}"));
+                    }
+                    if list[..slot].contains(&target) {
+                        return Err(format!(
+                            "node {node} names node {target} twice at layer {layer}"
+                        ));
+                    }
+                    let distance = self.dist_f.eval(owner, store.get(target));
+                    if distance.is_nan() {
+                        return Err(format!(
+                            "node {node} is at a NaN distance from node {target} at layer {layer}"
+                        ));
+                    }
+                    if let Some(previous) = nearer.filter(|&previous| distance < previous) {
+                        return Err(format!(
+                            "node {node} holds node {target} at {distance} after an entry at \
+                             {previous} at layer {layer}"
+                        ));
+                    }
+                    nearer = Some(distance);
+                }
+            }
+        }
+        if self.layer_counts != at_level {
+            return Err(format!(
+                "the layer table holds {:?} and the levels count {:?}",
+                self.layer_counts, at_level
+            ));
+        }
+        if count > 0
+            && (self.entry >= count
+                || self.levels[self.entry as usize] != self.entry_level
+                || self.entry_level != highest)
+        {
+            return Err(format!(
+                "the entry is node {} at recorded level {}, and the highest level is {highest}",
+                self.entry, self.entry_level
+            ));
+        }
+        for layer in 0..LAYERS {
+            let counted = self.counted_in_degree(layer);
+            for node in 0..count {
+                let (named, held) = (counted[node as usize], self.in_degree(node, layer));
+                if held != named {
+                    return Err(format!(
+                        "node {node} is named by {named} lists at layer {layer} and its counter \
+                         holds {held}"
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Every inbound counter the graph holds that is above zero, keyed by the
@@ -1922,13 +2394,9 @@ where
         total
     }
 
-    /// Search the graph, which is [`traverse::search`] over this layout.
-    ///
-    /// The empty case is answered here rather than in the traversal, which has
-    /// no early return for it because neither loading constructor accepts a
-    /// graph of no points. [`Self::new`] does, since a graph being built by
-    /// insertion starts empty, and the vendored `search_filter` answers the same
-    /// question the same way.
+    /// Search the graph, which is [`traverse::search`] over this layout, under
+    /// a predicate with the size test and with no predicate without it. See
+    /// [`traverse::search_layer`].
     pub(super) fn search<F>(
         &self,
         store: &VectorStore<T>,
@@ -1940,25 +2408,95 @@ where
     where
         F: Fn(&usize) -> bool,
     {
+        match filter {
+            None => self.search_with::<Held, fn(&usize) -> bool, false>(
+                Held, store, data, knbn, ef_arg, None,
+            ),
+            Some(admits) => {
+                self.search_with::<Held, F, true>(Held, store, data, knbn, ef_arg, Some(admits))
+            }
+        }
+    }
+
+    /// Search the graph, which is [`traverse::search`] over this layout, in
+    /// the instance `UNTIL_FULL` names, with every distance evaluated on
+    /// `path`.
+    ///
+    /// The empty case is answered here rather than in the traversal, which has
+    /// no early return for it because neither loading constructor accepts a
+    /// graph of no points. [`Self::new`] does, since a graph being built by
+    /// insertion starts empty, and the vendored `search_filter` answers the same
+    /// question the same way.
+    ///
+    /// Never inlined, so the traversal of each distance, each path and each
+    /// predicate is compiled alone and shares no registers and no stack
+    /// frame with another.
+    #[inline(never)]
+    pub(super) fn search_with<P, F, const UNTIL_FULL: bool>(
+        &self,
+        path: P,
+        store: &VectorStore<T>,
+        data: &[T],
+        knbn: usize,
+        ef_arg: usize,
+        filter: Option<&F>,
+    ) -> Vec<GraphHit>
+    where
+        P: Path<T, D>,
+        F: Fn(&usize) -> bool,
+    {
         if self.origin_ids.is_empty() {
             return Vec::new();
         }
-        traverse::search(&self.bound(store), data, knbn, ef_arg, filter)
+        traverse::search::<_, F, UNTIL_FULL>(&self.bound(path, store), data, knbn, ef_arg, filter)
     }
 
-    /// This graph with its store, which is what a traversal reads.
+    /// This graph with its store and the path its distances are evaluated
+    /// on, which is what a traversal reads.
     #[inline]
-    pub(in crate::graph) fn bound<'a>(&'a self, store: &'a VectorStore<T>) -> Bound<'a, T, D> {
-        Bound { graph: self, store }
+    pub(in crate::graph) fn bound<'a, P: Path<T, D>>(
+        &'a self,
+        path: P,
+        store: &'a VectorStore<T>,
+    ) -> Bound<'a, T, D, P> {
+        Bound {
+            graph: self,
+            store,
+            path,
+        }
     }
 
-    /// One node's adjacency as a dump records it, being every list from layer
-    /// zero up to the highest layer the node carries anything at, each edge
-    /// carrying the distance from the node to its target, recomputed.
+    /// One node's lists as a version 2 dump records them, being every list
+    /// from layer zero up to the highest layer the node owns one at, each
+    /// target as its index in the dump's node order, in the order the list
+    /// holds it.
     ///
     /// Empty lists in the middle are kept, because a node can carry residue at
     /// a layer above one it carries nothing at, and the file records lists by
-    /// position. Trailing empty lists are the writer's business to trim.
+    /// position. Trailing empty lists are the writer's to leave out.
+    fn lists_into(&self, node: u32, order: &DumpOrder, out: &mut Vec<Vec<u32>>) {
+        for list in out.iter_mut() {
+            list.clear();
+        }
+        while out.len() < LAYERS {
+            out.push(Vec::new());
+        }
+        let lists = self.span(node) + 1;
+        for (layer, list) in out.iter_mut().enumerate().take(lists) {
+            list.extend(
+                self.neighbours_at(node, layer)
+                    .iter()
+                    .map(|&target| order.node_index(self, target)),
+            );
+        }
+    }
+
+    /// One node's adjacency as a version 1 dump records it, being every list
+    /// from layer zero up to the highest layer the node carries anything at,
+    /// each edge carrying the distance from the node to its target,
+    /// recomputed. Empty lists in the middle are kept and trailing empty lists
+    /// are the writer's to leave out.
+    #[cfg(any(test, feature = "test-support"))]
     fn neighbourhood_into(
         &self,
         node: u32,
@@ -1993,21 +2531,25 @@ where
 /// is the whole of what design B costs at a distance evaluation: one load of
 /// the store's base pointer, which the optimiser hoists out of the neighbour
 /// loop, and then the same multiply and slice the arena used.
-pub(in crate::graph) struct Bound<'a, T, D> {
+pub(in crate::graph) struct Bound<'a, T, D, P> {
     pub(in crate::graph) graph: &'a MutableGraph<T, D>,
     pub(in crate::graph) store: &'a VectorStore<T>,
+    /// The path the traversal's distances are evaluated on.
+    pub(in crate::graph) path: P,
 }
 
-impl<T, D> Topology for Bound<'_, T, D>
+impl<'a, T, D, P> Topology for Bound<'a, T, D, P>
 where
     T: Clone + Send + Sync,
     D: Distance<T> + Send + Sync,
+    P: Path<T, D>,
 {
     type Elem = T;
-    type Dist = D;
+    type Dist = P::Scorer<'a>;
 
-    fn distance(&self) -> &D {
-        self.graph.distance()
+    #[inline]
+    fn distance(&self) -> P::Scorer<'a> {
+        self.path.scorer(self.graph.distance())
     }
 
     fn nb_points(&self) -> usize {
@@ -2087,6 +2629,10 @@ impl DumpOrder {
         let mut cursor = offsets;
         let mut by_layer = vec![0u32; graph.origin_ids.len()];
         let mut rank = vec![0u32; graph.origin_ids.len()];
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a node index, held below 2^31 by append_node and loading_layout"
+        )]
         for (node, &level) in graph.levels.iter().enumerate() {
             let level = level as usize;
             let at = cursor[level];
@@ -2101,13 +2647,23 @@ impl DumpOrder {
         }
     }
 
-    /// Where one node sits, as the dump names it.
+    /// Where one node sits, as its layer and its rank within that layer.
     fn point_id<T, D>(&self, graph: &MutableGraph<T, D>, node: u32) -> PointId
     where
         T: Clone + Send + Sync,
         D: Distance<T> + Send + Sync,
     {
         PointId(graph.levels[node as usize], self.rank[node as usize] as i32)
+    }
+
+    /// One node's index in the dump's layer then rank order, which is how a
+    /// version 2 dump names it.
+    fn node_index<T, D>(&self, graph: &MutableGraph<T, D>, node: u32) -> u32
+    where
+        T: Clone + Send + Sync,
+        D: Distance<T> + Send + Sync,
+    {
+        self.offsets[graph.levels[node as usize] as usize] + self.rank[node as usize]
     }
 
     /// The nodes of one layer, in rank order.
@@ -2191,6 +2747,16 @@ where
         Ok(())
     }
 
+    fn each_lists(&self, layer: usize, f: EachLists<'_>) -> Result<(), String> {
+        let mut scratch: Vec<Vec<u32>> = Vec::new();
+        for &node in self.order.layer(layer) {
+            self.graph.lists_into(node, &self.order, &mut scratch);
+            f(&scratch)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
     fn each_neighbourhood(&self, layer: usize, f: EachNeighbourhood<'_>) -> Result<(), String> {
         let mut scratch: Vec<Vec<LoadedEdge>> = Vec::new();
         for &node in self.order.layer(layer) {
@@ -2239,13 +2805,22 @@ fn edge_target(edge: &LoadedEdge, layer_offsets: &[u32; LAYERS + 1]) -> Result<u
     Ok(layer_offsets[target_layer] + edge.target.1 as u32)
 }
 
+/// A refusal of [`MutableGraph::from_adjacency`], with the origin ids and the
+/// positions it was handed, so a reader still holds what its rows are filed
+/// by.
+pub(super) struct NotBuilt {
+    pub(super) reason: String,
+    pub(super) origin_ids: Vec<usize>,
+    pub(super) record_of: Vec<u32>,
+}
+
 /// The rules both loading constructors apply before anything is sized, and
 /// what they give: each layer's node count, where each layer's run starts in
 /// node order with a sentinel after the last, and the node count.
 ///
-/// A rank is an `i32` in a dump and a node index a `u32`, and an upper list
-/// word names a node below [`WORD_WIDE`], so a layer table past any of those
-/// is refused here rather than wrapped later.
+/// A rank is an `i32` in a dump, and a graph holds no more nodes than its
+/// ceiling, which keeps every node index below [`WORD_WIDE`], so a layer table
+/// past either is refused here rather than wrapped later.
 fn loading_layout(
     layer_counts_in: &[usize],
     m: usize,
@@ -2286,19 +2861,12 @@ fn loading_layout(
     if nb_point == 0 {
         return Err("a graph holding no points has no entry point".to_string());
     }
-    if nb_point > u32::MAX as usize {
-        return Err(format!(
-            "the graph holds {} points and a node index is a u32",
-            nb_point
-        ));
-    }
-    if nb_point >= WORD_WIDE as usize {
-        return Err(format!(
-            "the graph holds {} points and an upper list word names a node below {}",
-            nb_point, WORD_WIDE
-        ));
-    }
+    within(NODES, 0, nb_point, ceilings().nodes)?;
     for layer in 0..LAYERS {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a layer's count, at most the node count, which this function holds to the nodes ceiling, below 2^31"
+        )]
         let count = layer_counts_in.get(layer).copied().unwrap_or(0) as u32;
         layer_counts[layer] = count;
         layer_offsets[layer + 1] = layer_offsets[layer] + count;
@@ -2324,6 +2892,21 @@ fn ordered_list(
         a.0.partial_cmp(&b.0)
             .expect("every distance was checked finite by edge_target")
     });
+    Ok(())
+}
+
+/// One version 1 list as the node indices it installs as, in the order of its
+/// stored distances, stable on ties, written into `targets`. `scratch` holds
+/// the list's entries with their distances while it is ordered.
+pub(in crate::graph) fn ordered_targets(
+    list: &[LoadedEdge],
+    layer_offsets: &[u32; LAYERS + 1],
+    scratch: &mut Vec<(f32, u32)>,
+    targets: &mut Vec<u32>,
+) -> Result<(), String> {
+    ordered_list(list, layer_offsets, scratch)?;
+    targets.clear();
+    targets.extend(scratch.iter().map(|&(_, target)| target));
     Ok(())
 }
 

@@ -8,6 +8,12 @@
 # compiles no Python crate.
 [package]
 name = "zeusdb-vector-hnsw"
+# What the crate is, and where the wheel's documentation is, an address the
+# root Cargo.toml declares once. cargo package, which maturin sdist runs on
+# each crate the wheel builds from, warns where a manifest has no
+# description, or has none of documentation, homepage and repository.
+description = "The index, which holds the collection and its spaces between the engine's floor and the binding."
+documentation.workspace = true
 # The version, the edition and the licence are the workspace's, declared once
 # in the root Cargo.toml.
 version.workspace = true
@@ -17,13 +23,20 @@ license.workspace = true
 # artefact.
 publish = false
 
+[features]
+# The points a test panics or pauses at inside a mutation, this crate's among
+# them, being the point after an insertion plans its record; see src/lib.rs.
+# Turns on the engine's own `pause-points` and nothing else of it. Off in
+# every build that does not name it. The binding's `test-support` feature
+# turns it on for the extension the interpreter checks run against.
+pause-points = ["zeusdb-vector-core/pause-points"]
+
 # Every version is the workspace's, declared once in the root Cargo.toml with
 # the reason for each pin.
 [dependencies]
 zeusdb-vector-core = { workspace = true }
 zeusdb-vector-sparse = { workspace = true }
 zeusdb-vector-text = { workspace = true }
-chrono = { workspace = true }
 rand = { workspace = true }
 rayon = { workspace = true }
 serde = { workspace = true }
@@ -32,11 +45,15 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 # The engine again, with its test data turned on, for the tests in
-# src/rerank.rs and src/collection/training.rs that measure against it.
-# cargo applies a dev-dependency's features to this crate's test targets and
-# to nothing else, so the wheel is built without them.
+# src/rerank.rs and src/collection/training.rs that measure against it, and
+# with the graph's ceilings a test lowers. cargo applies a dev-dependency's
+# features to this crate's test targets and to nothing else, so the wheel is
+# built without them.
 zeusdb-vector-core = { workspace = true, features = ["test-support"] }
 # The sparse index again, with its test support turned on, for the tests in
 # src/collection that hold the close-up built off to the side to the one
-# made in place.
+# made in place, and for the forward arena's ceiling a test lowers.
 zeusdb-vector-sparse = { workspace = true, features = ["test-support"] }
+# The text layer again, with its test support turned on, for the term
+# ceiling a test lowers.
+zeusdb-vector-text = { workspace = true, features = ["test-support"] }

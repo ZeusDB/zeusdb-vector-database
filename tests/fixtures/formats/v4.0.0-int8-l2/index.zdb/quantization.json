@@ -1,0 +1,12 @@
+{
+  "type": "int8",
+  "scale": "per_dimension",
+  "training_size": 1000,
+  "max_training_vectors": null,
+  "storage_mode": "quantized_only",
+  "is_trained": true,
+  "training_completed_at": "2026-10-22T08:44:31.869592500+00:00",
+  "training_ids": [],
+  "training_threshold_reached": true,
+  "saturated_values": 0
+}

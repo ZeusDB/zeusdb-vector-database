@@ -25,13 +25,16 @@ use super::levels::{LevelGenerator, DEFAULT_LEVEL_SEED};
 use super::mutable::{reserved_records, MutableGraph, RESERVE_BYTES};
 use super::store::VectorStore;
 use super::traverse::LAYERS;
-use super::{restore_graph, restore_int8_graph, Distance, DumpBounds, Record, VectorGraph};
-use crate::distance::{CosineDist, L1Dist, L2Dist};
+use super::{
+    restore_graph, restore_int8_graph, Distance, DumpBounds, Record, Restored, VectorGraph,
+};
+use crate::distance::{CosineDist, DotDist, L1Dist, L2Dist};
 use crate::distance::{DistPQ, Int8Dist, Int8Metric, PqMetric};
 use crate::int8::Int8Codec;
 use crate::pq::PQ;
 use crate::space::Position;
 use crate::storage::FsDir;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 type BoxedFilter = Box<dyn Fn(&usize) -> bool>;
@@ -79,7 +82,7 @@ fn build<T, D>(
     dist: D,
 ) -> (MutableGraph<T, D>, VectorStore<T>)
 where
-    T: Clone + Send + Sync,
+    T: Clone + Send + Sync + PartialEq,
     D: Distance<T> + Send + Sync,
 {
     let dim = data.first().map_or(1, Vec::len);
@@ -122,6 +125,7 @@ where
         // Every test graph here inserts under ids 0 to n - 1, so the node count
         // is a ceiling every one of them clears.
         max_origin_id: graph.nb_points(),
+        version: 2,
     };
     parse_dump::<T>(&FsDir::new(dir.path()), DUMP_FILENAME, &expected).unwrap()
 }
@@ -507,26 +511,40 @@ fn a_non_finite_query_traverses_or_panics_at_the_candidate_assertion() {
 // THE DUMP ROUND TRIP
 // ============================================================================
 
-/// Write a graph out, load it into the structure, write it out again, and
-/// compare the two files byte for byte.
+/// The dump of `graph` at `version`, written into `dir`.
+fn write_at<T, D>(
+    graph: &MutableGraph<T, D>,
+    store: &VectorStore<T>,
+    kind: GraphKind,
+    dir: &std::path::Path,
+    version: u32,
+) where
+    T: Clone + Send + Sync + DumpElement,
+    D: Distance<T> + Send + Sync,
+{
+    let view = graph.dump_view(store);
+    match version {
+        1 => super::dump::v1::write_dump(&view, kind, &FsDir::new(dir), DUMP_FILENAME),
+        _ => write_dump(&view, kind, &FsDir::new(dir), DUMP_FILENAME),
+    }
+    .unwrap();
+}
+
+/// Write a graph out at `version`, load it into the structure, write it out
+/// again, and compare the two files byte for byte.
 fn round_trip<T, D>(
     built: &MutableGraph<T, D>,
     built_store: &VectorStore<T>,
     kind: GraphKind,
     dist: impl Fn() -> D,
+    version: u32,
 ) -> (usize, usize)
 where
     T: Clone + Send + Sync + DumpElement,
     D: Distance<T> + Send + Sync,
 {
     let first = tempfile::tempdir().unwrap();
-    write_dump(
-        &built.dump_view(built_store),
-        kind,
-        &FsDir::new(first.path()),
-        DUMP_FILENAME,
-    )
-    .unwrap();
+    write_at(built, built_store, kind, first.path(), version);
     let expected = Expected {
         kind,
         dimension: built.dim(),
@@ -534,6 +552,7 @@ where
         ef_construction: built.ef_construction(),
         min_nodes: 0,
         max_origin_id: built.nb_points(),
+        version,
     };
     let parsed = parse_dump::<T>(&FsDir::new(first.path()), DUMP_FILENAME, &expected).unwrap();
     let (mutable, mutable_store) = MutableGraph::from_loaded(
@@ -546,13 +565,7 @@ where
     )
     .unwrap();
     let second = tempfile::tempdir().unwrap();
-    write_dump(
-        &mutable.dump_view(&mutable_store),
-        kind,
-        &FsDir::new(second.path()),
-        DUMP_FILENAME,
-    )
-    .unwrap();
+    write_at(&mutable, &mutable_store, kind, second.path(), version);
 
     let before = std::fs::read(first.path().join(DUMP_FILENAME)).unwrap();
     let after = std::fs::read(second.path().join(DUMP_FILENAME)).unwrap();
@@ -578,24 +591,36 @@ where
 }
 
 /// A dump loaded into the structure and written back out is the same file, byte
-/// for byte, on every configuration the small tests cover.
+/// for byte, on every configuration the small tests cover, at both versions.
 ///
 /// This is what makes the structure a lossless image of the file rather than a
 /// lossy one, and it is why the descent residue is stored. Without it the
 /// second file would be shorter by exactly the residue edges.
 #[test]
 fn a_dump_round_trips_through_the_mutable_graph() {
+    for version in [1, 2] {
+        round_trips_at(version);
+    }
+}
+
+fn round_trips_at(version: u32) {
     let (cosine, cosine_store) = build(&sample_vectors(1500, 24, 0x78_01), 16, 64, CosineDist {});
-    let (bytes, residue) = round_trip(&cosine, &cosine_store, GraphKind::Cosine, || CosineDist {});
+    let (bytes, residue) = round_trip(
+        &cosine,
+        &cosine_store,
+        GraphKind::Cosine,
+        || CosineDist {},
+        version,
+    );
     println!("round trip cosine bytes {} residue {}", bytes, residue);
     assert!(residue > 0, "the fixture must carry descent residue");
 
     let (l2, l2_store) = build(&sample_vectors(900, 16, 0x78_02), 16, 48, L2Dist {});
-    let (bytes, residue) = round_trip(&l2, &l2_store, GraphKind::L2, || L2Dist {});
+    let (bytes, residue) = round_trip(&l2, &l2_store, GraphKind::L2, || L2Dist {}, version);
     println!("round trip l2 bytes {} residue {}", bytes, residue);
 
     let (l1, l1_store) = build(&sample_vectors(700, 12, 0x78_03), 8, 48, L1Dist {});
-    let (bytes, residue) = round_trip(&l1, &l1_store, GraphKind::L1, || L1Dist {});
+    let (bytes, residue) = round_trip(&l1, &l1_store, GraphKind::L1, || L1Dist {}, version);
     println!("round trip l1 bytes {} residue {}", bytes, residue);
 
     // Ties, where a list holds runs of equal stored distances and only a stable
@@ -603,7 +628,13 @@ fn a_dump_round_trips_through_the_mutable_graph() {
     let distinct = sample_vectors(25, 16, 0x78_04);
     let repeated: Vec<Vec<f32>> = (0..600).map(|i| distinct[i % 25].clone()).collect();
     let (ties, ties_store) = build(&repeated, 16, 48, CosineDist {});
-    let (bytes, residue) = round_trip(&ties, &ties_store, GraphKind::Cosine, || CosineDist {});
+    let (bytes, residue) = round_trip(
+        &ties,
+        &ties_store,
+        GraphKind::Cosine,
+        || CosineDist {},
+        version,
+    );
     println!("round trip ties bytes {} residue {}", bytes, residue);
 
     // The quantized graph, whose elements are `u8` codes.
@@ -621,9 +652,13 @@ fn a_dump_round_trips_through_the_mutable_graph() {
         100,
         DistPQ::new(pq.clone(), PqMetric::SquaredL2),
     );
-    let (bytes, residue) = round_trip(&quantized, &quantized_store, GraphKind::CosinePq, || {
-        DistPQ::new(pq.clone(), PqMetric::SquaredL2)
-    });
+    let (bytes, residue) = round_trip(
+        &quantized,
+        &quantized_store,
+        GraphKind::CosinePq,
+        || DistPQ::new(pq.clone(), PqMetric::SquaredL2),
+        version,
+    );
     println!("round trip quantized bytes {} residue {}", bytes, residue);
 
     // The scalar quantized graph, whose elements are `i8` codes decoded
@@ -633,9 +668,13 @@ fn a_dump_round_trips_through_the_mutable_graph() {
     let dist = Int8Dist::new(codec.clone(), Int8Metric::Cosine);
     let rows: Vec<Vec<i8>> = unit.iter().map(|v| dist.encode(v).unwrap()).collect();
     let (scalar, scalar_store) = build(&rows, 16, 64, dist);
-    let (bytes, residue) = round_trip(&scalar, &scalar_store, GraphKind::CosineInt8, || {
-        Int8Dist::new(codec.clone(), Int8Metric::Cosine)
-    });
+    let (bytes, residue) = round_trip(
+        &scalar,
+        &scalar_store,
+        GraphKind::CosineInt8,
+        || Int8Dist::new(codec.clone(), Int8Metric::Cosine),
+        version,
+    );
     println!("round trip int8 bytes {} residue {}", bytes, residue);
     assert!(residue > 0, "the scalar fixture must carry descent residue");
 }
@@ -716,6 +755,8 @@ fn an_int8_graph_dumps_and_restores_through_the_seam() {
         min_nodes: N,
         max_origin_id: N,
         positions: Some(&held),
+        version: 2,
+        rows_only: false,
     };
 
     // The raw reader refuses it on the element, and the wrong space on the
@@ -730,8 +771,7 @@ fn an_int8_graph_dumps_and_restores_through_the_seam() {
         None,
         bounds,
     );
-    assert!(as_raw.is_err());
-    let reason = as_raw.err().unwrap();
+    let reason = as_raw.err().unwrap().detail;
     assert!(
         reason.contains("element type 3") && reason.contains("holds 1"),
         "{reason}"
@@ -745,14 +785,14 @@ fn an_int8_graph_dumps_and_restores_through_the_seam() {
         codec.clone(),
         bounds,
     );
-    let reason = as_l2.err().unwrap();
+    let reason = as_l2.err().unwrap().detail;
     assert!(
-        reason.contains("written for int8 cosine") && reason.contains("declares int8 l2"),
+        reason.contains("the int8 cosine graph") && reason.contains("declares int8 l2"),
         "{reason}"
     );
 
     // And it comes back as itself.
-    let (restored, nodes) = restore_int8_graph(
+    let restored = match restore_int8_graph(
         &FsDir::new(dir.path()),
         DUMP_FILENAME,
         "cosine",
@@ -761,8 +801,12 @@ fn an_int8_graph_dumps_and_restores_through_the_seam() {
         codec.clone(),
         bounds,
     )
-    .unwrap();
-    assert_eq!(nodes, N);
+    .unwrap()
+    {
+        Restored::Graph(graph) => *graph,
+        Restored::Rows { reason, .. } => panic!("the dump gave its rows alone: {reason}"),
+    };
+    assert_eq!(restored.nb_points(), N);
     assert!(restored.is_int8());
     let first = (0..N as u32)
         .find(|&node| restored.origin_id_at(node) == 1)
@@ -1312,6 +1356,898 @@ fn a_graph_reserved_after_it_is_built_holds_what_new_reserves() {
             "dim {} declared {}",
             dim,
             declared
+        );
+    }
+}
+
+// ============================================================================
+// THE STOP RULE AND THE TWIN
+// ============================================================================
+
+/// The node a graph built by [`build`] gave the point inserted as `id`.
+fn node_of_id<T, D>(graph: &MutableGraph<T, D>, id: usize) -> u32
+where
+    T: Clone + Send + Sync,
+    D: Distance<T> + Send + Sync,
+{
+    (0..graph.nb_points() as u32)
+        .find(|&node| graph.origin_id_of(node) == id)
+        .expect("every inserted id has a node")
+}
+
+/// Whether every node reaches every other through the base layer's lists,
+/// which holds where a walk over the lists and a walk over them backwards
+/// from one node each reach every node.
+fn base_layer_strongly_connected<T, D>(graph: &MutableGraph<T, D>) -> bool
+where
+    T: Clone + Send + Sync,
+    D: Distance<T> + Send + Sync,
+{
+    let n = graph.nb_points();
+    let mut backward: Vec<Vec<u32>> = vec![Vec::new(); n];
+    for node in 0..n as u32 {
+        for &target in graph.neighbours_at(node, 0) {
+            backward[target as usize].push(node);
+        }
+    }
+    let reaches_all = |next: &dyn Fn(u32) -> Vec<u32>| {
+        let mut seen = vec![false; n];
+        let mut stack = vec![0u32];
+        seen[0] = true;
+        while let Some(node) = stack.pop() {
+            for target in next(node) {
+                if !seen[target as usize] {
+                    seen[target as usize] = true;
+                    stack.push(target);
+                }
+            }
+        }
+        seen.iter().all(|&s| s)
+    };
+    reaches_all(&|node| graph.neighbours_at(node, 0).to_vec())
+        && reaches_all(&|node| backward[node as usize].clone())
+}
+
+/// A traversal under a predicate admitting fewer points than its width
+/// reaches every admitted point the base layer connects to its start, and
+/// returns the nearest `knbn` of them at every width at or above the
+/// admitted count. At a width below it the page is still `knbn` long.
+///
+/// One point in fifty is admitted, and each query is an admitted point's own
+/// vector, so the first point admitted lies at distance zero and every
+/// candidate after it lies farther. The page holds the ten admitted points an
+/// exact scan ranks first, positions and score bits both, and asked for all
+/// twenty at each width at or above twenty, every admitted point in the
+/// scan's order.
+///
+/// A second graph, built at `m` 2 and `ef_construction` 16 over clustered
+/// points in two dimensions with one point in twenty admitted, is asked for
+/// ten at widths of forty and four hundred from every point not admitted.
+/// Many of those traversals hold ten admitted points before they reach one
+/// of the nearest ten, so the page is the scan's only where the traversal
+/// goes on until its heap holds the width.
+#[test]
+fn a_traversal_under_a_sparse_predicate_returns_the_nearest_admitted_points() {
+    let data = sample_vectors(1_000, 8, 0x0223);
+    let (graph, store) = build(&data, 16, 64, L2Dist {});
+    assert!(
+        base_layer_strongly_connected(&graph),
+        "every admitted point is reachable from any start"
+    );
+    let admits = |id: &usize| id % 50 == 3;
+    let admitted: Vec<usize> = (0..data.len()).filter(admits).collect();
+    assert_eq!(admitted.len(), 20);
+    for &at in &admitted {
+        let query = &data[at];
+        for ef in [20, 40, 400] {
+            assert_eq!(
+                admitted_page(&graph, &store, query, 10, ef, &admits),
+                nearest_admitted(&data, &admitted, query, 10),
+                "query {at} at width {ef}"
+            );
+            assert_eq!(
+                admitted_page(&graph, &store, query, 20, ef, &admits),
+                nearest_admitted(&data, &admitted, query, 20),
+                "query {at} at width {ef}, every admitted point"
+            );
+        }
+        let page = graph.search(&store, query, 10, 10, Some(&admits));
+        assert_eq!(page.len(), 10, "query {at} at width 10");
+        assert!(page.iter().all(|hit| admits(&hit.position)));
+    }
+
+    let sparse = crate::test_vectors::clustered(400, 2, 0x0223);
+    let (graph, store) = build(&sparse, 2, 16, L2Dist {});
+    assert!(
+        base_layer_strongly_connected(&graph),
+        "every admitted point of the sparse graph is reachable from any start"
+    );
+    let admits = |id: &usize| id % 20 == 3;
+    let admitted: Vec<usize> = (0..sparse.len()).filter(admits).collect();
+    assert_eq!(admitted.len(), 20);
+    for at in (0..sparse.len()).filter(|id| !admits(id)) {
+        let query = &sparse[at];
+        for ef in [40, 400] {
+            assert_eq!(
+                admitted_page(&graph, &store, query, 10, ef, &admits),
+                nearest_admitted(&sparse, &admitted, query, 10),
+                "sparse graph, query {at} at width {ef}"
+            );
+        }
+    }
+}
+
+/// The `n` points of `admitted` nearest `query` under the l2 kernel, by
+/// distance and then by id, as ids and score bits.
+fn nearest_admitted(
+    data: &[Vec<f32>],
+    admitted: &[usize],
+    query: &[f32],
+    n: usize,
+) -> Vec<(usize, u32)> {
+    let mut ranked: Vec<(f32, usize)> = admitted
+        .iter()
+        .map(|&id| (L2Dist {}.eval(query, &data[id]), id))
+        .collect();
+    ranked.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    ranked[..n]
+        .iter()
+        .map(|&(distance, id)| (id, distance.to_bits()))
+        .collect()
+}
+
+/// The page a traversal of `graph` under `admits` returns, as ids and score
+/// bits.
+fn admitted_page<D>(
+    graph: &MutableGraph<f32, D>,
+    store: &VectorStore<f32>,
+    query: &[f32],
+    n: usize,
+    ef: usize,
+    admits: &impl Fn(&usize) -> bool,
+) -> Vec<(usize, u32)>
+where
+    D: Distance<f32> + Send + Sync,
+{
+    graph
+        .search(store, query, n, ef, Some(admits))
+        .iter()
+        .map(|hit| (hit.position, hit.distance.to_bits()))
+        .collect()
+}
+
+/// With no predicate the size test ends no traversal: a graph searched
+/// with a predicate admitting every point returns the page the search with
+/// none returns, at widths below, at and above the point count.
+///
+/// The sparse graph of the stop rule's test, built at `m` 2 over clustered
+/// points in two dimensions, is searched the same two ways from every point
+/// at widths of ten and forty, and the two pages agree there as well. Its
+/// searches with no predicate end before they visit every node, so a
+/// traversal under the predicate that went on past its distance test would
+/// return pages they do not.
+#[test]
+fn a_predicate_admitting_every_point_returns_the_unfiltered_page() {
+    let data = sample_vectors(300, 8, 0x0227);
+    let (graph, store) = build(&data, 8, 32, L2Dist {});
+    let every = |_: &usize| true;
+    for q in [0usize, 77, 299] {
+        for ef in [1, 10, 300, 600] {
+            let bare = graph.search(&store, &data[q], 10, ef, None::<&BoxedFilter>);
+            let admitted = graph.search(&store, &data[q], 10, ef, Some(&every));
+            let bits = |page: &[super::GraphHit]| -> Vec<(usize, u32)> {
+                page.iter()
+                    .map(|hit| (hit.position, hit.distance.to_bits()))
+                    .collect()
+            };
+            assert_eq!(bits(&bare), bits(&admitted), "query {q} at width {ef}");
+        }
+    }
+
+    let sparse = crate::test_vectors::clustered(400, 2, 0x0223);
+    let (graph, store) = build(&sparse, 2, 16, L2Dist {});
+    let bits = |page: &[super::GraphHit]| -> Vec<(usize, u32)> {
+        page.iter()
+            .map(|hit| (hit.position, hit.distance.to_bits()))
+            .collect()
+    };
+    for (q, query) in sparse.iter().enumerate() {
+        for ef in [10, 40] {
+            let bare = graph.search(&store, query, 10, ef, None::<&BoxedFilter>);
+            let admitted = graph.search(&store, query, 10, ef, Some(&every));
+            assert_eq!(
+                bits(&bare),
+                bits(&admitted),
+                "sparse graph, query {q} at width {ef}"
+            );
+        }
+    }
+}
+
+/// A point inserted with the row of a point already held keeps that twin
+/// and the neighbours the rule selects from the candidates after it.
+///
+/// The twin is the first candidate the selection pops, at distance zero, and
+/// every other candidate is exactly as far from it as from the new point.
+/// The new point's base list holds the twin and more, within its budget of
+/// `2 * m`, and among the rest no neighbour lies closer to an earlier one in
+/// the list than to the new point, which is the rule with the twin left out.
+#[test]
+fn a_twin_keeps_the_neighbours_the_rule_selects_past_it() {
+    for m in [2usize, 8] {
+        let mut data = sample_vectors(400, 8, 0x0224);
+        let original = 123;
+        data.push(data[original].clone());
+        let (graph, store) = build(&data, m, 64, L2Dist {});
+        let twin = node_of_id(&graph, 400);
+        let original_node = node_of_id(&graph, original);
+        let list = graph.neighbours_at(twin, 0);
+        assert!(
+            list.contains(&original_node),
+            "m {m}: the twin keeps the point it copies"
+        );
+        assert!(
+            list.len() > 1,
+            "m {m}: the twin holds a list of {} where the rule selects past its copy",
+            list.len()
+        );
+        assert!(
+            list.len() <= 2 * m,
+            "m {m}: the twin holds a list of {} over its budget of {}",
+            list.len(),
+            2 * m
+        );
+        let rest: Vec<u32> = list
+            .iter()
+            .copied()
+            .filter(|&node| node != original_node)
+            .collect();
+        let dist = L2Dist {};
+        for (k, &e) in rest.iter().enumerate() {
+            let to_new = dist.eval(&data[400], store.get(e));
+            for &r in &rest[..k] {
+                assert!(
+                    dist.eval(store.get(e), store.get(r)) >= to_new,
+                    "m {m}: node {e} is kept behind node {r}, which prunes it"
+                );
+            }
+        }
+    }
+}
+
+/// What the base list of the last point of `data` breaks of the rule, where
+/// the point at `head` is the candidate its selection pops first: the head
+/// missing from the list, a list of one, a list over its budget of `2 * m`,
+/// or a kept neighbour that an earlier one in the list prunes, being closer
+/// to it than the new point is. Each fault is named with `label`.
+///
+/// Holds first that `head` lies nearer the new point than every other point
+/// does, and that every other point lies exactly as far from `head` as from
+/// the new point, bit for bit, so the case reaches the tie it is named for.
+fn faults_past_the_head<T, D>(
+    label: &str,
+    data: &[Vec<T>],
+    head: usize,
+    m: usize,
+    dist: impl Fn() -> D,
+) -> Vec<String>
+where
+    T: Clone + Send + Sync + PartialEq,
+    D: Distance<T> + Send + Sync,
+{
+    let new = data.len() - 1;
+    let kernel = dist();
+    let to_head = kernel.eval(&data[new], &data[head]);
+    for (at, row) in data[..new].iter().enumerate() {
+        if at == head {
+            continue;
+        }
+        assert!(
+            to_head < kernel.eval(&data[new], row),
+            "{label}: point {at} lies no farther from the new point than the head"
+        );
+        assert_eq!(
+            kernel.eval(row, &data[head]).to_bits(),
+            kernel.eval(row, &data[new]).to_bits(),
+            "{label}: point {at} does not tie the head with the new point"
+        );
+    }
+    let (graph, store) = build(data, m, 64, dist());
+    let node = node_of_id(&graph, new);
+    let head_node = node_of_id(&graph, head);
+    let list = graph.neighbours_at(node, 0);
+    let mut faults = Vec::new();
+    if !list.contains(&head_node) {
+        faults.push(format!("{label}: the list does not hold the head"));
+    }
+    if list.len() < 2 {
+        faults.push(format!(
+            "{label}: a list of {} where the rule selects past the head",
+            list.len()
+        ));
+    }
+    if list.len() > 2 * m {
+        faults.push(format!(
+            "{label}: a list of {} over its budget of {}",
+            list.len(),
+            2 * m
+        ));
+    }
+    let rest: Vec<u32> = list.iter().copied().filter(|&n| n != head_node).collect();
+    for (k, &e) in rest.iter().enumerate() {
+        let to_new = kernel.eval(&data[new], store.get(e));
+        for &r in &rest[..k] {
+            if kernel.eval(store.get(e), store.get(r)) < to_new {
+                faults.push(format!(
+                    "{label}: node {e} is kept behind node {r}, which prunes it"
+                ));
+            }
+        }
+    }
+    faults
+}
+
+/// Every graph kind on every metric it serves keeps a full list past a head
+/// that ties with the new point against every other point.
+///
+/// The head is the candidate the selection pops first, and each case makes it
+/// tie with the new point bit for bit against every other point the graph
+/// holds. On every raw, product quantized and scalar graph the head holds the
+/// new point's row, the quantized rows coming from two different raw rows
+/// with equal codes, and a cosine graph holding rows of lengths other than
+/// one is among them. On the scalar cosine graph of width 5 fitted where four
+/// dimensions hold zeros, the head's codes are the new point's halved. On
+/// every raw and scalar metric, the head differs from the new point only in
+/// the sign of a dimension every other point holds at zero, and on the raw
+/// l2 graph only in the last place of such a dimension. The new point's base
+/// list holds the head and more, within its budget, and no neighbour in it
+/// lies closer to an earlier one than to the new point. A group of copies of
+/// one row leaves the last copy one copy and the rest from the rule. Every
+/// case is checked and every fault named before the test fails.
+#[test]
+fn a_twin_keeps_its_neighbours_on_every_graph_kind() {
+    const M: usize = 8;
+    const N: usize = 400;
+    const HEAD: usize = 123;
+    let mut faults = Vec::new();
+    let with_copy = |rows: &[Vec<f32>]| -> Vec<Vec<f32>> {
+        let mut data = rows.to_vec();
+        data.push(rows[HEAD].clone());
+        data
+    };
+
+    // Raw rows, each metric over a row equal to the head's. A cosine graph
+    // scores the rows it is given, so one holds rows of lengths from a half to
+    // eight tenths with the head the longest, at nine tenths. Under the inner
+    // product the head is three times its length, so it is the nearest.
+    let plain = sample_vectors(N, 8, 0x0229);
+    let unit = unit_sample_vectors(N, 8, 0x022b);
+    let scaled: Vec<Vec<f32>> = unit
+        .iter()
+        .enumerate()
+        .map(|(at, v)| {
+            let length = if at == HEAD {
+                0.9
+            } else {
+                0.5 + 0.05 * (at % 7) as f32
+            };
+            v.iter().map(|x| x * length).collect()
+        })
+        .collect();
+    let mut long = plain.clone();
+    long[HEAD] = long[HEAD].iter().map(|x| x * 3.0).collect();
+    faults.extend(faults_past_the_head(
+        "raw l2, an equal row",
+        &with_copy(&plain),
+        HEAD,
+        M,
+        || L2Dist {},
+    ));
+    faults.extend(faults_past_the_head(
+        "raw l1, an equal row",
+        &with_copy(&plain),
+        HEAD,
+        M,
+        || L1Dist {},
+    ));
+    faults.extend(faults_past_the_head(
+        "raw dot, an equal row",
+        &with_copy(&long),
+        HEAD,
+        M,
+        || DotDist {},
+    ));
+    faults.extend(faults_past_the_head(
+        "raw cosine, an equal row",
+        &with_copy(&unit),
+        HEAD,
+        M,
+        || CosineDist {},
+    ));
+    faults.extend(faults_past_the_head(
+        "raw cosine, an equal row of length nine tenths",
+        &with_copy(&scaled),
+        HEAD,
+        M,
+        || CosineDist {},
+    ));
+
+    // Two different raw rows with equal product quantized codes, on each
+    // quantized graph, the l1 graph scored by the squared distance as it is.
+    let equal_codes = |pq: &PQ, rows: &[Vec<f32>]| -> Vec<Vec<u8>> {
+        let mut near = rows[HEAD].clone();
+        near[0] += 1.0e-4;
+        let mut codes: Vec<Vec<u8>> = rows.iter().map(|v| pq.quantize(v).unwrap()).collect();
+        let near_codes = pq.quantize(&near).unwrap();
+        assert_ne!(near, rows[HEAD]);
+        assert_eq!(near_codes, codes[HEAD], "the two raw rows quantize alike");
+        codes.push(near_codes);
+        codes
+    };
+    let pq_plain = Arc::new(PQ::new(8, 4, 4, N, None));
+    pq_plain.train(&plain).unwrap();
+    let plain_codes = equal_codes(&pq_plain, &plain);
+    faults.extend(faults_past_the_head(
+        "product quantized l2, two raw rows with equal codes",
+        &plain_codes,
+        HEAD,
+        M,
+        || DistPQ::new(pq_plain.clone(), PqMetric::SquaredL2),
+    ));
+    faults.extend(faults_past_the_head(
+        "product quantized l1, two raw rows with equal codes",
+        &plain_codes,
+        HEAD,
+        M,
+        || DistPQ::new(pq_plain.clone(), PqMetric::SquaredL2),
+    ));
+    let pq_unit = Arc::new(PQ::new(8, 4, 4, N, None));
+    pq_unit.train(&unit).unwrap();
+    faults.extend(faults_past_the_head(
+        "product quantized cosine, two raw rows with equal codes",
+        &equal_codes(&pq_unit, &unit),
+        HEAD,
+        M,
+        || DistPQ::new(pq_unit.clone(), PqMetric::Cosine),
+    ));
+
+    // Two different raw rows with equal scalar codes, on each scalar graph.
+    for (label, metric, rows) in [
+        (
+            "scalar l2, two raw rows with equal codes",
+            Int8Metric::L2,
+            &plain,
+        ),
+        (
+            "scalar l1, two raw rows with equal codes",
+            Int8Metric::L1,
+            &plain,
+        ),
+        (
+            "scalar dot, two raw rows with equal codes",
+            Int8Metric::Dot,
+            &long,
+        ),
+        (
+            "scalar cosine, two raw rows with equal codes",
+            Int8Metric::Cosine,
+            &unit,
+        ),
+    ] {
+        let codec = Arc::new(Int8Codec::fit(8, rows).unwrap());
+        let kernel = Int8Dist::new(codec.clone(), metric);
+        let mut coded: Vec<Vec<i8>> = rows.iter().map(|v| kernel.encode(v).unwrap()).collect();
+        let mut near = rows[HEAD].clone();
+        near[0] += 1.0e-5;
+        let near_row = kernel.encode(&near).unwrap();
+        assert_ne!(near, rows[HEAD]);
+        assert_eq!(
+            near_row, coded[HEAD],
+            "{label}: the two raw rows encode alike"
+        );
+        coded.push(near_row);
+        faults.extend(faults_past_the_head(label, &coded, HEAD, M, || {
+            Int8Dist::new(codec.clone(), metric)
+        }));
+    }
+
+    // On the scalar cosine graph of width 5 fitted where dimensions 0 to 3
+    // hold zeros, the head's codes are the new point's halved. Every other
+    // row holds one to three of the first four dimensions at one or minus
+    // one, so its codes there are not zero.
+    let fitted = Arc::new(Int8Codec::fit(5, &[vec![0.0, 0.0, 0.0, 0.0, 1.0]]).unwrap());
+    let cosine5 = Int8Dist::new(fitted.clone(), Int8Metric::Cosine);
+    let mut rows5: Vec<Vec<i8>> = sample_vectors(N, 5, 0x022d)
+        .iter()
+        .enumerate()
+        .map(|(at, s)| {
+            let mut v: Vec<f32> = s[..4]
+                .iter()
+                .map(|&x| {
+                    if x > 0.15 {
+                        1.0
+                    } else if x < -0.15 {
+                        -1.0
+                    } else {
+                        0.0
+                    }
+                })
+                .collect();
+            let held = v.iter().filter(|&&x| x != 0.0).count();
+            if held == 0 {
+                v[at % 4] = 1.0;
+            } else if held == 4 {
+                v[at % 4] = 0.0;
+            }
+            v.push(s[4] * 1.8);
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let unit: Vec<f32> = v.iter().map(|x| x / norm).collect();
+            cosine5.encode(&unit).unwrap()
+        })
+        .collect();
+    let head5 = cosine5
+        .encode(&[0.47697, 0.47697, 0.47697, 0.47697, 0.3])
+        .unwrap();
+    let new5 = cosine5.encode(&[0.4, 0.4, 0.4, 0.4, 0.6]).unwrap();
+    assert_eq!(cosine5.codes_of_row(&head5), &[0, 0, 0, 0, 38]);
+    assert_eq!(cosine5.codes_of_row(&new5), &[0, 0, 0, 0, 76]);
+    rows5.push(head5);
+    rows5.push(new5);
+    faults.extend(faults_past_the_head(
+        "scalar cosine of width 5, codes in a power-of-two ratio",
+        &rows5,
+        N,
+        M,
+        || Int8Dist::new(fitted.clone(), Int8Metric::Cosine),
+    ));
+
+    // On every raw and scalar metric, the head differs from the new point
+    // only in the sign of dimension 7, which every other point holds at
+    // zero. The pair lies about a point none of the others holds, at three
+    // times its length under the inner product.
+    let flat: Vec<Vec<f32>> = sample_vectors(N, 8, 0x022f)
+        .into_iter()
+        .map(|mut v| {
+            v[7] = 0.0;
+            v
+        })
+        .collect();
+    let centre = sample_vectors(1, 8, 0x0231)[0].clone();
+    let pair = |rows: &[Vec<f32>], centre: &[f32], a: f32| -> Vec<Vec<f32>> {
+        let mut data = rows.to_vec();
+        for sign in [1.0f32, -1.0] {
+            let mut v = centre.to_vec();
+            v[7] = sign * a;
+            data.push(v);
+        }
+        data
+    };
+    let unit_rows = |rows: Vec<Vec<f32>>| -> Vec<Vec<f32>> {
+        rows.into_iter()
+            .map(|v| {
+                let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                v.iter().map(|x| x / norm).collect()
+            })
+            .collect()
+    };
+    let long_centre: Vec<f32> = centre.iter().map(|x| x * 3.0).collect();
+    let signs = pair(&flat, &centre, 0.01);
+    let unit_signs = unit_rows(signs.clone());
+    let long_signs = pair(&flat, &long_centre, 0.01);
+    faults.extend(faults_past_the_head(
+        "raw l2, rows differing in one sign",
+        &signs,
+        N,
+        M,
+        || L2Dist {},
+    ));
+    faults.extend(faults_past_the_head(
+        "raw l1, rows differing in one sign",
+        &signs,
+        N,
+        M,
+        || L1Dist {},
+    ));
+    faults.extend(faults_past_the_head(
+        "raw dot, rows differing in one sign",
+        &long_signs,
+        N,
+        M,
+        || DotDist {},
+    ));
+    faults.extend(faults_past_the_head(
+        "raw cosine, rows differing in one sign",
+        &unit_signs,
+        N,
+        M,
+        || CosineDist {},
+    ));
+    for (label, metric, rows) in [
+        (
+            "scalar l2, rows differing in one sign",
+            Int8Metric::L2,
+            &signs,
+        ),
+        (
+            "scalar l1, rows differing in one sign",
+            Int8Metric::L1,
+            &signs,
+        ),
+        (
+            "scalar dot, rows differing in one sign",
+            Int8Metric::Dot,
+            &long_signs,
+        ),
+        (
+            "scalar cosine, rows differing in one sign",
+            Int8Metric::Cosine,
+            &unit_signs,
+        ),
+    ] {
+        let codec = Arc::new(Int8Codec::fit(8, rows).unwrap());
+        let kernel = Int8Dist::new(codec.clone(), metric);
+        let coded: Vec<Vec<i8>> = rows.iter().map(|v| kernel.encode(v).unwrap()).collect();
+        faults.extend(faults_past_the_head(label, &coded, N, M, || {
+            Int8Dist::new(codec.clone(), metric)
+        }));
+    }
+
+    // On the raw l2 graph, the head differs from the new point only in the
+    // last place of dimension 7, which every other point holds at zero.
+    let a = 1.0e-6f32;
+    let mut last_place = flat.clone();
+    let mut head_row = centre.clone();
+    head_row[7] = a;
+    let mut new_row = centre.clone();
+    new_row[7] = f32::from_bits(a.to_bits() + 1);
+    last_place.push(head_row);
+    last_place.push(new_row);
+    faults.extend(faults_past_the_head(
+        "raw l2, rows differing in the last place of one value",
+        &last_place,
+        N,
+        M,
+        || L2Dist {},
+    ));
+
+    // Copies of one row fill no list: the last of 3 m copies keeps one copy
+    // and the neighbours the rule selects past them.
+    let row = sample_vectors(1, 8, 0x0233)[0].clone();
+    let mut copies = plain.clone();
+    copies.extend((0..3 * M).map(|_| row.clone()));
+    let (graph, _) = build(&copies, M, 64, L2Dist {});
+    let list = graph.neighbours_at(node_of_id(&graph, copies.len() - 1), 0);
+    let held = list
+        .iter()
+        .filter(|&&node| graph.origin_id_of(node) >= N)
+        .count();
+    if held != 1 || list.len() < 2 {
+        faults.push(format!(
+            "raw l2, {} copies of one row: the last keeps {held} copies in a list of {}",
+            3 * M,
+            list.len()
+        ));
+    }
+
+    assert!(
+        faults.is_empty(),
+        "{} faults:\n{}",
+        faults.len(),
+        faults.join("\n")
+    );
+}
+
+// ============================================================================
+// THE STRUCTURE UNDER RANDOM WRITES
+// ============================================================================
+
+/// The insertions each graph kind takes, unless `ZEUSDB_FUZZ_CASES` sets
+/// another number for a deep run.
+fn structure_insertions() -> usize {
+    std::env::var("ZEUSDB_FUZZ_CASES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300)
+}
+
+/// The nodes up to which the structure is asked after every step. Past it,
+/// every 64th step asks it, and the last step always does.
+const ASKED_EVERY_STEP: usize = 1_000;
+
+/// One graph kind as the structure test builds it, with the quantizer a
+/// quantized kind encodes through.
+enum StructureKind {
+    Raw(&'static str),
+    Pq(&'static str, Arc<PQ>),
+    Int8(&'static str, Arc<Int8Codec>),
+}
+
+impl StructureKind {
+    fn label(&self) -> String {
+        match self {
+            StructureKind::Raw(space) => format!("raw {space}"),
+            StructureKind::Pq(space, _) => format!("product quantized {space}"),
+            StructureKind::Int8(space, _) => format!("scalar quantized {space}"),
+        }
+    }
+
+    fn space(&self) -> &'static str {
+        match self {
+            StructureKind::Raw(space)
+            | StructureKind::Pq(space, _)
+            | StructureKind::Int8(space, _) => space,
+        }
+    }
+
+    /// An empty graph of this kind at degree `m`, its levels drawn from
+    /// `seed`.
+    fn empty(&self, m: usize, seed: u64) -> VectorGraph {
+        let mut graph = match self {
+            StructureKind::Raw(space) => VectorGraph::new_raw(space, 8, m, 64, LAYERS, 40),
+            StructureKind::Pq(space, pq) => {
+                VectorGraph::new_pq(space, m, 64, LAYERS, 40, pq.clone())
+            }
+            StructureKind::Int8(space, codec) => {
+                VectorGraph::new_int8(space, m, 64, LAYERS, 40, codec.clone())
+            }
+        };
+        graph.set_level_seed(seed);
+        graph
+    }
+}
+
+/// One record as the structure test holds it: its vector, as the space
+/// stores it, and the node the graph holds it at.
+struct Placed {
+    vector: Vec<f32>,
+    node: u32,
+}
+
+/// Insert `vector` as record `id` at position `id`, encoded as the kind
+/// encodes it, and hand back the node it took.
+fn place(graph: &mut VectorGraph, kind: &StructureKind, vector: &[f32], id: usize) -> u32 {
+    let node = u32::try_from(graph.nb_points()).unwrap();
+    let at = Position::from_slot(id);
+    match kind {
+        StructureKind::Raw(_) => graph.insert(vector, id, at),
+        StructureKind::Pq(_, pq) => {
+            let codes = pq.quantize(vector).unwrap();
+            graph.insert_batch_pq(&[(&codes, id, at)]).unwrap();
+        }
+        StructureKind::Int8(..) => {
+            let row = graph.int8_encode(vector).unwrap();
+            graph.insert_batch_int8(&[(&row, id, at)]).unwrap();
+        }
+    }
+    node
+}
+
+/// Every kind's graph holds its own structure through a seeded sequence of
+/// insertions, overwrites, strandings and rebuilds, asked after every step
+/// while the graph holds up to a thousand nodes and every 64th step past
+/// that. An overwrite files the record at a new node and strands the old
+/// one, a stranding clears a node's record, and a rebuild inserts every
+/// held record into a new graph in the order of its old node, at a degree
+/// drawn afresh, as a compaction and a rebuild do. A rebuild waits until as
+/// many records have been inserted since the last one as the graph holds,
+/// so the rebuilds cost no more than the insertions, and one runs once half
+/// the insertions are in where none has yet. The kinds are raw
+/// under the four metrics, product quantized under cosine and `l2`, which
+/// are the spaces it takes, and scalar quantized under the four metrics.
+#[test]
+fn every_graph_kind_holds_its_structure_under_random_writes() {
+    let budget = structure_insertions();
+    let sample = sample_vectors(1_000, 8, 0x0224_5eed);
+    let units = unit_sample_vectors(1_000, 8, 0x0224_5eed);
+    let trained = |space: &str| {
+        let pq = Arc::new(PQ::new(8, 4, 4, 1_000, None));
+        pq.train(if space == "cosine" { &units } else { &sample })
+            .unwrap();
+        pq
+    };
+    let fitted = |space: &str| {
+        Arc::new(Int8Codec::fit(8, if space == "cosine" { &units } else { &sample }).unwrap())
+    };
+    let mut kinds: Vec<StructureKind> = ["cosine", "l2", "l1", "dot"]
+        .into_iter()
+        .map(StructureKind::Raw)
+        .collect();
+    kinds.extend(
+        ["cosine", "l2"]
+            .into_iter()
+            .map(|space| StructureKind::Pq(space, trained(space))),
+    );
+    kinds.extend(
+        ["cosine", "l2", "l1", "dot"]
+            .into_iter()
+            .map(|space| StructureKind::Int8(space, fitted(space))),
+    );
+    for (k, kind) in kinds.iter().enumerate() {
+        let label = kind.label();
+        let mut state = 0x0224_0000_5eed_0001u64 ^ ((k as u64) << 40);
+        let mut draw = move |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % bound.max(1) as u64) as usize
+        };
+        let vector = |draw: &mut dyn FnMut(usize) -> usize| -> Vec<f32> {
+            let raw: Vec<f32> = (0..8).map(|_| (draw(41) as f32 - 20.0) * 0.25).collect();
+            let norm = raw.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if kind.space() == "cosine" && norm > 0.0 {
+                raw.iter().map(|x| x / norm).collect()
+            } else {
+                raw
+            }
+        };
+        let mut graph = kind.empty(4 + draw(5), 0x0224 + k as u64);
+        let mut held: BTreeMap<usize, Placed> = BTreeMap::new();
+        let (mut inserted, mut since_rebuild, mut next_id) = (0usize, 0usize, 0usize);
+        let (mut step, mut rebuilds, mut stranded) = (0usize, 0usize, 0usize);
+        while inserted < budget {
+            step += 1;
+            let roll = if rebuilds == 0 && inserted >= budget / 2 {
+                99
+            } else {
+                draw(100)
+            };
+            if roll < 70 || held.is_empty() {
+                for _ in 0..1 + draw(8) {
+                    let v = vector(&mut draw);
+                    let node = place(&mut graph, kind, &v, next_id);
+                    held.insert(next_id, Placed { vector: v, node });
+                    next_id += 1;
+                    inserted += 1;
+                    since_rebuild += 1;
+                }
+            } else if roll < 85 {
+                for _ in 0..1 + draw(4) {
+                    let id = *held.keys().nth(draw(held.len())).unwrap();
+                    let old = held[&id].node;
+                    graph.records_mut()[old as usize] = Position::NONE;
+                    stranded += 1;
+                    let v = vector(&mut draw);
+                    let node = place(&mut graph, kind, &v, id);
+                    held.insert(id, Placed { vector: v, node });
+                    inserted += 1;
+                    since_rebuild += 1;
+                }
+            } else if roll < 97 {
+                for _ in 0..1 + draw(4) {
+                    if held.is_empty() {
+                        break;
+                    }
+                    let id = *held.keys().nth(draw(held.len())).unwrap();
+                    let gone = held.remove(&id).unwrap();
+                    graph.records_mut()[gone.node as usize] = Position::NONE;
+                    stranded += 1;
+                }
+            } else if since_rebuild >= held.len() {
+                let mut order: Vec<(u32, usize)> =
+                    held.iter().map(|(&id, placed)| (placed.node, id)).collect();
+                order.sort_unstable();
+                graph = kind.empty(4 + draw(5), 0x0224 + k as u64 + rebuilds as u64);
+                for (_, id) in order {
+                    let v = held[&id].vector.clone();
+                    let node = place(&mut graph, kind, &v, id);
+                    held.get_mut(&id).unwrap().node = node;
+                }
+                since_rebuild = 0;
+                rebuilds += 1;
+            }
+            let last = inserted >= budget;
+            if graph.nb_points() <= ASKED_EVERY_STEP || step % 64 == 0 || last {
+                if let Err(broken) = graph.structure_holds() {
+                    panic!(
+                        "{label}, step {step}, {} nodes: {broken}",
+                        graph.nb_points()
+                    );
+                }
+            }
+        }
+        assert!(
+            rebuilds > 0 && stranded > 0,
+            "{label}: the sequence rebuilt {rebuilds} times and stranded {stranded} nodes"
         );
     }
 }

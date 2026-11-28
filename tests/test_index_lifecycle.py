@@ -57,23 +57,23 @@ def test_index_creation_validation():
     vdb = VectorDatabase()
     
     # Test invalid dimension
-    with pytest.raises(RuntimeError):
+    with pytest.raises(ValueError):
         vdb.create("hnsw", dim=0)
     
     # Test invalid ef_construction
-    with pytest.raises(RuntimeError):
+    with pytest.raises(ValueError):
         vdb.create("hnsw", dim=4, ef_construction=0)
     
     # Test invalid expected_size
-    with pytest.raises(RuntimeError):
+    with pytest.raises(ValueError):
         vdb.create("hnsw", dim=4, expected_size=0)
     
     # Test invalid m
-    with pytest.raises(RuntimeError):
+    with pytest.raises(ValueError):
         vdb.create("hnsw", dim=4, m=300)  # > 256
     
     # Test invalid space
-    with pytest.raises(RuntimeError):
+    with pytest.raises(ValueError):
         vdb.create("hnsw", dim=4, space="invalid")
 
 # ------------------------------------------------------------
@@ -274,10 +274,10 @@ def test_get_performance_info_reports_only_real_behaviour():
     }
     assert quantized_info["quantization_compression"] == "16.0x"
 
-    # The accuracy claim was "slight_recall_reduction". Measured on clustered
-    # data it is 0.16 at 10 against 1.00 unquantized, which rerank recovers and
-    # only quantized_with_raw can rerank, so the two modes now say different
-    # things and neither says slight.
+    # Product quantization scores against codes that approximate each vector,
+    # so its recall is below that of the same data unquantized. Only
+    # quantized_with_raw can rerank against the raw vectors, so the two modes
+    # report different impacts.
     assert quantized_info["quantization_accuracy_impact"] == (
         "large_recall_loss_no_rerank_available")
 
@@ -382,10 +382,10 @@ def test_m_lower_bound():
     vdb = VectorDatabase()
 
     for bad in (0, 1):
-        with pytest.raises(RuntimeError, match="m must be at least 2"):
+        with pytest.raises(ValueError, match="m must be at least 2"):
             vdb.create("hnsw", dim=4, m=bad)
 
-    with pytest.raises(RuntimeError, match="scale of 1 / ln"):
+    with pytest.raises(ValueError, match="scale of 1 / ln"):
         vdb.create("hnsw", dim=4, m=1)
 
     # Two is the smallest value that is accepted, and it works.
@@ -507,9 +507,7 @@ def test_default_m_scales_with_expected_size(expected_size, expected_m):
     scale, and expected_size is the size the user already declares.
 
     The expression is checked directly rather than through create() for every
-    size, because the graph reserves about 3KB of capacity per declared record
-    at creation, so building an index at the larger sizes here would commit
-    tens of gigabytes. The sizes that are built are checked below.
+    size. The sizes that are built are checked below.
     """
     assert VectorDatabase._default_m(expected_size) == expected_m
 
@@ -541,9 +539,9 @@ def test_explicit_m_overrides_the_scaled_default():
 
     # The ladder never produces a value outside the bounds for any
     # expected_size the Rust layer accepts.
-    with pytest.raises(RuntimeError, match="m must be at least 2"):
+    with pytest.raises(ValueError, match="m must be at least 2"):
         vdb.create("hnsw", dim=4, m=0, expected_size=30_000)
-    with pytest.raises(RuntimeError, match="less than or equal to 256"):
+    with pytest.raises(ValueError, match="less than or equal to 256"):
         vdb.create("hnsw", dim=4, m=257, expected_size=10)
 
     # An index created with no expected_size keeps the historical m 16, so the
@@ -554,7 +552,7 @@ def test_explicit_m_overrides_the_scaled_default():
     # than failing inside the ladder with a worse message.
     assert VectorDatabase._default_m("large") == 16
     assert VectorDatabase._default_m(True) == 16
-    with pytest.raises(RuntimeError):
+    with pytest.raises(TypeError):
         vdb.create("hnsw", dim=4, expected_size="large")
 
 
@@ -623,11 +621,11 @@ def test_neighbour_selection_heuristic_warning():
 
     # A pair the Rust layer rejects gets its real error and no warning.
     with _no_user_warning():
-        with pytest.raises(RuntimeError, match="ef_construction must be positive"):
+        with pytest.raises(ValueError, match="ef_construction must be positive"):
             vdb.create("hnsw", dim=4, ef_construction=0)
-        with pytest.raises(RuntimeError, match="less than or equal to 256"):
+        with pytest.raises(ValueError, match="less than or equal to 256"):
             vdb.create("hnsw", dim=4, m=257)
-        with pytest.raises(RuntimeError, match="m must be at least 2"):
+        with pytest.raises(ValueError, match="m must be at least 2"):
             vdb.create("hnsw", dim=4, m=1)
 
     # The warning points at the caller's create() rather than inside the
@@ -651,11 +649,214 @@ def test_ef_construction_has_a_ceiling_and_the_ceiling_is_inclusive():
     than dying, and the raises below fail in-process.
     """
     vdb = VectorDatabase()
-    with pytest.raises(RuntimeError, match="ef_construction must be at most 4096, got 4097"):
+    with pytest.raises(ValueError, match="ef_construction must be at most 4096, got 4097"):
         vdb.create("hnsw", dim=4, ef_construction=4097)
-    with pytest.raises(RuntimeError, match="ef_construction must be at most 4096, got 1099511627776"):
+    with pytest.raises(ValueError, match="ef_construction must be at most 4096, got 1099511627776"):
         vdb.create("hnsw", dim=4, ef_construction=1 << 40)
     index = vdb.create("hnsw", dim=4, ef_construction=4096, expected_size=4)
     assert index.ef_construction == 4096
     index.add({"ids": ["a"], "embeddings": [[1.0, 0.0, 0.0, 0.0]]})
     assert len(index) == 1
+
+
+# ------------------------------------------------------------
+# create() raises what the factory raises
+# ------------------------------------------------------------
+@pytest.mark.parametrize("kwargs,klass,words", [
+    ({"dim": 4, "m": 1}, ValueError, "m must be at least 2, got 1."),
+    ({"dim": 4, "space": "hamming"}, ValueError,
+     "Unsupported space: 'hamming'. Supported spaces: 'cosine', 'l2', 'l1', 'dot'"),
+    ({"dim": 0}, ValueError, "dim must be positive, got 0"),
+    ({"dim": "four"}, TypeError, "'str' object cannot be interpreted as an integer"),
+    ({"dim": 4, "ef_construction": 0}, ValueError, "ef_construction must be positive, got 0"),
+    ({"dim": 4, "expected_size": 10**9}, ValueError,
+     "expected_size must be at most 100000000, got 1000000000."),
+    ({"dim": 4, "indexed_fields": ["$and"]}, ValueError, 'indexed_fields names "$and"'),
+    ({"dim": 4, "sparse": {"unlink": "sometimes"}}, ValueError,
+     "unknown variant `sometimes`, expected one of `strand`, `lazy`, `eager`"),
+    ({"dim": 8, "space": "dot", "quantization_config": {"type": "pq", "subvectors": 2}},
+     ValueError, "space='dot' cannot be product quantized."),
+    ({"dim": 4, "colour": "red"}, TypeError, "unexpected keyword argument 'colour'"),
+])
+def test_create_raises_what_the_factory_raises(kwargs, klass, words):
+    """Every refusal reaches the caller in the factory's class and words, with
+    no prefix naming the factory and no exception beneath it, and an unknown
+    space is a ValueError as every other rule of the declaration is."""
+    with pytest.raises(klass) as raised:
+        VectorDatabase().create("hnsw", **kwargs)
+    assert type(raised.value) is klass
+    assert words in str(raised.value)
+    assert not str(raised.value).startswith("Failed to create")
+    assert raised.value.__cause__ is None
+
+
+@pytest.mark.parametrize("name", ["dim", "m", "ef_construction", "expected_size"])
+def test_create_refuses_a_negative_count_by_name(name):
+    """A negative count is a value outside the range, refused with ValueError
+    naming it."""
+    kwargs = {"dim": 4, name: -3}
+    with pytest.raises(ValueError) as raised:
+        VectorDatabase().create("hnsw", **kwargs)
+    assert str(raised.value) == f"{name} cannot be negative, got -3"
+    with pytest.raises(ValueError) as raised:
+        _create_hnsw_index(**{"dim": 4, "space": "l2", "m": 8, "ef_construction": 50,
+                              "expected_size": 10, name: -3})
+    assert str(raised.value) == f"{name} cannot be negative, got -3"
+
+
+def test_the_factory_docstrings_say_what_it_raises():
+    """`create()` names the classes it raises, and the field list check names
+    the rules it checks rather than every rule."""
+    create_doc = VectorDatabase.create.__doc__
+    assert "TypeError: If dim is missing" in create_doc
+    assert "RuntimeError: If index creation fails due to backend validation" not in create_doc
+    fields_doc = VectorDatabase._validate_indexed_fields.__doc__
+    assert "Every rule a declared field list has to satisfy" not in fields_doc
+    assert "held to their rules by the Rust constructor" in fields_doc
+    from zeusdb_vector_database import _engine
+    assert "load(path, tokenizer=None)" not in _engine._load_index.__doc__
+    assert "Useful for determining whether to set" not in _engine.is_logging_initialized.__doc__
+
+
+# ------------------------------------------------------------
+# An index_type that is not a string
+# ------------------------------------------------------------
+@pytest.mark.parametrize("index_type", [1, 1.5, b"hnsw", ["hnsw"], None, False, object()],
+                         ids=["int", "float", "bytes", "list", "None", "False", "object"])
+def test_an_index_type_that_is_not_a_string_raises_type_error(index_type):
+    """A parameter of the wrong type raises TypeError, as the docstring says,
+    and an index_type that is not a str is one, None among them."""
+    with pytest.raises(TypeError) as refusal:
+        VectorDatabase().create(index_type, dim=4)
+    assert str(refusal.value) == (
+        f"index_type must be a str such as 'hnsw', got {type(index_type).__name__}.")
+
+
+# ------------------------------------------------------------
+# A value the engine refuses, beside a quantization config
+# ------------------------------------------------------------
+def engine_refusal(**arguments):
+    """What create() raises for `arguments` with no quantization config,
+    being the engine's own refusal."""
+    with pytest.raises((ValueError, TypeError)) as refusal:
+        VectorDatabase().create("hnsw", **arguments)
+    return refusal.type, str(refusal.value)
+
+
+@pytest.mark.parametrize("config", [{"type": "pq"}, {"type": "pq", "subvectors": 8}],
+                         ids=["derived", "given"])
+@pytest.mark.parametrize("dim", [-3, 0, 65_537, "4"], ids=["negative", "zero", "above", "str"])
+def test_a_dim_the_engine_refuses_raises_its_refusal_alone_beside_a_pq_config(dim, config):
+    """The rules a product quantized config derives from dim stand aside for
+    a dim the engine refuses, so the caller reads the engine's refusal of
+    dim, and no warning, whatever the config."""
+    expected = engine_refusal(dim=dim)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises((ValueError, TypeError)) as refusal:
+            VectorDatabase().create("hnsw", dim=dim, quantization_config=dict(config))
+    assert (refusal.type, str(refusal.value)) == expected
+    assert [str(w.message) for w in caught] == []
+
+
+@pytest.mark.parametrize("config", [{"type": "pq", "subvectors": 4}, {"type": "int8"}],
+                         ids=["pq", "int8"])
+@pytest.mark.parametrize("expected_size", [-5, 0], ids=["negative", "zero"])
+def test_an_expected_size_the_engine_refuses_raises_its_refusal_alone(expected_size, config):
+    """A training size warning stands aside for an expected_size the engine
+    refuses, so the caller reads the engine's refusal of it and no warning."""
+    expected = engine_refusal(dim=8, expected_size=expected_size)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises(ValueError) as refusal:
+            VectorDatabase().create("hnsw", dim=8, expected_size=expected_size,
+                                    quantization_config=dict(config))
+    assert (refusal.type, str(refusal.value)) == expected
+    assert [str(w.message) for w in caught] == []
+
+
+# ------------------------------------------------------------
+# An argument of the wrong type raises TypeError
+# ------------------------------------------------------------
+@pytest.mark.parametrize("kwargs, words", [
+    ({"indexed_fields": 5}, "indexed_fields must be a list of metadata field names, got int."),
+    ({"indexed_fields": [5]},
+     "indexed_fields must hold field names as strings, but it holds 5, of type int."),
+    ({"indexed_fields": "lang"},
+     "indexed_fields must be a list of field names, not a single string. Pass "
+     "indexed_fields=['lang'] to declare one field."),
+    ({"quantization_config": 5}, "quantization_config must be a dictionary"),
+    ({"quantization_config": {"type": "pq", 1: 2}},
+     "quantization_config must have str keys, but it holds the key 1, of type int."),
+    ({"quantization_config": {"type": "int8", ("a",): 2}},
+     "quantization_config must have str keys, but it holds the key ('a',), of type tuple."),
+], ids=["fields-int", "fields-holding-an-int", "fields-str", "config-int", "pq-key-int",
+        "int8-key-tuple"])
+def test_an_argument_of_the_wrong_type_raises_type_error(kwargs, words):
+    """A parameter of the wrong type raises TypeError, as the docstring says:
+    a field list that is not a list of str, a quantization config that is
+    not a dict and a config key that is not a str."""
+    with pytest.raises(TypeError) as refusal:
+        VectorDatabase().create("hnsw", dim=8, **kwargs)
+    assert str(refusal.value) == words
+
+
+# ------------------------------------------------------------
+# A quantization count that is not an int names its type
+# ------------------------------------------------------------
+@pytest.mark.parametrize("scheme", ["pq", "int8"])
+@pytest.mark.parametrize("key, value", [("training_size", "2000"), ("training_size", 2000.0),
+                                        ("max_training_vectors", "5000")],
+                         ids=["training_size-str", "training_size-float",
+                              "max_training_vectors-str"])
+def test_a_quantization_count_that_is_not_an_int_names_its_type(scheme, key, value):
+    """A training_size or max_training_vectors that is not an int raises
+    ValueError naming the value and its type, under both schemes."""
+    config = {"type": scheme, key: value}
+    if scheme == "pq":
+        config["subvectors"] = 2
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        with pytest.raises(ValueError) as refusal:
+            VectorDatabase().create("hnsw", dim=8, quantization_config=config)
+    assert str(refusal.value) == (
+        f"{key} must be an integer, got {value!r}, of type {type(value).__name__}.")
+
+
+# ------------------------------------------------------------
+# None for a quantization key is the key left out
+# ------------------------------------------------------------
+@pytest.mark.parametrize("config", [
+    {"type": "pq", "subvectors": 2, "bits": None},
+    {"type": "pq", "subvectors": 2, "storage_mode": None},
+    {"type": "int8", "storage_mode": None},
+], ids=["pq-bits", "pq-storage_mode", "int8-storage_mode"])
+def test_none_for_a_quantization_key_with_a_default_is_that_default(config):
+    """None for bits or storage_mode is the key left out, as it is for every
+    other key of a quantization config, so the index takes the default."""
+    without = {key: value for key, value in config.items() if value is not None}
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        given = VectorDatabase().create("hnsw", dim=8, quantization_config=config)
+        left_out = VectorDatabase().create("hnsw", dim=8, quantization_config=without)
+    assert given.get_quantization_info() == left_out.get_quantization_info()
+
+
+# ------------------------------------------------------------
+# A quantization key the scheme does not read is refused
+# ------------------------------------------------------------
+@pytest.mark.parametrize("config, words", [
+    ({"type": "pq", "subvector": 4},
+     "quantization_config holds the key 'subvector', which type 'pq' does not read. Type 'pq' "
+     "reads type, subvectors, bits, training_size, max_training_vectors and storage_mode."),
+    ({"type": "int8", "trainingsize": 2000},
+     "quantization_config holds the key 'trainingsize', which type 'int8' does not read. Type "
+     "'int8' reads type, scale, training_size, max_training_vectors and storage_mode."),
+], ids=["pq", "int8"])
+def test_a_quantization_key_the_scheme_does_not_read_is_refused(config, words):
+    """The engine reads the keys a scheme names alone, so a key the scheme
+    does not read would change nothing, and create() raises ValueError
+    naming it and the keys the scheme reads."""
+    with pytest.raises(ValueError) as refusal:
+        VectorDatabase().create("hnsw", dim=8, quantization_config=config)
+    assert str(refusal.value) == words

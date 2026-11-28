@@ -7,9 +7,13 @@
 //!
 //! - **Global and immutable**: After any initialization (auto or manual), the logging
 //!   configuration is process-global and cannot be changed. Subsequent `init_*` calls
-//!   will return `False` and have no effect.
-//! - **File target**: `ZEUSDB_LOG_FILE` names the file that is written, exactly as
-//!   given (e.g. `app.log` writes `app.log`). Set `ZEUSDB_LOG_ROTATION=daily` to
+//!   will return `False` and have no effect, or raise `ValueError` for an empty
+//!   `log_dir` or, where `RUST_LOG` is unset or does not parse, for a level they
+//!   cannot read.
+//! - **File target**: `ZEUSDB_LOG_FILE` names the file that is written, as given
+//!   (e.g. `app.log` writes `app.log`). A path that names a folder, such as `.` or
+//!   `logs/`, writes no file, and the target falls back to stderr as for a file it
+//!   cannot open. Set `ZEUSDB_LOG_ROTATION=daily` to
 //!   bound disk growth, which appends a date (`app.log.2026-08-03`). The resolved
 //!   path is logged at startup either way. Rotation is also available through
 //!   `init_file_logging(log_dir, level, file_prefix)`, whose `file_prefix` is a
@@ -29,7 +33,7 @@
 //! - `ZEUSDB_LOG_LEVEL`: trace, debug, info, warn, error (default: warn)
 //! - `ZEUSDB_LOG_FORMAT`: human, json (default: human)
 //! - `ZEUSDB_LOG_TARGET`: stdout, stderr, file (default: stderr)
-//! - `ZEUSDB_LOG_FILE`: log file path, written exactly as given (default: zeusdb.log)
+//! - `ZEUSDB_LOG_FILE`: log file path, written as given, and a path that names a folder writes no file (default, where unset or empty: zeusdb.log)
 //! - `ZEUSDB_LOG_ROTATION`: daily, never (default: never). daily appends a date to the file name
 //! - `ZEUSDB_DISABLE_AUTO_LOGGING`: true, 1 or yes to disable auto-init (for programmatic control)
 //! - `ZEUSDB_DISABLE_AUTOLOG`: deprecated alias for the above, honoured for compatibility
@@ -69,8 +73,10 @@
 //! ```
 
 use pyo3::prelude::*;
+use std::ffi::OsStr;
 use std::io;
 use std::io::IsTerminal;
+use std::path::Path;
 use std::sync::Once;
 use tracing::Subscriber;
 use tracing_appender::non_blocking::WorkerGuard;
@@ -239,7 +245,10 @@ pub(crate) fn init_from_env_if_unset() {
         // Create base subscriber and consume it in the match
         let subscriber = Registry::default().with(filter);
 
-        // Initialize with appropriate layer, preserving format on file fallback
+        // Initialize with appropriate layer, preserving format on file fallback.
+        // What became of the file the `file` target names: written, or the
+        // cause it could not be opened, and nothing for any other target.
+        let mut file_layer: Option<Result<(), String>> = None;
         match (log_format.as_str(), log_target.as_str()) {
             ("json", "stdout") => {
                 let _ = subscriber.with(create_json_stdout_layer::<_>()).try_init();
@@ -247,28 +256,34 @@ pub(crate) fn init_from_env_if_unset() {
             ("json", "stderr") => {
                 let _ = subscriber.with(create_json_stderr_layer::<_>()).try_init();
             }
-            ("json", "file") => {
-                if let Some(layer) = create_json_file_layer::<_>() {
+            ("json", "file") => match create_json_file_layer::<_>() {
+                Ok(layer) => {
+                    file_layer = Some(Ok(()));
                     let _ = subscriber.with(layer).try_init();
-                } else {
+                }
+                Err(cause) => {
                     // Fallback: preserve JSON format, use stderr
+                    file_layer = Some(Err(cause));
                     let _ = subscriber.with(create_json_stderr_layer::<_>()).try_init();
                 }
-            }
+            },
             ("human", "stdout") => {
                 let _ = subscriber.with(create_human_stdout_layer::<_>()).try_init();
             }
             ("human", "stderr") => {
                 let _ = subscriber.with(create_human_stderr_layer::<_>()).try_init();
             }
-            ("human", "file") => {
-                if let Some(layer) = create_human_file_layer::<_>() {
+            ("human", "file") => match create_human_file_layer::<_>() {
+                Ok(layer) => {
+                    file_layer = Some(Ok(()));
                     let _ = subscriber.with(layer).try_init();
-                } else {
+                }
+                Err(cause) => {
                     // Fallback: preserve human format, use stderr
+                    file_layer = Some(Err(cause));
                     let _ = subscriber.with(create_human_stderr_layer::<_>()).try_init();
                 }
-            }
+            },
             _ => {
                 // Unknown format/target - safe fallback
                 let _ = subscriber.with(create_human_stderr_layer::<_>()).try_init();
@@ -287,7 +302,8 @@ pub(crate) fn init_from_env_if_unset() {
         // Name the destination when the target is a file, so the resolved path
         // is discoverable rather than inferred. Under daily rotation the
         // resolved name carries a date suffix and is not the name the caller
-        // typed, which is the case this record exists for.
+        // typed, which is the case this record exists for. Where the file
+        // could not be opened, a warning names it, the cause and stderr.
         if log_target == "file" {
             let requested_rotation = std::env::var("ZEUSDB_LOG_ROTATION").unwrap_or_default();
             if parse_rotation(&requested_rotation).is_none() {
@@ -298,12 +314,23 @@ pub(crate) fn init_from_env_if_unset() {
                 );
             }
 
-            tracing::info!(
-                operation = "logging_init_file",
-                rotation = %configured_rotation().as_str(),
-                log_file = %resolved_log_file_path(),
-                "ZeusDB file logging writing to resolved path"
-            );
+            match &file_layer {
+                Some(Ok(())) => tracing::info!(
+                    operation = "logging_init_file",
+                    rotation = %configured_rotation().as_str(),
+                    log_file = %resolved_log_file_path(),
+                    "ZeusDB file logging writing to resolved path"
+                ),
+                Some(Err(cause)) => tracing::warn!(
+                    operation = "logging_init_file",
+                    log_file = %resolved_log_file_path(),
+                    error = %cause,
+                    "ZeusDB file logging cannot open the resolved path, so the engine's \
+                     records go to stderr. Set ZEUSDB_LOG_FILE to a file this process can \
+                     write"
+                ),
+                None => {}
+            }
         }
     });
 }
@@ -313,19 +340,69 @@ pub fn init_logging() {
     init_from_env_if_unset()
 }
 
+/// The filter `call` installs: `RUST_LOG` where it parses, and `level`
+/// otherwise, `info` where it is left out. A `level` that does not parse,
+/// or that is one word naming no level and no target of the engine's,
+/// raises `ValueError` naming it, before the one initialization runs, so a
+/// call that raises leaves logging as it was and a later call can still
+/// initialize it.
+fn requested_filter(call: &str, level: Option<&str>) -> PyResult<EnvFilter> {
+    if let Ok(filter) = EnvFilter::try_from_default_env() {
+        return Ok(filter);
+    }
+    let level = level.unwrap_or("info");
+    let refused = |cause: &dyn std::fmt::Display| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "{} takes a level such as 'info' or a filter such as \
+             'zeusdb_vector_database=debug', and cannot read '{}': {}.",
+            call, level, cause
+        ))
+    };
+    // A name of the table `ZEUSDB_LOG_LEVEL` is read through, such as
+    // Python's `warning`, is that level. `EnvFilter` reads one word that is
+    // no level as a target at every level, as it would read a misspelt
+    // level, so such a word is refused unless it is the engine's own target
+    // or one under it. Any other text is a filter.
+    let text = known_level(level).unwrap_or(level);
+    if names_no_level(text) {
+        return Err(refused(&"it names no level"));
+    }
+    EnvFilter::try_new(text).map_err(|error| refused(&error))
+}
+
+/// The target of the engine's records, which each record carries or one
+/// under it.
+const ENGINE_TARGET: &str = "zeusdb_vector_database";
+
+/// Whether `text` is one word that `EnvFilter` reads as a target and not
+/// as a level, being no level name and no target of the engine's own.
+fn names_no_level(text: &str) -> bool {
+    let word = text.trim();
+    !word.is_empty()
+        && !word.contains(['=', ',', '['])
+        && word
+            .parse::<tracing_subscriber::filter::LevelFilter>()
+            .is_err()
+        && word != ENGINE_TARGET
+        && !word
+            .strip_prefix(ENGINE_TARGET)
+            .is_some_and(|rest| rest.starts_with("::"))
+}
+
 /// Python-exposed logging initialization (JSON to console)
 ///
-/// Returns true if initialization occurred, false if already initialized.
+/// Returns true if initialization occurred, false if already initialized,
+/// and raises ValueError for a level it cannot read.
 /// Forces JSON to stdout regardless of ZEUSDB_LOG_TARGET; use env vars for other formats.
+/// `level` left out or `None` is `info`, under a `RUST_LOG` that takes precedence
+/// where it parses.
 #[pyfunction(name = "init_logging")]
+#[pyo3(signature = (level = None))]
 pub fn py_init_logging(level: Option<String>) -> PyResult<bool> {
+    let filter = requested_filter("init_logging()", level.as_deref())?;
     let mut took_init = false;
     INIT.call_once(|| {
         took_init = true;
-        let filter = EnvFilter::try_from_default_env()
-            .or_else(|_| EnvFilter::try_new(level.as_deref().unwrap_or("info")))
-            .unwrap();
-
         let registry = Registry::default().with(filter).with(
             fmt::layer()
                 .json()
@@ -349,8 +426,15 @@ pub fn py_init_logging(level: Option<String>) -> PyResult<bool> {
 
 /// Python-exposed file logging initialization (JSON to rotating files)
 ///
-/// Returns true if initialization occurred, false if already initialized.
+/// Returns true if initialization occurred, false if already initialized,
+/// and raises ValueError for an empty `log_dir` or a level it cannot read
+/// and, before logging is set up, OSError for a folder it cannot make or a
+/// log file it cannot open.
+/// `level` left out or `None` is `info`, under a `RUST_LOG` that takes
+/// precedence where it parses, and `file_prefix` left out or `None` is
+/// `zeusdb`.
 #[pyfunction(name = "init_file_logging")]
+#[pyo3(signature = (log_dir, level = None, file_prefix = None))]
 pub fn py_init_file_logging(
     log_dir: String,
     level: Option<String>,
@@ -360,36 +444,38 @@ pub fn py_init_file_logging(
     if log_dir.trim().is_empty() {
         return Err(Error::LogDirEmpty.into());
     }
+    let filter = requested_filter("init_file_logging()", level.as_deref())?;
+
+    // Where the one setup has run, nothing is made or opened. Otherwise the
+    // folder and the file come before the setup, so a call that cannot make
+    // the one or open the other raises OSError and leaves the setup to a
+    // later call.
+    if INIT.is_completed() {
+        return Ok(false);
+    }
+    std::fs::create_dir_all(&log_dir).map_err(|error| {
+        pyo3::exceptions::PyOSError::new_err(format!(
+            "init_file_logging() cannot make the folder {}: {}.",
+            log_dir, error
+        ))
+    })?;
+    let appender = tracing_appender::rolling::RollingFileAppender::builder()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix(file_prefix.unwrap_or_else(|| "zeusdb".to_string()))
+        .build(&log_dir)
+        .map_err(|error| {
+            let cause = std::error::Error::source(&error)
+                .map_or_else(|| error.to_string(), |source| source.to_string());
+            pyo3::exceptions::PyOSError::new_err(format!(
+                "init_file_logging() cannot open a log file in {}: {}.",
+                log_dir, cause
+            ))
+        })?;
 
     let mut took_init = false;
     INIT.call_once(|| {
         took_init = true;
 
-        let filter = EnvFilter::try_from_default_env()
-            .or_else(|_| EnvFilter::try_new(level.as_deref().unwrap_or("info")))
-            .unwrap();
-
-        // Try to create log directory
-        if let Err(e) = std::fs::create_dir_all(&log_dir) {
-            // Install fallback subscriber first, then warn
-            let _ = Registry::default()
-                .with(filter)
-                .with(create_json_stderr_layer::<_>())
-                .try_init();
-
-            tracing::warn!(
-                operation = "create_log_dir",
-                error = ?e,
-                path = %log_dir,
-                "Failed to create log directory, using stderr instead"
-            );
-            return;
-        }
-
-        let appender = tracing_appender::rolling::daily(
-            log_dir,
-            file_prefix.unwrap_or_else(|| "zeusdb".to_string()),
-        );
         let (non_blocking, guard) = tracing_appender::non_blocking(appender);
         store_worker_guard(guard);
 
@@ -417,21 +503,23 @@ pub fn py_init_file_logging(
 /// Check if logging has been initialized
 ///
 /// Returns true if logging initialization has occurred (either auto or manual).
-/// Useful for determining whether to set ZEUSDB_DISABLE_AUTOLOG or not.
 #[pyfunction]
 pub fn is_logging_initialized() -> bool {
     INIT.is_completed()
 }
 
+/// The dependencies whose records the default filter holds at `warn`,
+/// whatever level the engine's own records run at. Each is a package in the
+/// workspace's lock file; see `every_quieted_crate_is_in_the_lock_file`.
+const QUIETED_CRATES: [&str; 3] = ["rayon", "pyo3", "serde_json"];
+
 /// Create environment filter with intelligent defaults for dependencies
 fn create_env_filter(log_level: &str) -> EnvFilter {
-    let base = format!(
-        "zeusdb_vector_database={level},\
-         rayon=warn,pyo3=warn,bincode=warn,serde_json=warn,\
-         mio=warn,tokio=warn",
-        level = canonical_level(log_level)
-    );
-    EnvFilter::new(base)
+    let mut directives = format!("zeusdb_vector_database={}", canonical_level(log_level));
+    for name in QUIETED_CRATES {
+        directives.push_str(&format!(",{}=warn", name));
+    }
+    EnvFilter::new(directives)
 }
 
 /// The one place a level name becomes a level, for both layers
@@ -452,14 +540,20 @@ fn create_env_filter(log_level: &str) -> EnvFilter {
 /// An unrecognised name falls back to `warn`, which is the default this module
 /// already used, rather than being passed through for `EnvFilter` to reject.
 fn canonical_level(log_level: &str) -> &'static str {
+    known_level(log_level).unwrap_or("warn")
+}
+
+/// The level a name of the table above names, whatever its case and the
+/// space around it, or `None` for any other text.
+fn known_level(log_level: &str) -> Option<&'static str> {
     match log_level.trim().to_lowercase().as_str() {
-        "trace" => "trace",
-        "debug" => "debug",
-        "info" => "info",
-        "warn" | "warning" => "warn",
-        "error" | "critical" | "fatal" => "error",
-        "off" | "none" | "silent" => "off",
-        _ => "warn",
+        "trace" => Some("trace"),
+        "debug" => Some("debug"),
+        "info" => Some("info"),
+        "warn" | "warning" => Some("warn"),
+        "error" | "err" | "critical" | "fatal" => Some("error"),
+        "off" | "none" | "silent" => Some("off"),
+        _ => None,
     }
 }
 
@@ -551,12 +645,13 @@ where
     )
 }
 
-/// Create JSON formatter for file output with rotation
-fn create_json_file_layer<S>() -> Option<Box<dyn Layer<S> + Send + Sync + 'static>>
+/// Create JSON formatter for file output with rotation, or the cause the
+/// file cannot be opened
+fn create_json_file_layer<S>() -> Result<Box<dyn Layer<S> + Send + Sync + 'static>, String>
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
-    let log_file = std::env::var("ZEUSDB_LOG_FILE").unwrap_or_else(|_| "zeusdb.log".to_string());
+    let log_file = log_file_setting();
 
     create_file_appender(&log_file).map(|(non_blocking, guard)| {
         store_worker_guard(guard);
@@ -578,12 +673,13 @@ where
     })
 }
 
-/// Create human-readable formatter for file output with rotation
-fn create_human_file_layer<S>() -> Option<Box<dyn Layer<S> + Send + Sync + 'static>>
+/// Create human-readable formatter for file output with rotation, or the
+/// cause the file cannot be opened
+fn create_human_file_layer<S>() -> Result<Box<dyn Layer<S> + Send + Sync + 'static>, String>
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
-    let log_file = std::env::var("ZEUSDB_LOG_FILE").unwrap_or_else(|_| "zeusdb.log".to_string());
+    let log_file = log_file_setting();
 
     create_file_appender(&log_file).map(|(non_blocking, guard)| {
         store_worker_guard(guard);
@@ -631,7 +727,7 @@ impl LogRotation {
             LogRotation::Never => String::new(),
             // tracing-appender formats a DAILY rotation as `{base}.{YYYY-MM-DD}`
             // against the UTC date.
-            LogRotation::Daily => format!(".{}", chrono::Utc::now().format("%Y-%m-%d")),
+            LogRotation::Daily => format!(".{}", zeusdb_vector_core::Timestamp::now().to_date()),
         }
     }
 }
@@ -654,6 +750,45 @@ fn configured_rotation() -> LogRotation {
     parse_rotation(&raw).unwrap_or(LogRotation::Never)
 }
 
+/// The value of `ZEUSDB_LOG_FILE`, or `zeusdb.log` where it is unset, empty
+/// or not Unicode
+///
+/// The Python layer reads an empty value as unset as well, so neither layer
+/// reads it as a path.
+fn log_file_setting() -> String {
+    std::env::var("ZEUSDB_LOG_FILE")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "zeusdb.log".to_string())
+}
+
+/// The folder and the name of the file `path` names, or `None` where it
+/// names a folder and so no file
+///
+/// A path names a folder where its last part is empty, `.` or `..`, read
+/// from its text before `Path::components` drops a trailing separator and a
+/// trailing `.`, where it holds no name, being a root or a drive, or where
+/// it is a folder that exists, beside which daily rotation would otherwise
+/// write a dated file. A bare name is in the working folder.
+/// `_names_a_folder` in `logging_config.py` keeps the same rule, so the two
+/// layers refuse the same paths.
+fn file_in_folder(path: &Path) -> Option<(&Path, &OsStr)> {
+    let text = path.as_os_str().as_encoded_bytes();
+    let last = text
+        .rsplit(|&byte| std::path::is_separator(char::from(byte)))
+        .next()
+        .unwrap_or_default();
+    if matches!(last, b"" | b"." | b"..") || path.is_dir() {
+        return None;
+    }
+    let name = path.file_name()?;
+    let directory = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    Some((directory, name))
+}
+
 /// Create a file appender for the file the caller named
 ///
 /// `ZEUSDB_LOG_FILE=app.log` writes `app.log` under the default rotation of
@@ -667,60 +802,69 @@ fn configured_rotation() -> LogRotation {
 /// `_FILE`. Rotation stays available for the callers who need disk growth
 /// bounded, under `ZEUSDB_LOG_ROTATION=daily`, where the date suffix is asked
 /// for rather than imposed.
+///
+/// A path that names a folder, by `file_in_folder`, names no file, so it is
+/// refused with the cause `is a directory` before any folder is made or file
+/// opened, as the Python layer refuses it.
 fn create_file_appender(
     log_file_path: &str,
-) -> Option<(
-    tracing_appender::non_blocking::NonBlocking,
-    tracing_appender::non_blocking::WorkerGuard,
-)> {
-    use std::borrow::Cow;
-    use std::path::Path;
-
-    let path = Path::new(log_file_path);
-
-    let (directory, filename) = match (path.parent(), path.file_name()) {
-        (Some(dir), Some(name)) if !dir.as_os_str().is_empty() => (dir, name.to_string_lossy()),
-        (_, Some(name)) => (Path::new("."), name.to_string_lossy()),
-        _ => (Path::new("."), Cow::from("zeusdb.log")),
+) -> Result<
+    (
+        tracing_appender::non_blocking::NonBlocking,
+        tracing_appender::non_blocking::WorkerGuard,
+    ),
+    String,
+> {
+    let Some((directory, filename)) = file_in_folder(Path::new(log_file_path)) else {
+        return Err(io::ErrorKind::IsADirectory.to_string());
     };
 
-    // Silent failure for graceful degradation
-    if std::fs::create_dir_all(directory).is_err() {
-        return None;
-    }
+    // A folder this process cannot make is returned as the cause the setup
+    // warns of before it falls back to stderr.
+    std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
 
-    let file_appender = match configured_rotation() {
-        LogRotation::Never => tracing_appender::rolling::never(directory, &*filename),
-        LogRotation::Daily => tracing_appender::rolling::daily(directory, &*filename),
+    // Built through the builder, whose `build` returns the failure that
+    // `rolling::never` and `rolling::daily` panic with, so a file this
+    // process cannot open falls back to stderr with its cause, as a folder
+    // it cannot make does.
+    let rotation = match configured_rotation() {
+        LogRotation::Never => tracing_appender::rolling::Rotation::NEVER,
+        LogRotation::Daily => tracing_appender::rolling::Rotation::DAILY,
     };
+    let file_appender = tracing_appender::rolling::RollingFileAppender::builder()
+        .rotation(rotation)
+        .filename_prefix(filename.to_string_lossy().into_owned())
+        .build(directory)
+        .map_err(|error| {
+            std::error::Error::source(&error)
+                .map_or_else(|| error.to_string(), |source| source.to_string())
+        })?;
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
-    Some((non_blocking, guard))
+    Ok((non_blocking, guard))
 }
 
 /// The file the `file` target resolves to, absolute where that can be worked out
 ///
 /// Emitted at startup so the destination is discoverable from the logs rather
 /// than by guessing. Under `daily` this carries the date suffix, which is the
-/// case where the resolved name differs from the one the caller typed.
+/// case where the resolved name differs from the one the caller typed. A path
+/// that names a folder is given as that folder, absolute where it exists,
+/// since no file is written for it.
 fn resolved_log_file_path() -> String {
-    use std::ffi::OsString;
-    use std::path::Path;
-
-    let configured = std::env::var("ZEUSDB_LOG_FILE").unwrap_or_else(|_| "zeusdb.log".to_string());
+    let configured = log_file_setting();
     let path = Path::new(&configured);
 
-    let mut filename = path
-        .file_name()
-        .map(|name| name.to_os_string())
-        .unwrap_or_else(|| OsString::from("zeusdb.log"));
+    let Some((directory, name)) = file_in_folder(path) else {
+        return match std::fs::canonicalize(path) {
+            Ok(folder) => folder.to_string_lossy().into_owned(),
+            Err(_) => configured,
+        };
+    };
+    let mut filename = name.to_os_string();
     filename.push(configured_rotation().filename_suffix());
 
-    match std::fs::canonicalize(
-        path.parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new(".")),
-    ) {
+    match std::fs::canonicalize(directory) {
         Ok(dir) => dir.join(&filename).to_string_lossy().into_owned(),
         // The directory could not be canonicalized, which is not a reason to
         // report the name the caller typed when rotation has changed it.
@@ -809,6 +953,21 @@ mod tests {
         });
     }
 
+    /// Every crate the default filter quiets is a package the workspace's
+    /// lock file holds, so no directive names a crate the engine does not
+    /// depend on.
+    #[test]
+    fn every_quieted_crate_is_in_the_lock_file() {
+        let lock = include_str!("../../../Cargo.lock");
+        for name in QUIETED_CRATES {
+            let entry = format!("name = \"{}\"", name);
+            assert!(
+                lock.lines().any(|line| line == entry),
+                "{name} is not a package in Cargo.lock"
+            );
+        }
+    }
+
     #[test]
     fn test_init_status_check() {
         // Before any init
@@ -820,5 +979,48 @@ mod tests {
 
         // Should show state change (or already was initialized)
         assert!(now_initialized);
+    }
+
+    /// A path whose last part is empty, `.` or `..`, a root, a drive and a
+    /// folder that exists name a folder and so no file, and a path that ends
+    /// in a name names that file in its parent, or in the working folder
+    /// where it has none, on every system.
+    #[test]
+    fn a_path_that_names_a_folder_names_no_file() {
+        let folder = std::env::temp_dir().join(format!("zeusdb-log-folder-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let existing = folder.to_string_lossy().into_owned();
+        for text in [
+            ".",
+            "..",
+            "logs/",
+            "logs/.",
+            "logs/..",
+            "a/b/..",
+            "/",
+            existing.as_str(),
+        ] {
+            assert_eq!(file_in_folder(Path::new(text)), None, "{text}");
+        }
+        assert_eq!(
+            file_in_folder(Path::new("app.log")),
+            Some((Path::new("."), OsStr::new("app.log")))
+        );
+        assert_eq!(
+            file_in_folder(Path::new("logs/app.log")),
+            Some((Path::new("logs"), OsStr::new("app.log")))
+        );
+        // A backslash separates on Windows alone, and a drive is Windows' own.
+        if cfg!(windows) {
+            for text in ["logs\\", "logs\\.", "C:\\", "C:", "\\\\server\\share\\"] {
+                assert_eq!(file_in_folder(Path::new(text)), None, "{text}");
+            }
+        } else {
+            assert_eq!(
+                file_in_folder(Path::new("logs\\")),
+                Some((Path::new("."), OsStr::new("logs\\")))
+            );
+        }
+        std::fs::remove_dir(&folder).unwrap();
     }
 }

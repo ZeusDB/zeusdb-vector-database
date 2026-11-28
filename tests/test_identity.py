@@ -13,7 +13,7 @@ import shutil
 
 import numpy as np
 import pytest
-from helpers import as_old_wire
+from helpers import as_before_five, as_old_wire
 from zeusdb_vector_database import VectorDatabase
 
 DIM = 8
@@ -44,12 +44,15 @@ def manifest(path):
 
 def recorded(path):
     """The identity a directory's manifest records, as the property spells it."""
-    identity = manifest(path)["identity"]
+    m = manifest(path)
+    identity = m["identity"]
     return {
         "collection_id": identity["collection_id"],
         "generation": identity["generation"],
         "snapshot": identity["snapshot"],
         "parent": identity.get("parent"),
+        "saved_at": m["saved_at"],
+        "sequence": identity["sequence"],
     }
 
 
@@ -73,11 +76,15 @@ def drop(index):
 def test_a_new_index_has_an_id_and_no_snapshot():
     index = build()
     identity = index.identity
-    assert sorted(identity) == ["collection_id", "generation", "parent", "snapshot"]
+    assert sorted(identity) == [
+        "collection_id", "generation", "parent", "saved_at", "sequence", "snapshot",
+    ]
     assert is_id(identity["collection_id"])
     assert identity["generation"] == 0
     assert identity["snapshot"] is None
     assert identity["parent"] is None
+    assert identity["saved_at"] is None
+    assert identity["sequence"] == 0
     assert index.identity == identity, "the same index reports the same identity"
     assert build().identity["collection_id"] != identity["collection_id"]
 
@@ -125,7 +132,7 @@ def test_a_save_that_fails_moves_nothing(tmp_path):
     index.save(str(path))
     before = index.identity
     (tmp_path / "afile").write_text("x")
-    with pytest.raises(RuntimeError, match="staging directory"):
+    with pytest.raises(RuntimeError, match="cannot be locked"):
         index.save(str(tmp_path / "afile" / "sub.zdb"))
     assert index.identity == before
     index.save(str(path))
@@ -183,12 +190,13 @@ def test_a_journaled_directory_names_one_id_three_times(tmp_path):
     """The manifest's identity, its journal record and the journal's header."""
     index = build(5)
     path = tmp_path / "j.zdb"
-    wal = path.parent / (path.name + ".zdbwal")
+    journal = path.parent / (path.name + ".zdbjournal")
     index.journal_to(str(path))
 
     def agree():
         m = manifest(path)
-        header = int.from_bytes(wal.read_bytes()[24:40], "little")
+        segment = sorted(journal.iterdir())[-1]
+        header = int.from_bytes(segment.read_bytes()[24:40], "little")
         assert m["identity"]["collection_id"] == m["journal"]["collection_id"]
         assert m["identity"]["collection_id"] == format(header, "032x")
         assert m["identity"]["collection_id"] == index.identity["collection_id"]
@@ -201,11 +209,32 @@ def test_a_journaled_directory_names_one_id_three_times(tmp_path):
     two = recorded(path)
     assert two["generation"] == 2
     add(index, 9, 12)
-    drop(index)
+    del index
+    gc.collect()
 
     reopened = load(path)
     assert reopened.identity == two, "a replay is not a save"
     assert len(reopened) == 12
+
+
+def test_the_identity_names_the_time_and_the_sequence_its_directory_records(tmp_path):
+    """saved_at is the time the manifest of the directory snapshot names
+    records as its save, and sequence the journal sequence that directory's
+    state holds, which moves at a checkpoint and not as records are added."""
+    index = build(4)
+    path = tmp_path / "j.zdb"
+    index.journal_to(str(path))
+    first = index.identity
+    assert first == recorded(path)
+    assert first["sequence"] == 0
+    assert isinstance(first["saved_at"], str) and "T" in first["saved_at"]
+    add(index, 4, 8)
+    assert index.identity == first, "records in the journal are not a save"
+    index.checkpoint()
+    second = index.identity
+    assert second == recorded(path)
+    assert second["sequence"] == 5, "four inserts and their commit"
+    assert second["saved_at"] >= first["saved_at"]
 
 
 def test_clear_keeps_the_identity(tmp_path):
@@ -235,7 +264,9 @@ def test_a_directory_recording_no_identity_is_named_at_its_next_save(tmp_path, v
     path = tmp_path / "older.zdb"
     index.save(str(path))
     drop(index)
-    if version != "4.0.0":
+    if version == "4.0.0":
+        as_before_five(path, version)
+    else:
         as_old_wire(path, version)
     m = manifest(path)
     del m["identity"]
@@ -247,6 +278,9 @@ def test_a_directory_recording_no_identity_is_named_at_its_next_save(tmp_path, v
     assert first.identity["generation"] == 0
     assert first.identity["snapshot"] is None
     assert len(first) == 10
+
+    assert first.identity["saved_at"] is None
+    assert first.identity["sequence"] == 0
 
     first.save(str(path))
     named = recorded(path)

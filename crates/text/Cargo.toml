@@ -5,6 +5,12 @@
 # that, and `cargo test -p zeusdb-vector-text` links no Python library.
 [package]
 name = "zeusdb-vector-text"
+# What the crate is, and where the wheel's documentation is, an address the
+# root Cargo.toml declares once. cargo package, which maturin sdist runs on
+# each crate the wheel builds from, warns where a manifest has no
+# description, or has none of documentation, homepage and repository.
+description = "The text layer, which turns a string into the term ids and term frequencies a sparse space stores."
+documentation.workspace = true
 # The version, the edition and the licence are the workspace's, declared once
 # in the root Cargo.toml.
 version.workspace = true
@@ -14,8 +20,22 @@ license.workspace = true
 # artefact.
 publish = false
 
+[features]
+# The term ceiling, for a test in another crate that lowers it to reach the
+# refusal of a term too long for the dictionary. Off in every build that is
+# not a test, so the wheel carries none of it. The collection's crate turns
+# it on through its dev-dependency on this crate, which cargo applies to that
+# crate's test targets and to nothing else.
+test-support = []
+
 # Every version is the workspace's, declared once in the root Cargo.toml with
 # the reason for each pin.
 [dependencies]
 zeusdb-vector-core = { workspace = true }
 serde = { workspace = true }
+
+[dev-dependencies]
+# The engine again, with its test support turned on, for the frame fuzz
+# mutator the dictionary's tests draw from. cargo applies a dev-dependency's
+# features to this crate's test targets and to nothing else.
+zeusdb-vector-core = { workspace = true, features = ["test-support"] }

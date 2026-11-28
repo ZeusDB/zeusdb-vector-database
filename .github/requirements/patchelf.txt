@@ -1,0 +1,19 @@
+# The patchelf that maturin runs inside each Linux build image in
+# publish-pypi.yml, when it copies a library into a wheel and points the
+# extension's needed entry and run path at the copy. The linux and musllinux
+# jobs install it with maturin and mount it read only into the image. It is
+# pinned by hash and installed with --require-hashes, wheels only and no
+# dependency resolution. Generated with `uv pip compile --python-version
+# 3.10.22 --python-platform x86_64-unknown-linux-gnu --only-binary :all:
+# --generate-hashes`.
+
+patchelf==0.19.1.0 \
+    --hash=sha256:2ffad3734be73b83ac2f46709264a34dd2aee40a7dd5deccf84856684d606ec6 \
+    --hash=sha256:89760f542fac28c7798e5f56e66601a78ef20e088fc80a493b6a9161438b8dc5 \
+    --hash=sha256:8976fbdef7d3e461d623e703024b70db6b6e3308f7e389930f39a71a1e347a2c \
+    --hash=sha256:a8f6331ccf40c345507279f755f4a38c2cb00b9efda746fd43c17713cce0aba4 \
+    --hash=sha256:b5c3dec03b89db2bb0df301d316360847eeaf72c6fb6ddde0227326655edabb4 \
+    --hash=sha256:c2311d99eac1b9c40f5acd673e3b3581cde320bc4647e7f997e5e063731fc438 \
+    --hash=sha256:efed44482d740e86d84e3f40e0ee9876c4249c7ac1128b5b1639e31287fa14a4 \
+    --hash=sha256:f16f44fbcf0da4f2d1dd841d49f849fe9ea1b8fb952d5c4e9b8234f09d3f149a \
+    --hash=sha256:f97a0e9e657882b89d397418b76b667c0d8af7058a3775cf14c0e105e8ce3a58

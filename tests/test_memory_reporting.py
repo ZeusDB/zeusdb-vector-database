@@ -341,10 +341,10 @@ def test_a_record_pays_for_the_metadata_it_carries_and_no_table_for_it():
         f"which is not one block of two forty byte fields and a short string")
 
 
-def test_metadata_json_names_every_record_and_holds_an_empty_object_for_a_bare_one(tmp_path):
-    """The saved file is one object per live record under its id, and a record
-    added without metadata is written as an empty object, which is what the
-    file held before the store was indexed by internal id."""
+def test_metadata_json_names_the_records_holding_a_field(tmp_path):
+    """The saved file is one object per live record holding a field, under
+    its id, in increasing internal id, and a record added without metadata is
+    left out and loads with an empty object."""
     import json
 
     records, dim = 200, 8
@@ -357,7 +357,7 @@ def test_metadata_json_names_every_record_and_holds_an_empty_object_for_a_bare_o
     index.save(str(tmp_path / "meta.zdb"))
     written = json.loads((tmp_path / "meta.zdb" / "metadata.json").read_text(encoding="utf-8"))
     expected = {ids[i]: metas[i] for i in range(records) if i != 3}
-    assert written == expected
+    assert list(written.items()) == [(key, value) for key, value in expected.items() if value]
 
     loaded = VectorDatabase().load(str(tmp_path / "meta.zdb"))
     got = {r["id"]: r["metadata"] for r in loaded.get_records(list(expected))}

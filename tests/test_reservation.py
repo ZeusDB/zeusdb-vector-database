@@ -7,9 +7,9 @@ times the memory an index needed.
 
 Memory is read as psutil memory_info().vms rather than rss. The reservation is
 committed but never written, so on Windows rss reports almost nothing and on
-Linux the untouched pages never enter the resident set. vms is private commit on
-Windows and virtual size on Linux, and both track a reservation the moment it is
-made.
+Linux and macOS the untouched pages never enter the resident set. vms is private
+commit on Windows and virtual size on Linux and macOS, and each tracks a
+reservation the moment it is made.
 """
 
 import gc
@@ -40,12 +40,10 @@ def _vms_delta(build):
 # ------------------------------------------------------------
 @pytest.mark.parametrize("m", [8, 16, 32, 64])
 def test_empty_index_at_a_large_declared_size_stays_under_the_bound(m):
-    """A declared size costs about one pointer per record and nothing more.
+    """A declared size reserves at most what the caps allow, at every m.
 
-    Each point lives in exactly one layer, the layer of its own top level, so
-    the per-layer reservations partition the declared size and sum to it. The
-    total is therefore one Arc slot per declared record, 8 bytes on a 64 bit
-    target, and it does not depend on m.
+    Every reservation an index takes from expected_size is capped, so an empty
+    index declared at five million records commits under the two bounds below.
 
     Without patch 5 this reserves 136 * ln(m) * 8 bytes per declared record,
     which for the size used here is 14,455 MB at m 16 and 21,657 MB at m 64, so
@@ -93,8 +91,6 @@ def test_declared_size_that_previously_aborted_the_process():
             expected_size=declared,
         )
     except (MemoryError, ValueError, RuntimeError):
-        # A host too small to commit 800 MB may still refuse. That is a
-        # catchable Python error, which is the behaviour being asserted.
         return
 
     assert index.get_vector_count() == 0
@@ -107,16 +103,7 @@ def test_declared_size_that_previously_aborted_the_process():
 # Test 2b: The declared size has an upper bound
 # ------------------------------------------------------------
 def test_declared_size_above_the_bound_raises_rather_than_aborting():
-    """Above the bound the caller gets a ValueError, not a dead process.
-
-    The reservation is one Arc slot per declared record and it is not fallible.
-    Vec::with_capacity aborts on allocation failure rather than unwinding, so a
-    declaration too large for the machine cannot be caught after the fact. A
-    declared 20,000,000,000 asks for 155 GB in the layer zero reservation alone
-    and the process exits with no traceback. The bound converts that into an
-    error, and the message carries the size the declaration would have asked
-    for.
-    """
+    """Above the bound the caller gets a ValueError, not a dead process."""
     vdb = VectorDatabase()
     bound = 100_000_000
 
@@ -124,7 +111,7 @@ def test_declared_size_above_the_bound_raises_rather_than_aborting():
         vdb.create(index_type="hnsw", dim=8, expected_size=bound + 1)
     message = str(excinfo.value)
     assert "expected_size must be at most 100000000" in message
-    assert "0.8 GB" in message
+    assert "An index accepts more records than its expected_size declares." in message
 
     with pytest.raises((ValueError, RuntimeError), match="expected_size must be positive"):
         vdb.create(index_type="hnsw", dim=8, expected_size=0)
@@ -136,11 +123,7 @@ def test_declared_size_above_the_bound_raises_rather_than_aborting():
 # Test 3: An index that outgrows its declared size
 # ------------------------------------------------------------
 def test_index_exceeding_its_declared_size_still_works():
-    """The reservation is a hint, so the layer Vec must simply grow.
-
-    Patch 5 makes the reservation tight rather than generous, which only stays
-    safe because a layer that receives more points than reserved reallocates.
-    """
+    """The declared size is a hint, so the index grows past it."""
     declared = 10
     records = 500
     vdb = VectorDatabase()

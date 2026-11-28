@@ -7,7 +7,11 @@ import logging
 import os
 import sys
 import json
+import calendar
 import datetime
+import errno
+import math
+import time
 from typing import Dict, Any
 from threading import Lock
 import shutil
@@ -31,6 +35,25 @@ def _autolog_disabled() -> bool:
         os.getenv(name, '').strip().lower() in truthy
         for name in (_DISABLE_AUTOLOG_VAR, _DISABLE_AUTOLOG_VAR_DEPRECATED)
     )
+
+
+def _or_none(read):
+    """What read() gives, or None where it raises OSError, as os.getcwd()
+    and os.path.abspath of a relative path do where the working folder is
+    gone."""
+    try:
+        return read()
+    except OSError:
+        return None
+
+
+def _names_a_folder(path):
+    """True where path names a folder and so no file: where its last part
+    is empty, '.' or '..', being a root, a drive or a path that ends in a
+    separator, or where it is a folder that exists. file_in_folder in
+    bindings/python/src/logging.rs keeps the same rule, so the two layers
+    refuse the same paths."""
+    return os.path.basename(path) in ('', os.curdir, os.pardir) or os.path.isdir(path)
 
 
 def _auto_configure_logging():
@@ -111,8 +134,7 @@ def _detect_environment() -> str:
 # `ignoring zeusdb_vector_database=warning` line on stderr and no filtering.
 #
 # This is the Python half of the table. `canonical_level` in bindings/python/src/
-# logging.rs is the Rust half, and it accepts the same spellings, so the Rust
-# side is right on its own for a caller who has disabled the auto-configuration.
+# logging.rs is the Rust half, and it reads every spelling here as the same level.
 _LEVEL_ALIASES = {
     'WARN': 'WARNING',
     'WARNING': 'WARNING',
@@ -276,13 +298,23 @@ def _configure_rust_logging(config: Dict[str, Any]) -> None:
     # Rust side reads. That spelling need not be one `EnvFilter` accepts, and
     # `warning` is exactly the case that used to break: the filter refused it,
     # printed `ignoring zeusdb_vector_database=warning` and then filtered
-    # nothing. `canonical_level` in bindings/python/src/logging.rs resolves it there
-    # instead, which also covers a caller who has disabled this module.
+    # nothing. `canonical_level` in bindings/python/src/logging.rs resolves it
+    # there instead.
     #
     # Overwriting it here would work for that case and break another: this
     # function is idempotent only if what it writes is what it would read back,
     # and `critical` written back as `error` reads back as ERROR rather than
     # CRITICAL.
+    #
+    # A level or a format the user set that this module does not recognise
+    # is replaced by the default the Python side fell back to, since the
+    # Rust side would fall back on its own, to warn and to human records on
+    # stderr. A level is written in its Python spelling, which both sides
+    # read as the same level and which reads back unchanged.
+    if '_invalid_log_level' in config:
+        os.environ["ZEUSDB_LOG_LEVEL"] = config['level']
+    if '_invalid_log_format' in config:
+        os.environ["ZEUSDB_LOG_FORMAT"] = config['format']
     os.environ.setdefault("ZEUSDB_LOG_LEVEL", rust_level)
     os.environ.setdefault("ZEUSDB_LOG_FORMAT", config['format'])
     
@@ -321,6 +353,12 @@ def _configure_python_logging(config: Dict[str, Any]):
         log_dir = os.path.dirname(log_file_path)
         
         try:
+            # A path that names a folder names no file. It is refused here,
+            # before any folder is made, and handled below as a file that
+            # cannot be opened.
+            if _names_a_folder(log_file_path):
+                raise IsADirectoryError(errno.EISDIR, os.strerror(errno.EISDIR), log_file_path)
+
             # Ensure directory exists
             if log_dir:
                 os.makedirs(log_dir, exist_ok=True)
@@ -330,12 +368,17 @@ def _configure_python_logging(config: Dict[str, Any]):
             handlers.append(file_handler)
             
         except (OSError, PermissionError) as e:
-            # ENHANCEMENT: Gather detailed error context
+            # ENHANCEMENT: Gather detailed error context. The working folder
+            # is read in a guard, since where it is gone os.getcwd() raises
+            # and so does os.path.abspath of a relative path, and a field it
+            # cannot give reads 'unknown'.
+            absolute_path = _or_none(lambda: os.path.abspath(log_file_path))
+            parent_dir = log_dir if log_dir else _or_none(os.getcwd)
             error_context = {
                 'attempted_path': log_file_path,
-                'absolute_path': os.path.abspath(log_file_path),
-                'parent_dir': log_dir if log_dir else os.getcwd(),
-                'parent_dir_exists': os.path.exists(log_dir) if log_dir else True,
+                'absolute_path': absolute_path if absolute_path is not None else 'unknown',
+                'parent_dir': parent_dir if parent_dir is not None else 'unknown',
+                'parent_dir_exists': parent_dir is not None and os.path.exists(parent_dir),
                 'parent_dir_writable': None,
                 'disk_space_available': None,
                 'error_type': type(e).__name__,
@@ -442,6 +485,33 @@ def _log_setup_warnings(logger: logging.Logger, config: Dict[str, Any]) -> None:
         )
 
 
+# 1970-01-01T00:00:00Z, the instant a record's time is counted from.
+_UNIX_EPOCH = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+
+# 400 Gregorian years, in seconds. The calendar's dates, weekdays and leap
+# days repeat after them.
+_SECONDS_IN_400_YEARS = 146097 * 86400
+
+
+def _local_time(created):
+    """The local time of the record time created, as time.localtime gives
+    it. Where the C library cannot convert created, as Windows' cannot
+    before 1970, this converts the moment a whole number of 400-year periods
+    away that falls in the years 2370 to 2769, and gives it the year of
+    created. The calendar repeats after 400 years, so the date, the weekday
+    and the time of day are those of created, and the local offset is the
+    one the C library's rules give in that later year."""
+    try:
+        return time.localtime(created)
+    except (OSError, OverflowError):
+        seconds = math.floor(created)
+        periods = seconds // _SECONDS_IN_400_YEARS - 1
+        shifted = seconds - periods * _SECONDS_IN_400_YEARS
+        local = time.localtime(shifted)
+        offset = calendar.timegm(local) - shifted
+        return time.struct_time((local.tm_year + 400 * periods, *local[1:9], local.tm_zone, offset))
+
+
 def _create_formatter(config: Dict[str, Any]) -> logging.Formatter:
     """Create appropriate formatter based on configuration."""
     
@@ -464,10 +534,13 @@ def _create_formatter(config: Dict[str, Any]) -> logging.Formatter:
         
         format_string = ' - '.join(format_parts)
         
-        return logging.Formatter(
+        formatter = logging.Formatter(
             format_string,
             datefmt='%Y-%m-%d %H:%M:%S'
         )
+        # The record's local time, before 1970 as well, on every system.
+        formatter.converter = _local_time
+        return formatter
 
 class _JSONFormatter(logging.Formatter):
     """JSON formatter for production logging with proper timestamp handling.
@@ -482,7 +555,10 @@ class _JSONFormatter(logging.Formatter):
     
     def formatTime(self, record, datefmt=None):
         """Override to get proper microsecond precision (time.strftime ignores %f)."""
-        dt = datetime.datetime.utcfromtimestamp(record.created)
+        # The UTC time counted from the epoch, which datetime holds from year
+        # 1 to 9999 on every system. fromtimestamp asks the C library, which
+        # on Windows gives no UTC time more than 12 hours before 1970.
+        dt = _UNIX_EPOCH + datetime.timedelta(seconds=record.created)
         return f"{dt:%Y-%m-%dT%H:%M:%S}.{dt.microsecond:06d}Z"
     
     def format(self, record):

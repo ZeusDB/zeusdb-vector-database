@@ -2269,10 +2269,9 @@ def test_subvectors_default_holds_the_compression_ratio():
     assert info["subvectors"] == 24
     assert info["compression_ratio"] == pytest.approx(128.0)
 
-    # A derived value never trips the ratio warning, which exists to tell a
-    # caller their own choice looks unbalanced. 128x is above the 50x threshold
-    # at every dimension from 256 up, so without the exemption create() would
-    # warn about its own default.
+    # A derived value trips the ratio warning only past 128x, the ratio it is
+    # chosen for, where a given value trips it past 50x, so create() does not
+    # warn about its own default at these dimensions, whose ratio is 128x.
     for dim in (256, 768, 1536):
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
@@ -2312,6 +2311,31 @@ def test_explicit_subvectors_is_unaffected_by_the_derived_default():
                                                     "bits": 8,
                                                     "training_size": 1000})
             assert built.get_quantization_info()["subvectors"] == subvectors
+
+
+# ------------------------------------------------------------
+# A derived subvectors warns past the ratio it is chosen for
+# ------------------------------------------------------------
+def test_a_derived_subvectors_warns_where_its_ratio_passes_128x():
+    """The snap to a divisor of dim and the floor move a derived subvectors
+    off 128x at some dimensions. Where its ratio passes 128x, as at dim 257,
+    whose one divisor in reach is 1, and at dim 1,000, which takes 25,
+    create() draws the ratio warning, and at a common width, whose ratio is
+    128x, it draws none."""
+    for dim, subvectors, ratio in [(257, 1, 1028.0), (1000, 25, 160.0), (768, 24, None)]:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            index = VectorDatabase().create("hnsw", dim=dim, expected_size=20000,
+                                            quantization_config={"type": "pq"})
+        assert index.get_quantization_info()["subvectors"] == subvectors, dim
+        ratios = [str(w.message) for w in caught
+                  if "Very high compression ratio" in str(w.message)]
+        if ratio is None:
+            assert ratios == [], dim
+        else:
+            assert len(ratios) == 1, (dim, ratios)
+            assert ratios[0].startswith(f"Very high compression ratio: {ratio}x may "
+                                        f"significantly impact recall quality."), ratios
 
 
 # ------------------------------------------------------------

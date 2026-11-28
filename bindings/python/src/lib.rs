@@ -4,17 +4,74 @@
 // parsing, the result construction, the logging control, and the conversion
 // below of an engine failure into an exception. The index itself is
 // zeusdb-vector-hnsw, over the engine's floor in zeusdb-vector-core, and
-// every method here parses, releases the interpreter lock, calls one
-// operation on the collection and converts what comes back.
+// every method here parses, calls one operation on the collection through the
+// rule a panic keeps, and converts what comes back, releasing the interpreter
+// lock around any call that may wait for an engine guard.
+
+// A narrowing cast in this crate's library code states its bound in an
+// `#[expect]` beside it, so a cast with no stated bound fails the lint gate,
+// and an `#[expect]` whose cast is gone fails it too. Test code is left out.
+#![cfg_attr(not(test), warn(clippy::cast_possible_truncation))]
+
+/// The part of a call that runs with the interpreter released: `$body`
+/// inside `Collection::run` on `$inner` as `$operation`, under `$py.detach`,
+/// with the result converted for the method that returns it.
+///
+/// Under the `test-support` feature the released part starts at the pause a
+/// test of the interpreter rule arms for its next call; see `test_support`.
+/// Without the feature the expansion is the release alone.
+///
+/// It is a macro defined here, ahead of `hnsw_index`, so that each of its
+/// two uses there is one line and adds no line to that module. Every log
+/// record carries its file and line, so a line added above a tracing call
+/// site changes what the log prints and what the wheel holds.
+macro_rules! run_released {
+    ($py:expr, $inner:expr, $operation:expr, $body:expr) => {
+        Ok($py.detach(|| {
+            #[cfg(feature = "test-support")]
+            crate::test_support::pause_here($operation);
+            $inner.run($operation, || $body)
+        })?)
+    };
+}
+
+/// `$py.detach` of a closure with its return type written out, for a method
+/// that releases the interpreter for its work by itself, being `search()`.
+///
+/// Under the `test-support` feature the closure's body starts at the pause a
+/// test arms for its next call, under `$operation`; see `test_support`.
+/// Without the feature the expansion is the call of `$py.detach` on the
+/// closure as written, token for token.
+///
+/// It is a macro defined here for the reason `run_released!` is one: its use
+/// in `hnsw_index` replaces one line and adds none.
+#[cfg(feature = "test-support")]
+macro_rules! detach_paused {
+    ($py:expr, $operation:expr, || -> $ret:ty { $($body:tt)* }) => {
+        $py.detach(|| -> $ret {
+            crate::test_support::pause_here($operation);
+            $($body)*
+        })
+    };
+}
+#[cfg(not(feature = "test-support"))]
+macro_rules! detach_paused {
+    ($py:expr, $operation:expr, || -> $ret:ty { $($body:tt)* }) => {
+        $py.detach(|| -> $ret { $($body)* })
+    };
+}
+
 mod conversion;
 mod durability;
 mod hnsw_index;
 mod logging;
+#[cfg(feature = "test-support")]
+mod test_support;
 mod tokenizer;
 
 use pyo3::prelude::*;
 use zeusdb_vector_core::{Error, Exception};
-use zeusdb_vector_hnsw::Collection;
+use zeusdb_vector_hnsw::{run_without_index, Collection, JournalPolicy};
 
 /// An engine failure on its way to Python.
 ///
@@ -84,8 +141,8 @@ impl From<PyEngineError> for PyErr {
 
 /// Load an index from a directory. See `Collection::load_with`.
 ///
-/// Registered as `_load_index`. `VectorDatabase.load(path, tokenizer=None)`
-/// is the documented route and is a one line pass through to this.
+/// Registered as `_load_index`. `VectorDatabase.load()` is the documented
+/// route and is a one line pass through to this.
 ///
 /// `tokenizer` is the tokenizer the directory's text layer was declared
 /// with, where it has one: `"simple"` for the built-in tokenizer, which a
@@ -97,8 +154,8 @@ impl From<PyEngineError> for PyErr {
 /// refused, since ignoring it would open the index under a tokenizer the
 /// caller did not ask for.
 ///
-/// A directory whose manifest names a journal is recovered: every record
-/// the journal holds above the checkpoint is replayed, the journal is
+/// A directory whose manifest names a journal is recovered: every committed
+/// record the journal holds above the checkpoint is replayed, the journal is
 /// reopened for append, and the index hands its mutations to it from then
 /// on under `durability`, which takes the three names `journal_to` takes
 /// and defaults to `"call"`. `interval_ms` belongs to `"interval"`. Naming
@@ -109,26 +166,120 @@ impl From<PyEngineError> for PyErr {
 /// copied without its sibling, and for a caller who wants the state as of
 /// the last checkpoint.
 ///
+/// A journaled directory saved by a release before 0.14.0 is upgraded by its
+/// first load: its journal is replayed and the directory is written again at
+/// format 5.0.0, after which those releases do not open it. A load holds the
+/// directory's lock, `<path>.zdblock`, while it reads where that file can be
+/// locked, and a journaled index keeps it for its life, so a second holder is
+/// refused with `RuntimeError` (`CollectionLocked`). A journaled directory on
+/// a medium that refuses writes, or one this process has no permission to
+/// write, opens read only where the load replays its journal, with a
+/// `RuntimeWarning` naming the reason: every record is replayed in memory,
+/// nothing on the medium changes, `add()` names
+/// every record in `errors`, every other change is refused with
+/// `RuntimeError` (`CollectionReadOnly`), and `save` into another directory
+/// copies it. A directory holding a feature this build does not know, which
+/// its manifest marks `read_only`, opens read only the same way whatever the
+/// medium, where its journal holds no record of a kind this build does not
+/// know, and `add()` names every record in `errors`, and every other change,
+/// every save, `checkpoint`, `journal_to` and `backup` is refused with
+/// `RuntimeError` (`FeatureReadOnly`). A journaled directory below
+/// format 5.0.0 whose identity records the largest generation a manifest can
+/// hold opens read only the same way where the load replays its journal,
+/// since that load's upgrade is a save and no save can record the generation
+/// after it: a `RuntimeWarning` names that
+/// generation, `add()` names every record in `errors`, and every other
+/// change, save, `checkpoint` and `backup` is refused with `RuntimeError` in
+/// the same words. A directory holding a value past a
+/// bound, being a stored vector of an l2, dot or l1 index whose Euclidean
+/// norm passes 2^62, a codebook value past 2^62, a scale past the largest one
+/// vectors within 2^62 fit, a sparse value whose magnitude passes 2^40 or a
+/// term weighting `k1` past 2^40, opens read only the same way, journaled or
+/// not and whatever the medium: a `RuntimeWarning` names the value, its file
+/// and the bound, `add()` names every record in `errors`, and every other
+/// change, save, `checkpoint` and `backup` is refused with `RuntimeError` in
+/// the same words.
+///
+/// `repair=True` loads a journal whose own history is broken: a corrupt
+/// record with records after it, damage in a segment that is not the last,
+/// a header that will not read, a record that will not decode or apply,
+/// and segments that do not form one run of calls. Every whole call before
+/// the first call the damage touches is replayed, that call and every byte
+/// after it are copied into `<path>.zdbjournal/quarantine/<UTC stamp>-<first
+/// sequence set aside>/` with a `repair.json` describing them, the journal
+/// is cut there, and a checkpoint is written. A journal of format version 1
+/// marks no calls, so it is cut at the damaged record itself, or at its
+/// first byte where its header does not read. A stale segment whose header
+/// does not read is copied there whole instead, and nothing is cut. A
+/// `RuntimeWarning` names the damage, the records set aside and the folder,
+/// and `index.recovery` reports the same. A load that finds nothing damaged
+/// and no repair unfinished is a plain load. A journal that belongs to
+/// another collection or another checkpoint is refused as without it. Where
+/// the index opens read only, the kept calls are replayed in memory and
+/// nothing is set aside or changed.
+///
+/// A directory below format 5.0.0 whose manifest records `created_at` as
+/// anything but an RFC 3339 time, which a load of 5.0.0 refuses, opens with
+/// its `saved_at` in its place, or with the time of the load where that is
+/// not one either. A time whose offset's minus is U+2212, or whose second is
+/// 60 in any minute, is read as one as well. A `RuntimeWarning` names both
+/// values, `index.recovery` reports them under `replaced`, and the next save
+/// writes the value taken.
+///
 /// The whole load runs with the interpreter lock released, the graph rebuild
 /// it may fall back to included. Nothing in the load path touches Python:
 /// the directory is read, the collection is built and restored, and the
 /// result is wrapped here with the lock back. A tokenizer handed in is
-/// stored and never run by the load.
+/// stored and never run by the load. `interval_ms` is a Python integer, and a
+/// negative one raises `ValueError` naming it. A panic inside the engine
+/// raises `RuntimeError`; see `run_without_index`.
 #[pyfunction]
-#[pyo3(name = "_load_index", signature = (path, tokenizer = None, durability = None, interval_ms = None, checkpoint_only = false))]
+#[pyo3(name = "_load_index", signature = (path, tokenizer = None, durability = None, interval_ms = None, checkpoint_only = false, repair = false))]
 fn load_index(
     py: Python<'_>,
     path: &str,
     tokenizer: Option<&Bound<PyAny>>,
     durability: Option<&str>,
-    interval_ms: Option<u64>,
+    interval_ms: Option<i64>,
     checkpoint_only: bool,
+    repair: bool,
 ) -> Result<hnsw_index::HNSWIndex, PyEngineError> {
+    run_without_index("load()", || {
+        load_index_body(
+            py,
+            path,
+            tokenizer,
+            durability,
+            interval_ms,
+            checkpoint_only,
+            repair,
+        )
+    })
+}
+
+/// The body of `load_index`, run through the rule a panic keeps by it.
+fn load_index_body(
+    py: Python<'_>,
+    path: &str,
+    tokenizer: Option<&Bound<PyAny>>,
+    durability: Option<&str>,
+    interval_ms: Option<i64>,
+    checkpoint_only: bool,
+    repair: bool,
+) -> Result<hnsw_index::HNSWIndex, PyEngineError> {
+    let interval_ms = conversion::count_if_given(interval_ms, "interval_ms")?.map(|ms| ms as u64);
     let tokenizer = tokenizer
         .map(|argument| tokenizer::tokenizer_from_python(argument, "tokenizer"))
         .transpose()?;
     let named = durability.is_some() || interval_ms.is_some();
-    if checkpoint_only {
+    let policy = if checkpoint_only {
+        if repair {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "repair=True reads the journal to repair it, and checkpoint_only=True reads no \
+                 journal, so the two do not go together",
+            )
+            .into());
+        }
         if named {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "checkpoint_only=True opens the checkpoint alone and attaches no journal, so \
@@ -136,11 +287,16 @@ fn load_index(
             )
             .into());
         }
-        let inner = py.detach(|| Collection::load_checkpoint_only(path, tokenizer))?;
-        return Ok(hnsw_index::HNSWIndex::wrap(inner));
-    }
-    let durability = durability::parse_durability(durability.unwrap_or("call"), interval_ms)?;
-    let (inner, recovery) = py.detach(|| Collection::recover(path, tokenizer, durability))?;
+        JournalPolicy::CheckpointOnly
+    } else {
+        let durability = durability::parse_durability(durability.unwrap_or("call"), interval_ms)?;
+        if repair {
+            JournalPolicy::Repair(durability)
+        } else {
+            JournalPolicy::Replay(durability)
+        }
+    };
+    let (inner, recovery) = py.detach(|| Collection::recover_with(path, tokenizer, policy))?;
     if named && !recovery.journaled {
         return Err(pyo3::exceptions::PyValueError::new_err(format!(
             "load names a durability and the directory at '{}' has no journal. A durability \
@@ -150,7 +306,16 @@ fn load_index(
         ))
         .into());
     }
-    Ok(hnsw_index::HNSWIndex::wrap(inner))
+    let warning = recovery
+        .repair_warning(path)
+        .or_else(|| recovery.read_only_warning(path));
+    for message in warning.into_iter().chain(recovery.replaced_warning(path)) {
+        let category = py.get_type::<pyo3::exceptions::PyRuntimeWarning>();
+        let message = std::ffi::CString::new(message)
+            .unwrap_or_else(|_| c"The directory was loaded with a warning.".to_owned());
+        PyErr::warn(py, category.as_any(), &message, 1)?;
+    }
+    Ok(hnsw_index::HNSWIndex::wrap_loaded(inner, recovery))
 }
 
 /// ZeusDB Vector Database Python Module
@@ -166,7 +331,7 @@ fn load_index(
 #[pymodule(name = "_engine")]
 fn engine(py: Python, m: &Bound<pyo3::types::PyModule>) -> PyResult<()> {
     // Auto-initialize logging on module import
-    // Respects ZEUSDB_DISABLE_AUTOLOG for power users
+    // Respects ZEUSDB_DISABLE_AUTO_LOGGING for power users
     logging::init_logging();
 
     // Core classes. Neither carries a `#[new]`, so both are importable for
@@ -205,5 +370,55 @@ fn engine(py: Python, m: &Bound<pyo3::types::PyModule>) -> PyResult<()> {
     let shutdown = m.getattr("shutdown_logging")?;
     py.import("atexit")?.call_method1("register", (shutdown,))?;
 
+    // Close this process's lock files in a child forked from it.
+    //
+    // A lock on an open file is shared by every copy of the file, and a child
+    // forked from this process holds a copy of each lock file the process has
+    // open, so a child that lives on would keep the directories locked after
+    // this process lets them go or ends. The child closes its copies just
+    // after the fork, which leaves every lock with this process. The lock
+    // files are held across the fork, so no other thread opens or closes one
+    // while the process is copied. `os.register_at_fork` exists on POSIX
+    // alone, and the hooks are not attributes of the module.
+    let os = py.import("os")?;
+    if os.hasattr("register_at_fork")? {
+        let hooks = pyo3::types::PyDict::new(py);
+        hooks.set_item(
+            "before",
+            pyo3::types::PyCFunction::new_closure(py, None, None, |_, _| -> PyResult<()> {
+                zeusdb_vector_core::hold_lock_files_for_fork();
+                Ok(())
+            })?,
+        )?;
+        hooks.set_item(
+            "after_in_parent",
+            pyo3::types::PyCFunction::new_closure(py, None, None, |_, _| -> PyResult<()> {
+                zeusdb_vector_core::release_lock_files_after_fork();
+                Ok(())
+            })?,
+        )?;
+        hooks.set_item(
+            "after_in_child",
+            pyo3::types::PyCFunction::new_closure(py, None, None, |_, _| -> PyResult<()> {
+                zeusdb_vector_core::close_lock_files_in_forked_child();
+                Ok(())
+            })?,
+        )?;
+        os.call_method("register_at_fork", (), Some(&hooks))?;
+    }
+
+    // The pause a test of the interpreter rule arms, registered after every
+    // other name and under the `test-support` feature alone; see
+    // `test_support`.
+    #[cfg(feature = "test-support")]
+    m.add_class::<test_support::PyPause>()?;
+
     Ok(())
 }
+
+// The test build's allocator, which holds every request to a ceiling and a
+// fuzzer's reads to a bound. See `zeusdb_vector_core::test_support`.
+#[cfg(test)]
+#[global_allocator]
+static ALLOCATOR: zeusdb_vector_core::test_support::Bounded =
+    zeusdb_vector_core::test_support::Bounded;

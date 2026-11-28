@@ -466,3 +466,51 @@ fn a_query_is_held_to_its_rules_at_the_door() {
         .hits
         .is_empty());
 }
+
+/// `records`, `list` and a query hand every record's metadata over with its
+/// names in code point order, whatever order the store first saw them in, so
+/// two records holding the same names hand them over alike in every process.
+#[test]
+fn every_page_hands_the_names_over_in_code_point_order() {
+    let collection = Collection::build(
+        Declaration::validate(2, "l2", 8, 50, 100, vec![]).unwrap(),
+        None,
+    );
+    let names = ["zeta", "Alpha", "mid", "\u{e9}t\u{e9}", "beta"];
+    let records: Vec<ParsedRecord> = (0..6)
+        .map(|i| {
+            let mut metadata: HashMap<String, Value> = HashMap::new();
+            // Each record names the fields in a rotated order.
+            for k in 0..names.len() {
+                let name = names[(i + k) % names.len()];
+                metadata.insert(name.to_string(), json!(k));
+            }
+            ParsedRecord::from((format!("r{i}"), vec![i as f32, 1.0], metadata))
+        })
+        .collect();
+    let added = collection.add_records(records, vec![], false);
+    assert_eq!(added.total_errors, 0, "{:?}", added.errors);
+    let mut sorted: Vec<&str> = names.to_vec();
+    sorted.sort_unstable();
+    assert_eq!(sorted, ["Alpha", "beta", "mid", "zeta", "\u{e9}t\u{e9}"]);
+
+    let ids: Vec<String> = (0..6).map(|i| format!("r{i}")).collect();
+    for view in collection.records(ids, false, true).unwrap() {
+        let keys: Vec<&str> = view.metadata.keys().map(String::as_str).collect();
+        assert_eq!(keys, sorted, "{}", view.id);
+    }
+    for (id, metadata) in collection.list(10, 0, None).unwrap() {
+        let keys: Vec<&str> = metadata.keys().map(String::as_str).collect();
+        assert_eq!(keys, sorted, "{id}");
+    }
+    let query = [0.0f32, 1.0];
+    let arms = [Arm::Dense {
+        vector: &query,
+        ef: None,
+        rerank: None,
+    }];
+    for hit in collection.query(&Query::new(&arms, 6)).unwrap().hits {
+        let keys: Vec<&str> = hit.metadata.keys().map(String::as_str).collect();
+        assert_eq!(keys, sorted, "{}", hit.id);
+    }
+}

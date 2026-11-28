@@ -120,6 +120,10 @@ pub mod order {
     /// The guard over a space's index, being the graph of a dense space and
     /// the postings of a sparse one, for the space at `space` in the
     /// declaration.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a space's index, below MAX_SPACES, 4"
+    )]
     pub const fn space_index(space: usize) -> u8 {
         SPACE_BASE + (space as u8) * SPACE_STRIDE
     }
@@ -129,6 +133,7 @@ pub mod order {
         space_index(space) + 1
     }
 
+    #[expect(clippy::cast_possible_truncation, reason = "MAX_SPACES, 4")]
     const AFTER_SPACES: u8 = SPACE_BASE + (MAX_SPACES as u8) * SPACE_STRIDE;
     pub const VECTOR_METADATA: u8 = AFTER_SPACES;
     pub const COLUMNS: u8 = AFTER_SPACES + 1;
@@ -140,6 +145,10 @@ pub mod order {
     const LEAF_BASE: u8 = AFTER_SPACES + 6;
 
     /// A leaf. The rerank calibration of the dense space at `space`.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a space's index, below MAX_SPACES, 4"
+    )]
     pub const fn space_calibration(space: usize) -> u8 {
         LEAF_BASE + (space as u8) * 2
     }
@@ -149,10 +158,12 @@ pub mod order {
         space_calibration(space) + 1
     }
 
+    #[expect(clippy::cast_possible_truncation, reason = "MAX_SPACES, 4")]
     const AFTER_LEAVES: u8 = LEAF_BASE + (MAX_SPACES as u8) * 2;
     /// A leaf.
     pub const CREATED_AT: u8 = AFTER_LEAVES;
-    /// A leaf, taken by `generate_id` alone and held across nothing.
+    /// A leaf, taken by `generate_id` and `follow_generated_id` and held
+    /// across nothing.
     pub const GENERATED_IDS: u8 = AFTER_LEAVES + 1;
     /// A leaf below every other rank. The sink a mutation hands its record
     /// to, taken with `writers` held and nothing else on the mutation paths
@@ -320,6 +331,100 @@ pub(crate) fn held_now() -> Vec<String> {
 }
 
 // ============================================================================
+// THE WAIT A TEST SEES
+// ============================================================================
+
+/// Where a thread stands at a wait, for a test's wait hook: `Begins` once
+/// an acquisition has found its lock held by another thread and before it
+/// waits, and `Ends` once it has taken the lock after waiting.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Wait {
+    Begins,
+    Ends,
+}
+
+/// What a test sets for this thread's waits to call, with the lock's name
+/// where the build keeps ranks and an empty name where it does not.
+#[cfg(test)]
+pub(crate) type WaitHook = Box<dyn FnMut(&str, Wait)>;
+
+// What this thread's waits call, where a test set it. A thread whose
+// acquisition finds its lock free calls nothing, so the hook hears a wait
+// only where another thread holds the lock. Nothing outside the tests sees
+// it.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static WAIT_HOOK: std::cell::RefCell<Option<WaitHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Set this thread's wait hook to call `heard` with the name of each lock
+/// it finds held, as it begins to wait.
+#[cfg(test)]
+pub(crate) fn on_wait(mut heard: impl FnMut(&str) + 'static) {
+    WAIT_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |name, wait| {
+            if wait == Wait::Begins {
+                heard(name);
+            }
+        }));
+    });
+}
+
+/// The name a wait hook hears for the lock the registry calls `name`, which
+/// is empty in a build that keeps no ranks.
+#[cfg(test)]
+pub(crate) fn lock_name(name: &str) -> String {
+    if cfg!(debug_assertions) {
+        name.to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// Call this thread's wait hook, where a test set one and it is not
+/// already running on this thread.
+#[cfg(test)]
+fn waits(name: &str, wait: Wait) {
+    let _ = WAIT_HOOK.try_with(|hook| {
+        if let Ok(mut hook) = hook.try_borrow_mut() {
+            if let Some(hook) = hook.as_mut() {
+                hook(name, wait);
+            }
+        }
+    });
+}
+
+/// The standard lock's own acquisition through `$take`, being `read`,
+/// `write` or `lock`. In the tests alone it tries `$try` first, and where
+/// another thread holds the lock it calls this thread's wait hook before it
+/// waits and once it has taken the lock; see [`WAIT_HOOK`]. Every other
+/// build compiles the acquisition as written.
+#[cfg(not(test))]
+macro_rules! acquire {
+    ($lock:expr, $take:ident, $try:ident) => {
+        $lock.inner.$take()
+    };
+}
+#[cfg(test)]
+macro_rules! acquire {
+    ($lock:expr, $take:ident, $try:ident) => {
+        match $lock.inner.$try() {
+            Ok(guard) => Ok(guard),
+            Err(std::sync::TryLockError::Poisoned(poison)) => Err(poison),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let name = $lock.wait_name();
+                waits(&name, Wait::Begins);
+                let taken = $lock.inner.$take();
+                waits(&name, Wait::Ends);
+                taken
+            }
+        }
+    };
+}
+
+// ============================================================================
 // THE LOCKS
 // ============================================================================
 
@@ -348,7 +453,7 @@ impl<T> RwLockAt<T> {
     pub fn read(&self) -> LockResult<ReadGuard<'_, T>> {
         #[cfg(debug_assertions)]
         enter(self.rank);
-        match self.inner.read() {
+        match acquire!(self, read, try_read) {
             Ok(guard) => Ok(ReadGuard {
                 inner: guard,
                 #[cfg(debug_assertions)]
@@ -365,7 +470,7 @@ impl<T> RwLockAt<T> {
     pub fn write(&self) -> LockResult<WriteGuard<'_, T>> {
         #[cfg(debug_assertions)]
         enter(self.rank);
-        match self.inner.write() {
+        match acquire!(self, write, try_write) {
             Ok(guard) => Ok(WriteGuard {
                 inner: guard,
                 #[cfg(debug_assertions)]
@@ -377,6 +482,39 @@ impl<T> RwLockAt<T> {
                 rank: self.rank,
             })),
         }
+    }
+
+    /// The read guard where the lock is free to read now, taken without
+    /// waiting, and `None` where a writer holds it or a panic poisoned it.
+    ///
+    /// Held to the order and to the rule against a second acquisition as
+    /// `read` is, since the guard it returns is held the same way, and a
+    /// refusal leaves the held set as it found it.
+    pub fn try_read(&self) -> Option<ReadGuard<'_, T>> {
+        #[cfg(debug_assertions)]
+        enter(self.rank);
+        match self.inner.try_read() {
+            Ok(guard) => Some(ReadGuard {
+                inner: guard,
+                #[cfg(debug_assertions)]
+                rank: self.rank,
+            }),
+            Err(_) => {
+                #[cfg(debug_assertions)]
+                leave(self.rank);
+                None
+            }
+        }
+    }
+
+    /// The name a test's wait hook hears for this lock.
+    #[cfg(test)]
+    fn wait_name(&self) -> String {
+        #[cfg(debug_assertions)]
+        let name = name_of(self.rank);
+        #[cfg(not(debug_assertions))]
+        let name = String::new();
+        name
     }
 }
 
@@ -402,7 +540,7 @@ impl<T> MutexAt<T> {
     pub fn lock(&self) -> LockResult<Locked<'_, T>> {
         #[cfg(debug_assertions)]
         enter(self.rank);
-        match self.inner.lock() {
+        match acquire!(self, lock, try_lock) {
             Ok(guard) => Ok(Locked {
                 inner: guard,
                 #[cfg(debug_assertions)]
@@ -414,6 +552,37 @@ impl<T> MutexAt<T> {
                 rank: self.rank,
             })),
         }
+    }
+
+    /// The guard where the lock is free now, taken without waiting, and
+    /// `None` where another thread holds it or a panic poisoned it. Held to
+    /// the order as `lock` is, and a refusal leaves the held set as it found
+    /// it.
+    pub fn try_lock(&self) -> Option<Locked<'_, T>> {
+        #[cfg(debug_assertions)]
+        enter(self.rank);
+        match self.inner.try_lock() {
+            Ok(guard) => Some(Locked {
+                inner: guard,
+                #[cfg(debug_assertions)]
+                rank: self.rank,
+            }),
+            Err(_) => {
+                #[cfg(debug_assertions)]
+                leave(self.rank);
+                None
+            }
+        }
+    }
+
+    /// The name a test's wait hook hears for this lock.
+    #[cfg(test)]
+    fn wait_name(&self) -> String {
+        #[cfg(debug_assertions)]
+        let name = name_of(self.rank);
+        #[cfg(not(debug_assertions))]
+        let name = String::new();
+        name
     }
 }
 
@@ -515,6 +684,106 @@ mod tests {
         } else {
             assert_eq!(extras, [0, 0, 0, 0]);
         }
+    }
+
+    /// A try takes a free lock as a wait would, and gives `None` without
+    /// waiting where another thread holds the lock or a panic poisoned it,
+    /// leaving this thread's held set as it found it.
+    #[test]
+    fn a_try_takes_a_free_lock_and_refuses_a_held_or_poisoned_one() {
+        let lock: RwLockAt<u32> = RwLockAt::new(order::COLUMNS, 5);
+        let mutex: MutexAt<u32> = MutexAt::new(order::VECTOR_COUNT, 6);
+        assert_eq!(lock.try_read().map(|guard| *guard), Some(5));
+        assert_eq!(mutex.try_lock().map(|guard| *guard), Some(6));
+
+        let (lock_ref, mutex_ref) = (&lock, &mutex);
+        std::thread::scope(|scope| {
+            let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+            let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+            scope.spawn(move || {
+                let _write = lock_ref.write().unwrap();
+                let _locked = mutex_ref.lock().unwrap();
+                held_tx.send(()).unwrap();
+                done_rx.recv().unwrap();
+            });
+            held_rx.recv().unwrap();
+            assert!(lock.try_read().is_none(), "a writer holds the lock");
+            assert!(mutex.try_lock().is_none(), "another thread holds the mutex");
+            #[cfg(debug_assertions)]
+            assert!(held_now().is_empty());
+            done_tx.send(()).unwrap();
+        });
+
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _write = lock.write().unwrap();
+            let _locked = mutex.lock().unwrap();
+            panic!("a panic under both guards");
+        }));
+        assert!(poisoned.is_err());
+        assert!(lock.try_read().is_none(), "a panic poisoned the lock");
+        assert!(mutex.try_lock().is_none(), "a panic poisoned the mutex");
+        #[cfg(debug_assertions)]
+        assert!(held_now().is_empty());
+    }
+
+    /// An acquisition that finds its lock held by another thread calls this
+    /// thread's wait hook with the lock's name before it waits and once it
+    /// has taken the lock, and an acquisition of a free lock calls nothing.
+    #[test]
+    fn a_wait_hook_hears_a_wait_on_a_lock_another_thread_holds() {
+        let lock: RwLockAt<u32> = RwLockAt::new(order::IDS, 7);
+        let mutex: MutexAt<u32> = MutexAt::new(order::WRITERS, 8);
+        let limit = std::time::Duration::from_secs(20);
+        let (lock_ref, mutex_ref) = (&lock, &mutex);
+        std::thread::scope(|scope| {
+            let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+            let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+            // The mutex first, in the declared order, and let go first, so
+            // the waiter finds it free once the write lets the read through.
+            let holder = scope.spawn(move || {
+                let locked = mutex_ref.lock().unwrap();
+                let write = lock_ref.write().unwrap();
+                held_tx.send(()).unwrap();
+                go_rx.recv().unwrap();
+                drop(locked);
+                drop(write);
+            });
+            held_rx.recv_timeout(limit).expect("the holder takes both");
+
+            let (heard_tx, heard) = std::sync::mpsc::channel::<(String, Wait)>();
+            let waiter = scope.spawn(move || {
+                WAIT_HOOK.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move |name, wait| {
+                        let _ = heard_tx.send((name.to_string(), wait));
+                    }));
+                });
+                let read = *lock_ref.read().unwrap();
+                let locked = *mutex_ref.lock().unwrap();
+                // Both are free now, so these call nothing.
+                let read_again = *lock_ref.read().unwrap();
+                let locked_again = *mutex_ref.lock().unwrap();
+                WAIT_HOOK.with(|hook| *hook.borrow_mut() = None);
+                (read, locked, (read_again, locked_again))
+            });
+            let named = |name: &str| if cfg!(debug_assertions) { name } else { "" }.to_string();
+            assert_eq!(
+                heard.recv_timeout(limit).expect("the read waits"),
+                (named("ids"), Wait::Begins)
+            );
+            assert!(
+                !waiter.is_finished(),
+                "the read waits while the write is held"
+            );
+            go_tx.send(()).unwrap();
+            holder.join().unwrap();
+            assert_eq!(waiter.join().unwrap(), (7, 8, (7, 8)));
+            let rest: Vec<(String, Wait)> = heard.try_iter().collect();
+            assert_eq!(
+                rest,
+                [(named("ids"), Wait::Ends)],
+                "the read ended its wait, and the free acquisitions called nothing"
+            );
+        });
     }
 
     /// A second read on one thread is refused, which is the whole point.

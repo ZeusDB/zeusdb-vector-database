@@ -5,9 +5,9 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, trace};
 use zeusdb_vector_core::{
-    Admit, Bitmap, Budget, CorpusStats, Cost, Dir, Error, Hits, Inventory, Ledger, Persist,
-    Position, Prepared, RecordId, Restore, Selectivity, Sparse, SparseRef, SparseVector,
-    VectorIndex,
+    magnitude_bits, Admit, Bitmap, Budget, CorpusStats, Cost, Dir, Error, Hits, Inventory, Ledger,
+    Persist, Position, Prepared, RecordId, Restore, Selectivity, Sparse, SparseRef, SparseVector,
+    VectorIndex, SPARSE_BOUND,
 };
 
 use crate::calibrate::UnitCosts;
@@ -76,6 +76,8 @@ impl Weighting {
     };
 
     /// `k1` is finite and at least zero, and `b` is between zero and one.
+    /// What a load holds the weighting `config.json` names to; see
+    /// [`Weighting::validate_declared`] for a declaration.
     pub fn validate(&self) -> Result<(), Error> {
         if let Weighting::Bm25 { k1, b } = *self {
             if !(k1.is_finite() && k1 >= 0.0) {
@@ -96,6 +98,25 @@ impl Weighting {
         Ok(())
     }
 
+    /// The rules of [`Weighting::validate`], and `k1` at most
+    /// [`SPARSE_BOUND`]: what a declaration is held to before a space is
+    /// built on it. A `k1` past the bound is refused with the whole rule
+    /// named, and every other refusal is the one [`Weighting::validate`]
+    /// gives.
+    pub fn validate_declared(&self) -> Result<(), Error> {
+        self.validate()?;
+        if let Weighting::Bm25 { k1, .. } = *self {
+            if k1 > SPARSE_BOUND {
+                return Err(Error::SparseWeightingInvalid {
+                    parameter: "k1",
+                    value: k1,
+                    rule: "finite, at least zero and at most 2^40, 1.099511627776e12",
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Whether every stored value is read as a term frequency, which is
     /// what makes a value at or below zero, or one that is not a whole
     /// number, a refusal at insert.
@@ -108,11 +129,26 @@ impl Weighting {
     /// a term frequency, above zero and a whole number, since a term
     /// frequency is a count and the rule's saturation and length read it
     /// as one. The first value breaking a rule is named, the positivity
-    /// rule first. What `insert` applies, and what a collection applies
-    /// before it writes any other space for the record, so a record
-    /// refused here leaves nothing behind.
+    /// rule first. What `insert` applies, and what a load applies to a
+    /// record of a directory or a journal.
     pub fn validate_record(&self, vector: SparseRef<'_>) -> Result<(), Error> {
         vector.validate()?;
+        self.validate_counts(vector)
+    }
+
+    /// The rules of [`Weighting::validate_record`], with every value at
+    /// most [`SPARSE_BOUND`] in magnitude, as [`SparseRef::validate_bounded`]
+    /// holds it. What a collection applies where it admits a new record,
+    /// before it writes any other space for the record, so a record refused
+    /// here leaves nothing behind.
+    pub fn validate_bounded_record(&self, vector: SparseRef<'_>) -> Result<(), Error> {
+        vector.validate_bounded()?;
+        self.validate_counts(vector)
+    }
+
+    /// Every value above zero and a whole number, where the rule reads a
+    /// term frequency, the positivity rule first.
+    fn validate_counts(&self, vector: SparseRef<'_>) -> Result<(), Error> {
         if self.reads_term_frequency() {
             for (index, &value) in vector.values.iter().enumerate() {
                 if value <= 0.0 {
@@ -194,9 +230,17 @@ impl Default for SparseConfig {
 }
 
 impl SparseConfig {
-    /// The rules a declaration has to satisfy before a space is built on it.
+    /// The rules a declaration `config.json` holds has to satisfy before a
+    /// load builds a space on it.
     pub fn validate(&self) -> Result<(), Error> {
         self.weighting.validate()
+    }
+
+    /// The rules a caller's declaration has to satisfy before a space is
+    /// built on it, being those of [`SparseConfig::validate`] and `k1` at
+    /// most [`SPARSE_BOUND`]. See [`Weighting::validate_declared`].
+    pub fn validate_declared(&self) -> Result<(), Error> {
+        self.weighting.validate_declared()
     }
 }
 
@@ -214,7 +258,8 @@ pub(crate) struct Posting {
 pub(crate) struct PostingList {
     pub(crate) postings: Vec<Posting>,
     /// Postings whose record has been removed and not yet rewritten out.
-    /// Maintained under `Unlink::Lazy` alone.
+    /// Maintained under `Unlink::Strand` and `Unlink::Lazy`. `Unlink::Eager`
+    /// takes a removed record's postings out, so it stays at zero there.
     pub(crate) dead: u32,
 }
 
@@ -235,6 +280,53 @@ impl Slot {
     pub(crate) fn held(&self) -> bool {
         self.len != u32::MAX
     }
+}
+
+/// The most nonzeros the forward arena holds, removed records' included until
+/// a compaction. A span names its start and its length as `u32`s and a length
+/// of `u32::MAX` marks a slot never held, so a span that ends within this
+/// ceiling has a start, a length and an end a `u32` holds, and a length below
+/// the marker.
+pub const MAX_FORWARD: usize = u32::MAX as usize - 1;
+
+// The forward arena's ceiling this thread's indexes hold a record to, which a
+// test lowers to reach the refusal without gigabytes of postings. Nothing
+// outside the tests sees it.
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    pub static FORWARD_CEILING: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(MAX_FORWARD) };
+}
+
+/// The forward arena's ceiling.
+#[cfg(any(test, feature = "test-support"))]
+fn forward_ceiling() -> usize {
+    FORWARD_CEILING.with(std::cell::Cell::get)
+}
+
+/// The forward arena's ceiling.
+#[cfg(not(any(test, feature = "test-support")))]
+fn forward_ceiling() -> usize {
+    MAX_FORWARD
+}
+
+/// Refuse a record of `nnz` nonzeros where a forward arena holding `held`,
+/// and `admitted` more for the records a caller has admitted and not yet
+/// inserted, cannot take it. A collection runs this where it admits a
+/// record, before anything is recorded for it, and an index runs it as it
+/// inserts one. The refusal leaves the space for the caller to name.
+pub fn refuse_forward(held: usize, admitted: usize, nnz: usize) -> Result<(), Error> {
+    let ceiling = forward_ceiling();
+    if held.saturating_add(admitted).saturating_add(nnz) > ceiling {
+        return Err(Error::SparseForwardFull {
+            space: String::new(),
+            held,
+            admitted,
+            nnz,
+            ceiling,
+        });
+    }
+    Ok(())
 }
 
 /// Heap bytes the structure holds, by capacity, split by part. The
@@ -460,17 +552,27 @@ impl PostingsIndex {
 
     /// Whether every posting is keyed by a position the record table holds a
     /// record at, live or dead, each list in strictly increasing key order,
-    /// the dead set lies inside the records held, the length table is the
-    /// record table's length, and the slot count reaches past every record.
-    /// Every write keeps it true.
+    /// each list's dead count is the postings on it whose position is in the
+    /// dead set, the dead postings are the sum of those counts, the dead set
+    /// lies inside the records held, the length table is the record table's
+    /// length, and the slot count reaches past every record. Every write
+    /// keeps it true.
     pub fn keys_agree(&self) -> bool {
         let held = |key: usize| self.records.get(key).is_some_and(Slot::held);
+        let mut counted_dead = 0usize;
         let lists = self.lists.iter().all(|list| {
+            let dead_keys = list
+                .postings
+                .iter()
+                .filter(|p| self.dead.contains(p.key as usize))
+                .count();
+            counted_dead += list.dead as usize;
             list.postings.iter().all(|p| held(p.key as usize))
                 && list
                     .postings
                     .windows(2)
                     .all(|pair| pair[0].key < pair[1].key)
+                && dead_keys == list.dead as usize
         });
         let mut dead = 0usize;
         let mut dead_within = true;
@@ -482,6 +584,7 @@ impl PostingsIndex {
             .filter(|&at| held(at) && !self.dead.contains(at))
             .count();
         lists
+            && counted_dead == self.dead_postings
             && dead_within
             && dead == self.dead_records
             && live == self.live
@@ -543,10 +646,46 @@ impl PostingsIndex {
         }
     }
 
+    /// Nonzeros the forward arena holds, removed records' spans included
+    /// until a compaction, which is what [`MAX_FORWARD`] bounds.
+    pub fn forward_len(&self) -> usize {
+        self.fwd_dims.len()
+    }
+
+    /// The first value a live record holds whose magnitude passes
+    /// [`SPARSE_BOUND`], with the record's position and the value's index
+    /// in the record's vector, the records taken in position order. `None`
+    /// for every index this build writes, since a collection admits no such
+    /// value.
+    ///
+    /// One pass over the forward arena with no early exit settles an index
+    /// that holds no such value, removed records' spans included, and only
+    /// an arena that holds one is walked record by record. A load asks this
+    /// once the space is read and any journal replayed.
+    pub fn first_value_past_bound(&self) -> Option<(Position, usize, f32)> {
+        let within = SPARSE_BOUND.to_bits();
+        let past = self.fwd_values.iter().fold(false, |past, &value| {
+            past | (magnitude_bits(value) > within)
+        });
+        if !past {
+            return None;
+        }
+        (0..self.records.len()).find_map(|slot| {
+            let at = Position::from_slot(slot);
+            let vector = self.forward(self.slot_of(at)?);
+            let (index, &value) = vector
+                .values
+                .iter()
+                .enumerate()
+                .find(|(_, value)| magnitude_bits(**value) > within)?;
+            Some((at, index, value))
+        })
+    }
+
     /// Rewrite one list without its dead postings.
-    fn compact_list(&mut self, slot: u32) {
+    fn compact_list(&mut self, slot: usize) {
         let dead = &self.dead;
-        let list = &mut self.lists[slot as usize];
+        let list = &mut self.lists[slot];
         let before = list.postings.len();
         list.postings.retain(|p| !dead.contains(p.key as usize));
         let removed = before - list.postings.len();
@@ -574,11 +713,11 @@ impl PostingsIndex {
     pub fn compact(&mut self) {
         let postings_before = self.postings_total;
         let dead_before = self.dead_records;
-        for slot in 0..self.lists.len() as u32 {
-            if self.lists[slot as usize].dead > 0 {
+        for slot in 0..self.lists.len() {
+            if self.lists[slot].dead > 0 {
                 self.compact_list(slot);
             }
-            self.lists[slot as usize].postings.shrink_to_fit();
+            self.lists[slot].postings.shrink_to_fit();
         }
         // The forward arena, rebuilt in position order, and the length total
         // summed again from the records that survive.
@@ -595,7 +734,10 @@ impl PostingsIndex {
                 continue;
             }
             let (s, e) = (slot.start as usize, (slot.start + slot.len) as usize);
-            let start = dims.len() as u32;
+            let start = u32::try_from(dims.len()).expect(
+                "the rebuilt arena holds the live records' nonzeros, which the forward arena's \
+                 ceiling held within a u32",
+            );
             dims.extend_from_slice(&self.fwd_dims[s..e]);
             values.extend_from_slice(&self.fwd_values[s..e]);
             slot.start = start;
@@ -645,8 +787,8 @@ impl PostingsIndex {
     #[cfg(any(test, feature = "test-support"))]
     pub fn close_up(&mut self, old_of_new: &[u32], new_of_old: &[u32]) {
         if self.dead_records > 0 {
-            for slot in 0..self.lists.len() as u32 {
-                if self.lists[slot as usize].dead > 0 {
+            for slot in 0..self.lists.len() {
+                if self.lists[slot].dead > 0 {
                     self.compact_list(slot);
                 }
             }
@@ -844,8 +986,10 @@ impl PostingsIndex {
         self.slot_count = self.slot_count.max(id.slot() + 1);
     }
 
-    /// Insert one record at its position `at`, with the check every caller
-    /// wants. The caller raises the slot count by the record's internal id
+    /// Insert one record at its position `at`, with the checks every caller
+    /// wants, being the record's own rules, the forward arena's ceiling and
+    /// a position the index holds live or removed, all before anything is
+    /// written. The caller raises the slot count by the record's internal id
     /// once the record is in, through [`PostingsIndex::count_slot`].
     pub(crate) fn insert_record(
         &mut self,
@@ -853,6 +997,8 @@ impl PostingsIndex {
         vector: SparseRef<'_>,
     ) -> Result<(), Error> {
         self.config.weighting.validate_record(vector)?;
+        let nnz = vector.dims.len();
+        refuse_forward(self.fwd_dims.len(), 0, nnz)?;
         let slot_index = at.slot();
         if slot_index >= self.records.len() {
             self.records.resize(slot_index + 1, NEVER_HELD);
@@ -862,21 +1008,24 @@ impl PostingsIndex {
             return Err(Error::RecordAlreadyHeld { id: at.0 });
         }
         if self.dead.contains(slot_index) {
-            // A removed position being re-inserted. The engine never does
-            // this, since it never reuses a position, but the structure stays
-            // correct if a caller does: the old span and its postings are
-            // already counted dead, and the record starts again.
-            self.dead.remove(slot_index);
-            self.dead_records -= 1;
+            // A removed position keeps its postings on their lists under the
+            // strand and lazy policies, keyed by the position, until a
+            // compaction or a close-up drops them, so a record taken at it
+            // would read them as its own. The collection files every record
+            // at a new position and never takes one.
+            return Err(Error::RecordRemoved { id: at.0 });
         }
-        let nnz = vector.dims.len();
-        let start = self.fwd_dims.len() as u32;
+        let start = u32::try_from(self.fwd_dims.len())
+            .expect("the forward arena is held within its ceiling, which no u32 offset passes");
+        let len = u32::try_from(nnz)
+            .expect("a record's nonzeros are held within the forward arena's ceiling");
         self.fwd_dims.extend_from_slice(vector.dims);
         self.fwd_values.extend_from_slice(vector.values);
-        self.records[slot_index] = Slot {
-            start,
-            len: nnz as u32,
-        };
+        self.records[slot_index] = Slot { start, len };
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a record's length summed in f64 and kept as the f32 the scorer reads, not an offset, a count, an index or an id"
+        )]
         let length = vector.values.iter().map(|&v| v as f64).sum::<f64>() as f32;
         self.lengths[slot_index] = length;
         self.live_length += length as f64;
@@ -886,6 +1035,10 @@ impl PostingsIndex {
             let slot = match self.slots_by_dim.get(&d) {
                 Some(&s) => s,
                 None => {
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "a new list's slot, below 2^32, since each list holds a distinct u32 dimension"
+                    )]
                     let s = self.lists.len() as u32;
                     self.lists.push(PostingList::default());
                     self.slots_by_dim.insert(d, s);
@@ -953,11 +1106,11 @@ impl PostingsIndex {
             Unlink::Lazy => {
                 self.dead_postings += slot.len as usize;
                 let threshold = self.config.lazy_threshold_percent as usize;
-                let mut to_compact: Vec<u32> = Vec::new();
+                let mut to_compact: Vec<usize> = Vec::new();
                 for i in s..e {
                     let d = self.fwd_dims[i];
-                    let list_slot = self.slots_by_dim[&d];
-                    let list = &mut self.lists[list_slot as usize];
+                    let list_slot = self.slots_by_dim[&d] as usize;
+                    let list = &mut self.lists[list_slot];
                     list.dead += 1;
                     if list.dead as usize * 100 > list.postings.len() * threshold {
                         to_compact.push(list_slot);
@@ -1091,7 +1244,7 @@ impl VectorIndex<Sparse> for PostingsIndex {
     }
 
     fn corpus_stats(&self, dims: &[u32], admit: &dyn Admit) -> Option<CorpusStats> {
-        self.stats_under(dims, admit)
+        Some(self.stats_under(dims, admit))
     }
 }
 
@@ -1120,6 +1273,10 @@ impl Persist for PostingsIndex {
     /// which is an index whose positions are its internal ids, as an index
     /// filled on its own is. A collection writes through
     /// [`PostingsIndex::write_with`].
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a position as an internal id, for an index filled on its own, below its record table's length"
+    )]
     fn write(&self, prefix: &str, dir: &dyn Dir, ledger: &mut dyn Ledger) -> Result<(), Error> {
         crate::persist::write(self, prefix, dir, ledger, &|at| at as u32)
     }
@@ -1144,7 +1301,7 @@ impl Restore for PostingsIndex {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use zeusdb_vector_core::Candidates;
 
@@ -1200,6 +1357,121 @@ mod tests {
         assert_eq!(dot.len(), 1);
     }
 
+    /// A declaration's `k1` past the bound on a sparse value is refused with
+    /// the whole rule named, one at the bound is taken, and a load, which
+    /// holds `config.json` to the rules without the bound, reads both. Every
+    /// other refusal of a declaration keeps its words.
+    #[test]
+    fn a_k1_past_the_bound_is_refused_where_declared_and_read_where_loaded() {
+        let at = Weighting::Bm25 {
+            k1: SPARSE_BOUND,
+            b: 0.75,
+        };
+        assert!(at.validate_declared().is_ok());
+        for k1 in [f32::from_bits(SPARSE_BOUND.to_bits() + 1), 2e12, f32::MAX] {
+            let past = Weighting::Bm25 { k1, b: 0.75 };
+            assert!(past.validate().is_ok(), "{k1:e}: a load reads it");
+            let declared = SparseConfig {
+                weighting: past,
+                ..SparseConfig::default()
+            };
+            assert!(declared.validate().is_ok(), "{k1:e}: a load reads it");
+            assert_eq!(
+                declared.validate_declared().unwrap_err().to_string(),
+                format!(
+                    "Term weighting parameter k1 is {k1}, and it must be finite, at least zero \
+                     and at most 2^40, 1.099511627776e12"
+                )
+            );
+        }
+        assert_eq!(
+            Weighting::Bm25 { k1: 2e12, b: 0.75 }
+                .validate_declared()
+                .unwrap_err()
+                .to_string(),
+            "Term weighting parameter k1 is 2000000000000, and it must be finite, at least zero \
+             and at most 2^40, 1.099511627776e12"
+        );
+        for broken in [
+            Weighting::Bm25 { k1: -1.0, b: 0.75 },
+            Weighting::Bm25 {
+                k1: f32::NAN,
+                b: 0.75,
+            },
+            Weighting::Bm25 { k1: 1.2, b: 1.5 },
+        ] {
+            assert_eq!(
+                broken.validate_declared().unwrap_err().to_string(),
+                broken.validate().unwrap_err().to_string()
+            );
+        }
+        assert!(Weighting::Dot.validate_declared().is_ok());
+    }
+
+    /// A new record's value past the bound on a sparse value is refused as
+    /// past the bound before the rules a term frequency keeps, under either
+    /// weighting, and the rules a load applies take the same record.
+    #[test]
+    fn a_new_records_value_past_the_bound_is_refused_before_the_count_rules() {
+        let whole_past = 2f32.powi(41);
+        for (weighting, value) in [(Weighting::BM25, whole_past), (Weighting::Dot, -whole_past)] {
+            let vector = sparse(&[1, 2], &[1.0, value]);
+            assert!(
+                matches!(
+                    weighting.validate_bounded_record(vector.as_ref()),
+                    Err(Error::SparseValuePastBound { index: 1, value: held }) if held == value
+                ),
+                "{weighting:?}"
+            );
+            assert!(
+                weighting.validate_record(vector.as_ref()).is_ok(),
+                "{weighting:?}: a load reads it"
+            );
+        }
+        assert!(matches!(
+            Weighting::BM25.validate_bounded_record(sparse(&[1], &[0.5]).as_ref()),
+            Err(Error::SparseValueNotWhole { index: 0, .. })
+        ));
+    }
+
+    /// The first stored value past the bound on a sparse value is a live
+    /// record's, found in position order with its place in the record's
+    /// vector. A removed record's value is passed over, and an index that
+    /// holds none answers none.
+    #[test]
+    fn the_first_value_past_the_bound_is_a_live_records() {
+        let none = zeusdb_vector_core::Prepared::none;
+        let mut index = PostingsIndex::new(SparseConfig {
+            unlink: Unlink::Strand,
+            ..SparseConfig::default()
+        });
+        assert_eq!(index.first_value_past_bound(), None);
+        for (at, values) in [
+            (1u32, [1.0f32, 2.0]),
+            (2, [1.0, 3e12]),
+            (3, [-5e12, SPARSE_BOUND]),
+        ] {
+            index
+                .insert(
+                    Position(at),
+                    RecordId(at),
+                    sparse(&[4, 9], &values).as_ref(),
+                    none(),
+                )
+                .unwrap();
+        }
+        assert_eq!(index.first_value_past_bound(), Some((Position(2), 1, 3e12)));
+        index.remove(Position(2)).unwrap();
+        assert_eq!(
+            index.first_value_past_bound(),
+            Some((Position(3), 0, -5e12))
+        );
+        index.remove(Position(3)).unwrap();
+        assert_eq!(index.first_value_past_bound(), None);
+        index.compact();
+        assert_eq!(index.first_value_past_bound(), None);
+    }
+
     /// An id already held is refused, an id never held cannot be removed,
     /// and the live count and the stranded count follow every write.
     #[test]
@@ -1234,6 +1506,102 @@ mod tests {
             Err(Error::RecordNotHeld { id: 1 })
         ));
         assert!(index.vector(Position(1)).is_none());
+    }
+
+    /// A position the index holds as removed is refused under every policy,
+    /// before anything is written, so the removed record's postings stay
+    /// counted dead and no search reads them as a new record's. A
+    /// compaction then takes them back cleanly.
+    #[test]
+    fn a_removed_position_is_refused_with_nothing_written() {
+        for unlink in [Unlink::Strand, Unlink::Lazy, Unlink::Eager] {
+            let mut index = PostingsIndex::new(SparseConfig {
+                unlink,
+                ..SparseConfig::default()
+            });
+            // Twenty records share dimension 1, so one removal leaves that
+            // list below the lazy rewrite's ten percent and its dead posting
+            // on it.
+            for id in 0..20u32 {
+                let v = sparse(&[1, 100 + id], &[1.0, 1.0]);
+                index
+                    .insert(Position(id), RecordId(id + 1), v.as_ref(), Prepared::none())
+                    .unwrap();
+            }
+            index.remove(Position(5)).unwrap();
+            let before = index.layout();
+            let refused = index.insert(
+                Position(5),
+                RecordId(21),
+                sparse(&[7], &[2.0]).as_ref(),
+                Prepared::none(),
+            );
+            assert!(
+                matches!(refused, Err(Error::RecordRemoved { id: 5 })),
+                "{unlink:?}: {refused:?}"
+            );
+            assert_eq!(index.layout(), before, "{unlink:?}: nothing is written");
+            assert!(index.keys_agree(), "{unlink:?}");
+            assert!(!index.holds(Position(5)), "{unlink:?}");
+            assert_eq!(index.df(1), 19, "{unlink:?}");
+            for dim in [1, 105, 7] {
+                let found = index
+                    .search(
+                        sparse(&[dim], &[1.0]).as_ref(),
+                        25,
+                        &Candidates::All,
+                        &Budget::default(),
+                    )
+                    .unwrap();
+                assert!(
+                    found.items.iter().all(|hit| hit.position != Position(5)),
+                    "{unlink:?}: dimension {dim} finds the removed position"
+                );
+            }
+            index.compact();
+            assert_eq!(index.dead_postings(), 0, "{unlink:?}");
+            assert!(index.keys_agree(), "{unlink:?}: compacted");
+        }
+    }
+
+    /// The structure's own check holds each list's dead count to the
+    /// postings on it whose position is removed, and the dead postings to
+    /// the sum of the counts, so a position dropped from the dead set while
+    /// its postings stay counted, or a count that drifts, fails it.
+    #[test]
+    fn the_keys_check_holds_the_dead_counts_to_the_lists() {
+        for unlink in [Unlink::Strand, Unlink::Lazy] {
+            let fresh = || {
+                let mut index = PostingsIndex::new(SparseConfig {
+                    unlink,
+                    ..SparseConfig::default()
+                });
+                for id in 0..20u32 {
+                    let v = sparse(&[1, 100 + id], &[1.0, 1.0]);
+                    index
+                        .insert(Position(id), RecordId(id + 1), v.as_ref(), Prepared::none())
+                        .unwrap();
+                }
+                index.remove(Position(5)).unwrap();
+                assert!(index.keys_agree(), "{unlink:?}");
+                index
+            };
+
+            let mut revived = fresh();
+            revived.dead.remove(5);
+            revived.dead_records -= 1;
+            assert!(!revived.keys_agree(), "{unlink:?}: a revived position");
+
+            let mut drifted = fresh();
+            let slot = drifted.slots_by_dim[&1] as usize;
+            drifted.lists[slot].dead += 1;
+            drifted.dead_postings += 1;
+            assert!(!drifted.keys_agree(), "{unlink:?}: a list's count");
+
+            let mut total = fresh();
+            total.dead_postings += 1;
+            assert!(!total.keys_agree(), "{unlink:?}: the total");
+        }
     }
 
     /// Stranding leaves the postings and counts them, and a compaction takes
@@ -1278,6 +1646,103 @@ mod tests {
         assert!(hits.exact);
         assert_eq!(hits.items[0].position, Position(3));
         assert_eq!(hits.items[0].score, 4.0);
+    }
+
+    /// The forward arena's ceiling, lowered on this thread for the length of
+    /// a test and put back when dropped.
+    pub(crate) struct Lowered(usize);
+
+    impl Lowered {
+        pub(crate) fn to(ceiling: usize) -> Self {
+            Lowered(FORWARD_CEILING.with(|held| held.replace(ceiling)))
+        }
+    }
+
+    impl Drop for Lowered {
+        fn drop(&mut self) {
+            FORWARD_CEILING.with(|held| held.set(self.0));
+        }
+    }
+
+    /// A record that takes the forward arena exactly to its ceiling goes in,
+    /// and one that would pass it by a nonzero is refused, naming what the
+    /// arena holds, what the record carries and the ceiling, with nothing
+    /// written. A removed record's span is counted until a compaction gives
+    /// it back, and then the record that was refused goes in. A caller's
+    /// admitted nonzeros count toward the ceiling as the arena's do.
+    #[test]
+    fn the_forward_arena_takes_a_record_to_its_ceiling_and_refuses_one_past_it() {
+        let _lowered = Lowered::to(12);
+        let mut index = PostingsIndex::new(SparseConfig::default());
+        let four = |base: u32| sparse(&[base, base + 1, base + 2, base + 3], &[1.0; 4]);
+        for id in 1..=3u32 {
+            index
+                .insert(
+                    Position(id),
+                    RecordId(id),
+                    four(id * 10).as_ref(),
+                    Prepared::none(),
+                )
+                .unwrap();
+        }
+        assert_eq!(index.forward_len(), 12, "the arena is at its ceiling");
+        let refused = index
+            .insert(
+                Position(4),
+                RecordId(4),
+                sparse(&[90], &[1.0]).as_ref(),
+                Prepared::none(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                Error::SparseForwardFull { ref space, held: 12, admitted: 0, nnz: 1, ceiling: 12 }
+                    if space.is_empty()
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(index.len(), 3);
+        assert_eq!(index.forward_len(), 12);
+        assert!(!index.holds(Position(4)));
+
+        index.remove(Position(2)).unwrap();
+        assert_eq!(
+            index.forward_len(),
+            12,
+            "a removed record's span stays until a compaction"
+        );
+        assert!(index
+            .insert(
+                Position(4),
+                RecordId(4),
+                sparse(&[90], &[1.0]).as_ref(),
+                Prepared::none()
+            )
+            .is_err());
+        index.compact();
+        assert_eq!(index.forward_len(), 8);
+        index
+            .insert(
+                Position(4),
+                RecordId(4),
+                four(90).as_ref(),
+                Prepared::none(),
+            )
+            .unwrap();
+        assert_eq!(index.forward_len(), 12);
+
+        assert!(refuse_forward(8, 4, 0).is_ok());
+        assert!(matches!(
+            refuse_forward(8, 3, 2),
+            Err(Error::SparseForwardFull {
+                held: 8,
+                admitted: 3,
+                nnz: 2,
+                ceiling: 12,
+                ..
+            })
+        ));
     }
 
     /// The list stays sorted when an id arrives out of order, which the

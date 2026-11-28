@@ -1,23 +1,71 @@
-//! Product quantization training, and the graph rebuild that follows it.
+//! Quantizer training, and the graph rebuild that follows it.
 //!
-//! Training fires once, on the `add` that reaches `training_size`, and that call
-//! does four things in order: it fits the codebook, it measures the rerank fetch
-//! on the sample it has just fitted to, it clears the collected ids, and it
-//! rebuilds the whole graph over the codes. `quantized_only` sheds its raw
-//! vectors at the end of that rebuild, which is the single point where the mode
-//! does so.
+//! Training fires on the `add` that reaches `training_size`, once the
+//! segment holding that record has committed and installed. It fits the
+//! codebook or the scales, measures the rerank fetch on the sample it has
+//! just fitted to where the storage mode reranks, hands the training's record
+//! to the sink carrying everything it fitted and commits it alone, and only
+//! then installs: the quantizer, the stamp and the calibration, the collected
+//! ids cleared, and the whole graph rebuilt over the codes. A replay of the
+//! record installs through the same function and fits nothing.
+//! `quantized_only` sheds its raw vectors at the end of that rebuild, which is
+//! the single point where the mode does so.
 
 use super::insert::MutationGuard;
 use super::{Collection, QuantizationConfig, StorageMode, MAX_LAYER};
-use crate::{calibrate_rerank_from_sample, raw_distance_fn, RerankCalibration};
-use chrono::Utc;
+use crate::{calibrate_rerank_from_sample, RerankCalibration};
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, info, instrument, trace, warn};
-use zeusdb_vector_core::{Error, Int8Codec, Operation, Position, SeededRng, VectorGraph, PQ};
+use zeusdb_vector_core::{
+    Error, FittedRef, Int8Codec, Operation, OperationKind, Position, SeededRng, Timestamp, Values,
+    VectorGraph, Withdrawal, JOURNAL_MAX_PAYLOAD, PQ,
+};
+
+/// A training's refused record in the words its entry in `errors` takes:
+/// the refusal, with each sentence a withdrawal gives a call put as the
+/// training's, since the records of the call that set the training off
+/// committed before the training's record.
+fn training_failure(error: &Error) -> String {
+    let mut words = error.to_string();
+    for (call, training) in [
+        (
+            Withdrawal::Aborted.sentence(),
+            "The training's record was withdrawn by an abort record, so the training does not \
+             come back after a crash.",
+        ),
+        (
+            Withdrawal::CutBack.sentence(),
+            "The training's record was cut from the journal, so the training does not come \
+             back after a crash.",
+        ),
+        (
+            Withdrawal::Neither.sentence(),
+            "The training's record could be neither withdrawn nor cut from the journal, so the \
+             training may come back after a crash until a checkpoint.",
+        ),
+    ] {
+        words = words.replace(call, training);
+    }
+    words
+}
+
+/// What a training fitted, held until its record has committed and then
+/// installed, by the live training and by a replay of its record alike.
+pub(super) enum Trained {
+    /// A codebook, one list a subvector of one list a centroid, with the
+    /// rerank calibration measured on it as the record carries it, being
+    /// JSON, where one was measured.
+    Codebook {
+        centroids: Vec<Vec<Vec<f32>>>,
+        calibration: Option<String>,
+    },
+    /// The scales.
+    Scales(Int8Codec),
+}
 
 /// The target every record this file emits carries. See the parent module.
 const LOG_TARGET: &str = "zeusdb_vector_database::hnsw_index::training";
@@ -67,140 +115,254 @@ impl Collection {
             "Training threshold reached - starting quantizer training"
         );
         // The clock is read here, on the path where the quantizer is fitted
-        // for the first time, and handed down as the stamp. The training's
-        // record carries that stamp and is handed to the sink before the
-        // quantizer is fitted, so a replay of the records reaches this same
-        // trigger as a function of the records before it and takes the stamp
-        // from the record rather than from its own clock.
-        let completed_at = Utc::now().to_rfc3339();
-        self.record(|| Operation::Train {
-            completed_at: completed_at.clone(),
-        })
-        .map_err(|e| e.to_string())?;
-        self.commit_records().map_err(|e| e.to_string())?;
-        if config.is_int8() {
-            self.train_int8_from_ids(writers, completed_at)
-        } else {
-            self.train_quantization_from_ids(writers, completed_at)
-        }
+        // for the first time, and the stamp travels in the training's record,
+        // so a replay installs the stamp the record carries and reads no
+        // clock.
+        let completed_at = Timestamp::now().to_rfc3339();
+        let trained = self.fit_training(config)?;
+        // The record carries everything the fit produced and commits alone,
+        // before anything is installed. A record the sink refuses trains
+        // nothing: what was fitted is dropped, the fault stands, and the
+        // first call after the checkpoint fits again.
+        self.record_training(&completed_at, &trained)
+            .map_err(|error| training_failure(&error))?;
+        // Once the record has committed, no valid record reaches a failure of
+        // the install, so one is a defect that leaves the fault.
+        self.install_training(writers, trained, completed_at)
+            .inspect_err(|error| self.fault_sink(error))
     }
 
-    /// TRAINING EXECUTION: Uses collected IDs for deterministic training set
+    /// Fit the quantizer the collection declares to the training sample,
+    /// installing nothing.
     ///
-    /// `completed_at` is the RFC 3339 stamp the codebook is recorded as fitted
-    /// at. It is a parameter rather than a clock reading taken here so that
-    /// the one value training cannot reproduce is supplied by the caller:
-    /// `maybe_trigger_training` reads the clock, and a caller replaying a
-    /// recorded training hands the stamp that training took. Everything else
-    /// training produces is a function of the records that reached the
-    /// threshold, since every draw is seeded and every order is fixed.
-    #[instrument(target = LOG_TARGET, level = "info", skip(self, writers, completed_at), fields(
+    /// A codebook's rerank calibration is measured where the storage mode
+    /// reranks, on a quantizer of its own holding the new codebook, since the
+    /// collection's own stays untrained until the training's record commits.
+    /// Every draw is seeded and every order fixed, so what this returns is a
+    /// function of the records that reached the threshold, the calibration's
+    /// timing aside.
+    #[instrument(target = LOG_TARGET, level = "info", skip(self, config), fields(
         has_pq = self.dense().pq.is_some(),
-        has_config = self.dense().quantization_config.is_some()
+        int8 = config.is_int8()
     ))]
-    pub(super) fn train_quantization_from_ids(
-        &self,
-        writers: &MutationGuard<'_>,
-        completed_at: String,
-    ) -> Result<(), String> {
-        let start_time = Instant::now();
+    pub(super) fn fit_training(&self, config: &QuantizationConfig) -> Result<Trained, String> {
+        let sample = self.training_sample(config)?;
+        if config.is_int8() {
+            let scale = config
+                .scheme
+                .int8_scale()
+                .ok_or("the space is not declared with scalar quantization")?;
+            info!(target: LOG_TARGET, operation = "int8_training_start",
+                training_vectors = sample.len(),
+                scale = scale.name(),
+                "Starting scalar quantization training"
+            );
+            let training_start = Instant::now();
+            let codec = Int8Codec::fit(self.dense().dim, &sample)?;
+            info!(target: LOG_TARGET, operation = "int8_training_complete",
+                dim = codec.dim(),
+                duration_ms = training_start.elapsed().as_millis(),
+                "Scalar quantization training completed successfully"
+            );
+            return Ok(Trained::Scales(codec));
+        }
 
-        let pq = self.dense().pq.as_ref().ok_or("PQ not available")?.clone();
-        let config = self
-            .dense()
-            .quantization_config
-            .as_ref()
-            .ok_or("Config not available")?
-            .clone();
-
-        let final_training_set = self.training_sample(&config)?;
-
+        let pq = self.dense().pq.as_ref().ok_or("PQ not available")?;
         let (subvectors, bits) = config.scheme.pq_shape().unwrap_or((0, 0));
         info!(target: LOG_TARGET, operation = "pq_training_start",
-            training_vectors = final_training_set.len(),
+            training_vectors = sample.len(),
             subvectors = subvectors,
             bits = bits,
             "Starting PQ training"
         );
-
-        // Train the PQ model
         let training_start = Instant::now();
-        pq.train(&final_training_set)?;
-        let training_duration = training_start.elapsed();
-
-        // The one point where the codebook goes from absent to fitted, so it is
-        // the one point that stamps when that happened, with the stamp the
-        // caller handed in. `quantization.json` used to write the save time
-        // under this name. See the field.
-        *self.dense().training_completed_at.write().unwrap() = Some(completed_at);
-
+        let centroids = pq.fit(&sample)?;
         info!(target: LOG_TARGET, operation = "pq_training_complete",
-            training_vectors = final_training_set.len(),
-            duration_ms = training_duration.as_millis(),
+            training_vectors = sample.len(),
+            duration_ms = training_start.elapsed().as_millis(),
             "PQ training completed successfully"
         );
 
-        // Measure the rerank fetch on the data the codebook was just fitted to,
-        // while that data and the codebook are both in hand. See
-        // `RerankCalibration`. The training set is released with this function's
-        // frame, so this is the only point where the measurement is free of a
-        // second pass over the records.
-        if let Some(calibration) = self.calibrate_rerank(&pq, &final_training_set) {
-            info!(target: LOG_TARGET, operation = "rerank_calibration",
-                fetch = calibration.fetch,
-                sample_records = calibration.sample_records,
-                queries = calibration.queries,
-                duration_ms = calibration.millis,
-                "Rerank fetch calibrated from the training sample"
+        // Measured on the data the codebook was just fitted to, while that
+        // data and the codebook are both in hand. See `RerankCalibration`.
+        // The sample is released with this function's frame, so this is the
+        // only point where the measurement is free of a second pass over the
+        // records.
+        let calibration = self.calibrate_rerank(pq, &centroids, &sample)?;
+        let calibration = calibration
+            .map(|calibration| {
+                info!(target: LOG_TARGET, operation = "rerank_calibration",
+                    fetch = calibration.fetch,
+                    sample_records = calibration.sample_records,
+                    queries = calibration.queries,
+                    duration_ms = calibration.millis,
+                    "Rerank fetch calibrated from the training sample"
+                );
+                serde_json::to_string(&calibration)
+            })
+            .transpose()
+            .map_err(|e| format!("the rerank calibration does not serialize: {e}"))?;
+        Ok(Trained::Codebook {
+            centroids,
+            calibration,
+        })
+    }
+
+    /// Hand the training's record to the sink, carrying the stamp and
+    /// everything `trained` holds, and commit it alone. An append that
+    /// fails is withdrawn and leaves the fault, as a commit that fails does.
+    fn record_training(&self, completed_at: &str, trained: &Trained) -> Result<(), Error> {
+        let fitted = match trained {
+            Trained::Codebook {
+                centroids,
+                calibration,
+            } => {
+                let first = centroids.first();
+                FittedRef::Codebook {
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "a codebook's subvector count, at most MAX_DIM"
+                    )]
+                    subvectors: centroids.len() as u32,
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "a subvector's centroid count, at most 256"
+                    )]
+                    centroids: first.map_or(0, Vec::len) as u32,
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "a subvector's width, at most MAX_DIM"
+                    )]
+                    width: first.and_then(|c| c.first()).map_or(0, Vec::len) as u32,
+                    values: Values::Nested(centroids),
+                    calibration: calibration.as_deref(),
+                }
+            }
+            Trained::Scales(codec) => FittedRef::Scales(codec.scales()),
+        };
+        let encode = |out: &mut Vec<u8>| {
+            Operation::encode_train(completed_at, fitted, out);
+            // The ceiling was derived for a codebook at the widest
+            // declaration, so no payload a declaration allows passes it.
+            debug_assert!(
+                out.len() <= JOURNAL_MAX_PAYLOAD,
+                "a training's record of {} bytes is within the ceiling",
+                out.len()
             );
-            *self.dense().rerank_calibration.write().unwrap() = Some(calibration);
+        };
+        if let Err(error) = self.record_encoded(OperationKind::Train, encode) {
+            return Err(self.withdraw_records(error));
         }
+        self.commit_records()
+    }
 
-        // Clear training IDs (no longer needed)
-        //
-        // The capacity goes with them. Collection stops for good once
-        // `training_threshold_reached` is set, which happens on the record that
-        // fills the buffer and before this runs, so nothing pushes into it
-        // again for the life of the index and the slots it held are dead
-        // weight. At the default `training_size` of 10,000 the buffer had grown
-        // to 16,384 slots of a 24 byte `String` header, being 393,216 bytes
-        // held inside `index_bookkeeping_memory_mb` on every trained index.
-        {
-            let mut training_ids = self.training_ids.write().unwrap();
-            training_ids.clear();
-            training_ids.shrink_to_fit();
+    /// Install what a training fitted: the quantizer, the stamp and the
+    /// calibration, the collected ids cleared, and the graph rebuilt over the
+    /// codes or the rows. The live training reaches this once its record has
+    /// committed, and a replay of the record reaches it with what the record
+    /// carries, so the two install the same state.
+    ///
+    /// A calibration that does not parse is refused before anything is
+    /// installed.
+    #[instrument(target = LOG_TARGET, level = "info", skip(self, writers, trained, completed_at))]
+    pub(super) fn install_training(
+        &self,
+        writers: &MutationGuard<'_>,
+        trained: Trained,
+        completed_at: String,
+    ) -> Result<(), String> {
+        let start_time = Instant::now();
+        match trained {
+            Trained::Codebook {
+                centroids,
+                calibration,
+            } => {
+                let pq = self.dense().pq.as_ref().ok_or("PQ not available")?.clone();
+                let calibration = calibration
+                    .map(|json| serde_json::from_str::<RerankCalibration>(&json))
+                    .transpose()
+                    .map_err(|e| format!("the rerank calibration does not parse: {e}"))?;
+                pq.install(centroids)?;
+                // The one point where the codebook goes from absent to
+                // fitted, so it is the one point that stamps when that
+                // happened. See the field.
+                *self.dense().training_completed_at.write().unwrap() = Some(completed_at);
+                if let Some(calibration) = calibration {
+                    *self.dense().rerank_calibration.write().unwrap() = Some(calibration);
+                }
+                self.release_training_ids();
+                zeusdb_vector_core::panic_at(zeusdb_vector_core::PanicPoint::TrainingBeforeRebuild);
+
+                debug!(target: LOG_TARGET, operation = "pq_rebuild_start",
+                    "Rebuilding index with quantization"
+                );
+                let rebuild_start = Instant::now();
+                let rebuilt = self
+                    .rebuild_with_quantization_locked(writers)
+                    .map_err(|e| format!("Failed to rebuild with quantization: {}", e))?;
+                if !rebuilt {
+                    error!(target: LOG_TARGET, operation = "pq_rebuild", "Index rebuild returned false");
+                    return Err("Index rebuild returned false".to_string());
+                }
+                // The code size against the vector size. A
+                // `memory_savings_percent` field used to sit beside it,
+                // carrying 1 - 1/compression_ratio, which is the same number in
+                // another form and was labelled as a saving the index does not
+                // make.
+                let compression_ratio = (self.dense().dim as f64 * 4.0) / pq.subvectors() as f64;
+                info!(target: LOG_TARGET, operation = "pq_complete",
+                    rebuild_duration_ms = rebuild_start.elapsed().as_millis(),
+                    compression_ratio = compression_ratio,
+                    total_duration_ms = start_time.elapsed().as_millis(),
+                    "Index successfully rebuilt with quantization"
+                );
+            }
+            Trained::Scales(codec) => {
+                // The one point where the scales go from absent to fitted,
+                // stamped as the codebook's path is.
+                *self.dense().training_completed_at.write().unwrap() = Some(completed_at);
+                self.release_training_ids();
+                // The codec becomes the space's, and its presence is the
+                // trained flag every reader asks; see the field.
+                if self.dense().install_int8_codec(Arc::new(codec)).is_err() {
+                    error!(target: LOG_TARGET, operation = "int8_training",
+                        "The scalar codec was already fitted"
+                    );
+                    return Err("The scalar codec was already fitted".to_string());
+                }
+                debug!(target: LOG_TARGET, operation = "int8_rebuild_start",
+                    "Rebuilding index over scalar rows"
+                );
+                let rebuild_start = Instant::now();
+                let rebuilt = self
+                    .rebuild_with_int8_locked(writers)
+                    .map_err(|e| format!("Failed to rebuild with quantization: {}", e))?;
+                if !rebuilt {
+                    error!(target: LOG_TARGET, operation = "int8_rebuild", "Index rebuild returned false");
+                    return Err("Index rebuild returned false".to_string());
+                }
+                info!(target: LOG_TARGET, operation = "int8_complete",
+                    rebuild_duration_ms = rebuild_start.elapsed().as_millis(),
+                    total_duration_ms = start_time.elapsed().as_millis(),
+                    "Index successfully rebuilt over scalar rows"
+                );
+            }
         }
-
-        // Rebuild index with quantization
-        debug!(target: LOG_TARGET, operation = "pq_rebuild_start",
-            "Rebuilding index with quantization"
-        );
-        let rebuild_start = Instant::now();
-        let rebuild_success = self
-            .rebuild_with_quantization_locked(writers)
-            .map_err(|e| format!("Failed to rebuild with quantization: {}", e))?;
-        let rebuild_duration = rebuild_start.elapsed();
-
-        if rebuild_success {
-            // The code size against the vector size. A `memory_savings_percent`
-            // field used to sit beside it, carrying 1 - 1/compression_ratio,
-            // which is the same number in another form and was labelled as a
-            // saving the index does not make.
-            let compression_ratio = (self.dense().dim as f64 * 4.0) / pq.subvectors() as f64;
-
-            let total_duration_ms = start_time.elapsed().as_millis();
-            info!(target: LOG_TARGET, operation = "pq_complete",
-                rebuild_duration_ms = rebuild_duration.as_millis(),
-                compression_ratio = compression_ratio,
-                total_duration_ms = total_duration_ms,
-                "Index successfully rebuilt with quantization"
-            );
-        } else {
-            error!(target: LOG_TARGET, operation = "pq_rebuild", "Index rebuild returned false");
-            return Err("Index rebuild returned false".to_string());
-        }
-
         Ok(())
+    }
+
+    /// Clear the collected training ids, and their capacity with them.
+    /// Collection stops for good once `training_threshold_reached` is set,
+    /// which happens on the record that fills the buffer and before training
+    /// runs, so nothing pushes into it again for the life of the index and
+    /// the slots it held are dead weight. At the default `training_size` of
+    /// 10,000 the buffer had grown to 16,384 slots of a 24 byte `String`
+    /// header, being 393,216 bytes held inside `index_bookkeeping_memory_mb`
+    /// on every trained index.
+    fn release_training_ids(&self) {
+        let mut training_ids = self.training_ids.write().unwrap();
+        training_ids.clear();
+        training_ids.shrink_to_fit();
     }
 
     /// The training sample: every collected record's vector, in the seeded
@@ -301,95 +463,6 @@ impl Collection {
         Ok(final_training_set)
     }
 
-    /// Fit the scales to the sample and rebuild the graph over rows.
-    ///
-    /// The scalar counterpart of `train_quantization_from_ids`: the same
-    /// sample in the same seeded order, `Int8Codec::fit` over it, which
-    /// draws nothing and is a function of the sample alone, the stamp, the
-    /// buffer cleared, the codec installed on the space, and the graph
-    /// rebuilt over every stored raw vector's row. There is no rerank
-    /// calibration, since a scalar index keeps no raw vector to rerank
-    /// against.
-    #[instrument(target = LOG_TARGET, level = "info", skip(self, writers, completed_at))]
-    pub(super) fn train_int8_from_ids(
-        &self,
-        writers: &MutationGuard<'_>,
-        completed_at: String,
-    ) -> Result<(), String> {
-        let start_time = Instant::now();
-        let config = self
-            .dense()
-            .quantization_config
-            .as_ref()
-            .ok_or("Config not available")?
-            .clone();
-        let scale = config
-            .scheme
-            .int8_scale()
-            .ok_or("the space is not declared with scalar quantization")?;
-
-        let sample = self.training_sample(&config)?;
-
-        info!(target: LOG_TARGET, operation = "int8_training_start",
-            training_vectors = sample.len(),
-            scale = scale.name(),
-            "Starting scalar quantization training"
-        );
-
-        let training_start = Instant::now();
-        let codec = Arc::new(Int8Codec::fit(self.dense().dim, &sample)?);
-        let training_duration = training_start.elapsed();
-        drop(sample);
-
-        // The one point where the scales go from absent to fitted, stamped
-        // with the time the caller handed in, as the codebook's path is.
-        *self.dense().training_completed_at.write().unwrap() = Some(completed_at);
-
-        info!(target: LOG_TARGET, operation = "int8_training_complete",
-            dim = codec.dim(),
-            duration_ms = training_duration.as_millis(),
-            "Scalar quantization training completed successfully"
-        );
-
-        // The collected ids and their capacity go, for the reason the
-        // codebook's path gives.
-        {
-            let mut training_ids = self.training_ids.write().unwrap();
-            training_ids.clear();
-            training_ids.shrink_to_fit();
-        }
-
-        // The codec becomes the space's, and its presence is the trained
-        // flag every reader asks; see the field.
-        if self.dense().install_int8_codec(codec).is_err() {
-            error!(target: LOG_TARGET, operation = "int8_training",
-                "The scalar codec was already fitted"
-            );
-            return Err("The scalar codec was already fitted".to_string());
-        }
-
-        debug!(target: LOG_TARGET, operation = "int8_rebuild_start",
-            "Rebuilding index over scalar rows"
-        );
-        let rebuild_start = Instant::now();
-        let rebuilt = self
-            .rebuild_with_int8_locked(writers)
-            .map_err(|e| format!("Failed to rebuild with quantization: {}", e))?;
-        let rebuild_duration = rebuild_start.elapsed();
-
-        if !rebuilt {
-            error!(target: LOG_TARGET, operation = "int8_rebuild", "Index rebuild returned false");
-            return Err("Index rebuild returned false".to_string());
-        }
-
-        info!(target: LOG_TARGET, operation = "int8_complete",
-            rebuild_duration_ms = rebuild_duration.as_millis(),
-            total_duration_ms = start_time.elapsed().as_millis(),
-            "Index successfully rebuilt over scalar rows"
-        );
-        Ok(())
-    }
-
     /// Rebuild the graph as a scalar graph over the fitted codec.
     ///
     /// Encodes every live record's raw vector where the graph being replaced
@@ -400,11 +473,13 @@ impl Collection {
     /// rebuild does. Nothing is held twice: the rows live in the
     /// replacement's store and the raw vectors go with the graph that held
     /// them, which is the whole of how `quantized_only` sheds them. The
-    /// values the encode clipped are added to the index's count.
+    /// values the encode clipped are added to the index's count. A
+    /// replacement with no room for a row is refused with the room's refusal
+    /// as a rebuild gives it and installs nothing.
     pub(super) fn rebuild_with_int8_locked(
         &self,
         writers: &MutationGuard<'_>,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, Error> {
         let start_time = Instant::now();
         let Some(codec) = self.dense().int8_codec().cloned() else {
             warn!(target: LOG_TARGET, operation = "rebuild_quantization",
@@ -444,7 +519,7 @@ impl Collection {
                 if let Some(row) = node.and_then(|node| old_hnsw.int8_row_at(node)) {
                     rows.push((row.to_vec(), internal_id));
                 } else if let Some(vector) = node.and_then(|node| old_hnsw.raw_vector_at(node)) {
-                    let row = new_hnsw.int8_encode(vector)?;
+                    let row = new_hnsw.int8_encode(vector).map_err(Error::Engine)?;
                     clipped += codec.saturated(vector) as u64;
                     rows.push((row, internal_id));
                     encoded += 1;
@@ -457,10 +532,10 @@ impl Collection {
                     missing_records = missing,
                     "Refusing to rebuild, some live records hold neither a raw vector nor a scalar row"
                 );
-                return Err(format!(
+                return Err(Error::Engine(format!(
                     "{} live records hold neither a raw vector nor a scalar row to rebuild from",
                     missing
-                ));
+                )));
             }
             (rows, encoded, clipped, old_hnsw.raw_count())
         };
@@ -478,7 +553,10 @@ impl Collection {
                 .collect();
             new_hnsw.insert_batch_int8(&batch).map_err(|e| {
                 error!(target: LOG_TARGET, operation = "int8_rebuild", error = %e, "Failed to insert scalar rows");
-                format!("Failed to insert scalar rows: {}", e)
+                match e {
+                    Error::GraphFull { .. } => e.in_rebuild(),
+                    e => Error::Engine(format!("Failed to insert scalar rows: {}", e)),
+                }
             })?;
         }
 
@@ -503,24 +581,42 @@ impl Collection {
 
     /// Measure how deep this index's codes bury a true neighbour
     ///
-    /// Runs once, at training completion, over the training sample and the
-    /// codebook just fitted to it. What it measures, why the queries come from
-    /// the sample itself, and how the search scales the result to a larger
-    /// corpus are all recorded on `RerankCalibration`.
+    /// Runs once, at training, over the training sample and `centroids`, the
+    /// codebook just fitted to it, on a quantizer of `pq`'s shape that holds
+    /// that codebook. What it measures, why the queries come from the sample
+    /// itself, and how the search scales the result to a larger corpus are
+    /// all recorded on `RerankCalibration`.
     ///
     /// Returns `None` where the measurement would be spent for nothing.
     /// `quantized_only` never reranks, so it is not calibrated.
-    fn calibrate_rerank(&self, pq: &PQ, sample: &[Vec<f32>]) -> Option<RerankCalibration> {
+    fn calibrate_rerank(
+        &self,
+        pq: &PQ,
+        centroids: &[Vec<Vec<f32>>],
+        sample: &[Vec<f32>],
+    ) -> Result<Option<RerankCalibration>, String> {
         let keeps_raw = self
             .dense()
             .quantization_config
             .as_ref()
             .is_some_and(|config| config.storage_mode == StorageMode::QuantizedWithRaw);
         if !keeps_raw {
-            return None;
+            return Ok(None);
         }
 
-        calibrate_rerank_from_sample(pq, sample, raw_distance_fn(&self.dense().metric))
+        let fitted = Arc::new(PQ::new(
+            pq.dim(),
+            pq.subvectors(),
+            pq.bits(),
+            pq.training_size,
+            pq.max_training_vectors,
+        ));
+        fitted.install(centroids.to_vec())?;
+        Ok(calibrate_rerank_from_sample(
+            &fitted,
+            &self.dense().metric,
+            sample,
+        ))
     }
 
     /// The body of `rebuild_with_quantization`, with the writers guard already held
@@ -529,13 +625,14 @@ impl Collection {
     /// call, so the two entry points are separate rather than one taking the guard
     /// twice and deadlocking on itself.
     ///
-    /// Errors are `String`, which `rebuild_with_quantization` turns into the
-    /// `Error::Engine` the binding raises as the `RuntimeError` it always
-    /// raised, and the training path formats into its own message.
+    /// Errors are `Error::Engine`, which the binding raises as `RuntimeError`
+    /// and the training path formats into its own message, except a
+    /// replacement with no room for a record, which is refused with the
+    /// room's refusal as a rebuild gives it and installs nothing.
     pub(super) fn rebuild_with_quantization_locked(
         &self,
         writers: &MutationGuard<'_>,
-    ) -> Result<bool, String> {
+    ) -> Result<bool, Error> {
         if self.dense().declares_int8() {
             return self.rebuild_with_int8_locked(writers);
         }
@@ -608,7 +705,7 @@ impl Collection {
                 let vector_refs: Vec<&[f32]> = with_raw.iter().map(|&(_, vector)| vector).collect();
                 let quantized_codes = pq.quantize_batch(&vector_refs).map_err(|e| {
                     error!(target: LOG_TARGET, operation = "quantization_rebuild", error = %e, "Failed to quantize vectors");
-                    format!("Failed to quantize vectors: {}", e)
+                    Error::Engine(format!("Failed to quantize vectors: {}", e))
                 })?;
 
                 // Store quantized codes. Codes for records that have no raw vector
@@ -686,7 +783,10 @@ impl Collection {
             new_hnsw.insert_batch_pq(&batch)
                 .map_err(|e| {
                     error!(target: LOG_TARGET, operation = "quantization_rebuild", error = %e, "Failed to insert quantized vectors");
-                    format!("Failed to insert quantized vectors: {}", e)
+                    match e {
+                        Error::GraphFull { .. } => e.in_rebuild(),
+                        e => Error::Engine(format!("Failed to insert quantized vectors: {}", e)),
+                    }
                 })?;
         }
 
@@ -700,11 +800,11 @@ impl Collection {
                 held_records = held,
                 "Refusing the rebuild, some held records have no codes"
             );
-            return Err(format!(
+            return Err(Error::Engine(format!(
                 "the quantized rebuild built {} nodes for the {} records the index holds",
                 new_hnsw.nb_points(),
                 held
-            ));
+            )));
         }
 
         // The raw vectors survive the transition, where the storage mode keeps
@@ -737,7 +837,9 @@ impl Collection {
                     .collect();
                 new_hnsw
                     .adopt_raw_from(old_hnsw, &source, self.dense().dim)
-                    .map_err(|e| format!("Failed to carry the raw vectors over: {}", e))?;
+                    .map_err(|e| {
+                        Error::Engine(format!("Failed to carry the raw vectors over: {}", e))
+                    })?;
                 // The store that carries them is opened at the number of
                 // records present now, which is the training sample, and the
                 // rest of the corpus is still coming. Every record after this
@@ -789,9 +891,9 @@ impl Collection {
     ///
     /// Re-encodes whatever raw vectors the index still holds through the
     /// trained codebook and rebuilds the graph from the stored codes. It never
-    /// retrains the codebook; training runs exactly once, on the `add` that
-    /// reaches `training_size`. Returns false when there is no trained
-    /// quantizer or nothing stored to rebuild from. Takes the mutation guard,
+    /// retrains the codebook. Returns false when there is no trained
+    /// quantizer, or when a product quantized collection holds nothing to
+    /// rebuild from. Takes the mutation guard,
     /// which the training path already holds when it reaches the body, and
     /// hands the record over before the body runs, whether or not the body
     /// turns out to rebuild, since a replay of the record decides that the
@@ -801,7 +903,6 @@ impl Collection {
         self.record(|| Operation::RebuildQuantized)?;
         self.commit_records()?;
         self.rebuild_with_quantization_locked(&writers)
-            .map_err(Error::Engine)
     }
 
     /// How far the training collection has come, as a percentage, and 100 on
@@ -820,6 +921,19 @@ impl Collection {
         }
     }
 
+    /// [`Collection::training_progress`] without waiting; see
+    /// [`Collection::try_len`].
+    pub fn try_training_progress(&self) -> Option<f32> {
+        let Some(config) = &self.dense().quantization_config else {
+            return Some(0.0);
+        };
+        if self.dense().try_can_use_quantization()? {
+            return Some(100.0);
+        }
+        let training_ids = self.training_ids.try_read()?;
+        Some((training_ids.len() as f32 / config.training_size as f32 * 100.0).min(100.0))
+    }
+
     /// Get number of training vectors still needed
     pub fn training_vectors_needed(&self) -> usize {
         if let Some(config) = &self.dense().quantization_config {
@@ -834,6 +948,19 @@ impl Collection {
         }
     }
 
+    /// [`Collection::training_vectors_needed`] without waiting; see
+    /// [`Collection::try_len`].
+    pub fn try_training_vectors_needed(&self) -> Option<usize> {
+        let Some(config) = &self.dense().quantization_config else {
+            return Some(0);
+        };
+        if self.training_threshold_reached.load(Ordering::Acquire) {
+            return Some(0);
+        }
+        let training_ids = self.training_ids.try_read()?;
+        Some(config.training_size.saturating_sub(training_ids.len()))
+    }
+
     /// Check if training is ready to be triggered
     pub fn is_training_ready(&self) -> bool {
         self.training_threshold_reached.load(Ordering::Acquire)
@@ -843,9 +970,10 @@ impl Collection {
 #[cfg(test)]
 mod tests {
     use super::TRAINING_SAMPLE_SEED;
-    use crate::{calibrate_rerank_from_sample, raw_distance_fn};
+    use crate::calibrate_rerank_from_sample;
     use rand::seq::SliceRandom;
     use rand::SeedableRng;
+    use std::sync::Arc;
     use zeusdb_vector_core::{test_support::clustered, SeededRng, PQ};
 
     /// The shuffle the training sample is drawn in is fixed by its seed, so two
@@ -888,12 +1016,141 @@ mod tests {
         // And the calibration over the shuffled sample is reproducible, given
         // the codebook. One codebook is fitted here and both calibrations read
         // it, so what this holds is the calibration alone.
-        let pq = PQ::new(32, 8, 6, 500, None);
+        let pq = Arc::new(PQ::new(32, 8, 6, 500, None));
         pq.train(&after).unwrap();
-        let first = calibrate_rerank_from_sample(&pq, &after, raw_distance_fn("cosine")).unwrap();
-        let second = calibrate_rerank_from_sample(&pq, &after, raw_distance_fn("cosine")).unwrap();
+        let first = calibrate_rerank_from_sample(&pq, "cosine", &after).unwrap();
+        let second = calibrate_rerank_from_sample(&pq, "cosine", &after).unwrap();
         assert_eq!(first.fetch, second.fetch);
         assert_eq!(first.fit_fetches, second.fit_fetches);
         assert_eq!(first.exponent, second.exponent);
+    }
+
+    /// The rerank calibration measures each true neighbour's depth in the
+    /// order a search of its index reads the candidates in. On a trained
+    /// `quantized_with_raw` collection, under cosine and under l2, the fetch
+    /// it measured at each page over the whole training sample is the fetch
+    /// the pooled ranks give where every record of the sample is ranked by
+    /// the score a traversal gives it, on a graph made for the collection's
+    /// space over the codes of the collection's codebook.
+    #[test]
+    fn the_calibration_measures_depth_in_the_order_its_index_traverses() {
+        use crate::collection::{Collection, Declaration, ParsedRecord, StorageMode};
+        use crate::raw_distance_fn;
+        use crate::rerank::{
+            RERANK_CALIBRATION_PAGES, RERANK_CALIBRATION_QUERIES, RERANK_CALIBRATION_TARGET,
+        };
+        use std::collections::HashMap;
+        use zeusdb_vector_core::{Position, VectorGraph, NB_LAYER_MAX};
+
+        const RECORDS: usize = 1_000;
+        const DIM: usize = 32;
+        for metric in ["cosine", "l2"] {
+            let declared = Declaration::validate(DIM, metric, 16, 200, RECORDS, vec![]).unwrap();
+            let quantization = declared
+                .quantization(8, 6, RECORDS, None, StorageMode::QuantizedWithRaw)
+                .unwrap();
+            let collection = Collection::build(declared, Some(quantization));
+            // Each vector as the binding hands it over, processed for the
+            // space, which is what the index stores and trains on.
+            let stored: Vec<Vec<f32>> = clustered(RECORDS, DIM, 0x0226)
+                .into_iter()
+                .map(|vector| collection.process_vector_for_space(vector))
+                .collect();
+            let records: Vec<ParsedRecord> = stored
+                .iter()
+                .enumerate()
+                .map(|(i, vector)| ParsedRecord {
+                    id: format!("r{i:04}"),
+                    vector: vector.clone(),
+                    sparse: None,
+                    metadata: HashMap::new(),
+                })
+                .collect();
+            let added = collection.add_records(records, vec![], false);
+            assert_eq!(added.total_errors, 0, "{metric}: {:?}", added.errors);
+            assert!(collection.is_quantized(), "{metric}");
+            let calibration = collection.rerank_calibration().expect("calibrated");
+
+            // The training sample, being every record's stored vector in the
+            // order the records arrived, shuffled under the training's seed,
+            // and a graph over its codes in that order, so node `k` holds
+            // the sample's record `k`.
+            let mut order: Vec<usize> = (0..RECORDS).collect();
+            order.shuffle(&mut SeededRng::seed_from_u64(TRAINING_SAMPLE_SEED));
+            let sample: Vec<&[f32]> = order.iter().map(|&i| stored[i].as_slice()).collect();
+            let pq = collection
+                .pq()
+                .expect("a product quantized collection")
+                .clone();
+            let codes = pq.quantize_batch(&sample).unwrap();
+            let batch: Vec<(&Vec<u8>, usize, Position)> = codes
+                .iter()
+                .enumerate()
+                .map(|(k, code)| (code, k + 1, Position::from_slot(k)))
+                .collect();
+            let mut graph =
+                VectorGraph::new_pq(metric, 16, RECORDS, NB_LAYER_MAX as usize, 200, pq);
+            graph.insert_batch_pq(&batch).unwrap();
+            assert!((0..RECORDS).all(|k| graph.codes_at(k as u32) == Some(codes[k].as_slice())));
+
+            // Each query's exact neighbours by the space's raw distance,
+            // ordered by distance and then by their place in the sample, and
+            // each one's rank among the other records of the sample by the
+            // traversal's score.
+            let distance = raw_distance_fn(metric);
+            let deepest = *RERANK_CALIBRATION_PAGES.last().unwrap();
+            let stride = (RECORDS / RERANK_CALIBRATION_QUERIES).max(1);
+            let per_query: Vec<Vec<usize>> = (0..RECORDS)
+                .step_by(stride)
+                .take(RERANK_CALIBRATION_QUERIES)
+                .map(|q| {
+                    let mut exact: Vec<(f32, usize)> = (0..RECORDS)
+                        .filter(|&i| i != q)
+                        .map(|i| (distance(sample[q], sample[i]), i))
+                        .collect();
+                    exact.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+                    exact.truncate(deepest);
+                    let traversed: Vec<f32> = {
+                        let scores = graph.code_scores(sample[q]).unwrap().unwrap();
+                        (0..RECORDS)
+                            .map(|i| {
+                                if i == q {
+                                    f32::INFINITY
+                                } else {
+                                    scores.at(i as u32).unwrap()
+                                }
+                            })
+                            .collect()
+                    };
+                    let mut ordered = traversed.clone();
+                    ordered.sort_by(|a, b| a.total_cmp(b));
+                    exact
+                        .iter()
+                        .map(|&(_, i)| 1 + ordered.partition_point(|&d| d < traversed[i]))
+                        .collect()
+                })
+                .collect();
+            let expected: Vec<usize> = RERANK_CALIBRATION_PAGES
+                .iter()
+                .map(|&page| {
+                    let mut pool: Vec<usize> = per_query
+                        .iter()
+                        .flat_map(|ranks| ranks.iter().take(page).copied())
+                        .collect();
+                    pool.sort_unstable();
+                    let at = ((RERANK_CALIBRATION_TARGET * pool.len() as f64).ceil() as usize)
+                        .clamp(1, pool.len());
+                    pool[at - 1]
+                })
+                .collect();
+            assert_eq!(
+                calibration.page_fetches.to_vec(),
+                expected,
+                "{metric}: the calibration measured the fetches at pages \
+                 {RERANK_CALIBRATION_PAGES:?} as {:?}, and the ranks in the order the index \
+                 traverses give {expected:?}",
+                calibration.page_fetches
+            );
+        }
     }
 }

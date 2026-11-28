@@ -145,13 +145,12 @@ fn quantized_graph_depends_on_the_data() {
     );
 }
 
-/// A graph whose distances all tie leaves every node with one neighbour,
-/// because the diversity heuristic in `select_neighbours` rejects a
-/// candidate that is at least as close to an already chosen neighbour as it
-/// is to the new point, and under a total tie that is every candidate after
-/// the first. Measured on the shipped code, layer zero out-degree was
-/// exactly one for 99.64 percent of nodes and a traversal reached 33 of
-/// 10,000.
+/// The quantized graph's layer zero is no star: fewer than one node in a
+/// hundred keeps one neighbour or none, and the mean out-degree is above half
+/// of `m`. Under a total tie `select_neighbours` keeps each candidate it pops
+/// until the budget is full, since a tie prunes nothing, so a graph built on
+/// a constant distance shows in `quantized_graph_depends_on_the_data` rather
+/// than as a star here.
 #[test]
 fn quantized_graph_layer_zero_out_degree() {
     let f = fixture();

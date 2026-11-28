@@ -1,15 +1,18 @@
 //! The engine's floor.
 //!
 //! What every index crate stands on, and it names nothing of Python: the
-//! error type, the checksum, the seeded generator, the filter language and
+//! error type, the checksum, the clock and the spellings for the times an
+//! index's files record, the seeded generator, the filter language and
 //! the column store that answers it, the distance kernels, the product
 //! quantizer, the scalar codec, the graph with its dump format, the seam every index sits
 //! behind, being the index trait, the admit family and the persistence traits
 //! in `space` and `admit`, the fusion that combines several indexes'
 //! pages into one, the write-ahead journal's format with its reader and
 //! the operations it records, the storage a saved collection is kept in
-//! with its one implementation over the filesystem, and the abort hook a
-//! crash test kills a process at. The binding takes this crate as a path
+//! with its one implementation over the filesystem, the abort hook a crash
+//! test kills a process at, and the hook a test panics or pauses at inside a
+//! mutation.
+//! The binding takes this crate as a path
 //! dependency and reaches it through the re-exports below, so the crate's
 //! surface is this file's `pub use` list and nothing else.
 //! Every module is private. An item a module marks `pub` that this file does
@@ -32,12 +35,24 @@
 //! `cargo test -p zeusdb-vector-core` compiles this crate and its
 //! dependencies alone. The `test-support` feature exposes [`test_support`]
 //! for a test in another crate that measures against the same data, and
-//! nothing but a test target turns it on.
+//! nothing but a test target turns it on. The `pause-points` feature, which
+//! `test-support` turns on, exposes the points a test panics or pauses at;
+//! the binding's own `test-support` feature turns it on for the extension
+//! the interpreter checks run against. See `panic_point`.
 #![warn(unreachable_pub)]
+// A narrowing cast in this crate's library code states its bound in an
+// `#[expect]` beside it, so a cast with no stated bound fails the lint gate,
+// and an `#[expect]` whose cast is gone fails it too. Test code is left out.
+#![cfg_attr(not(test), warn(clippy::cast_possible_truncation))]
 
 mod admit;
+// The test build's allocator, which holds every request to a ceiling and a
+// fuzzer's reads to a bound. See `allocations`.
+#[cfg(any(test, feature = "test-support"))]
+mod allocations;
 mod bitmap;
 mod checksum;
+mod clock;
 mod columns;
 mod distance;
 mod error;
@@ -50,11 +65,14 @@ mod int8;
 mod journal;
 mod kill;
 mod metadata;
+mod metadata_value;
 mod operation;
+mod panic_point;
 mod pq;
 mod rng;
 mod space;
 mod storage;
+mod table;
 // Test data two test modules measure against, so it is defined once.
 #[cfg(any(test, feature = "test-support"))]
 mod test_vectors;
@@ -62,29 +80,56 @@ mod test_vectors;
 pub use admit::{Admit, And, Candidates};
 pub use bitmap::Bitmap;
 pub use checksum::checksum_of;
+pub use clock::Timestamp;
 pub use columns::{validate_indexed_fields, ColumnParts, ColumnStore, Selection};
-pub use distance::{CosineDist, DistPQ, DotDist, Int8Dist, Int8Metric, L1Dist, L2Dist, PqMetric};
+pub use distance::{
+    norm_f64, not_finite_words, past_bound_words, raw_distance, screen, CodeKernel, CosineDist,
+    DistPQ, DotDist, Int8Dist, Int8Metric, L1Dist, L2Dist, PqMetric, Screen, NORM_BOUND,
+};
 pub use error::{Error, Exception};
 pub use filter::{compile_filter, matches_filter, FieldLookup, Filter};
+// The frame fuzz mutator, for the fuzzers in the crates whose payloads are
+// framed. Present under the `test-support` feature and in this crate's own
+// tests; see `frame::fuzz`.
+#[cfg(any(test, feature = "test-support"))]
+pub use frame::fuzz as frame_fuzz;
 pub use frame::{
-    begin as frame_begin, finish as frame_finish, frame, fuzz as frame_fuzz, unframe,
-    FrameEncoding, FrameKind, Framed, FRAME_HEADER_BYTES, FRAME_MAGIC, FRAME_OVERHEAD_BYTES,
-    FRAME_TRAILER_BYTES,
+    begin as frame_begin, finish as frame_finish, frame, unframe, FrameEncoding, FrameKind, Framed,
+    FRAME_HEADER_BYTES, FRAME_MAGIC, FRAME_OVERHEAD_BYTES, FRAME_TRAILER_BYTES,
 };
 pub use fusion::{fuse, Contribution, FusedHit, Fusion, DEFAULT_RRF_K};
+// The dump fuzzer's mutator, for a fuzzer in another crate that mutates a
+// saved directory's dump. Present under the `test-support` feature and in
+// this crate's own tests; see `graph::dump_fuzz`.
 pub use graph::dump::{DUMP_FILENAME, LEGACY_DUMP_FILENAMES, NB_LAYER_MAX};
+#[cfg(any(test, feature = "test-support"))]
+pub use graph::dump_fuzz;
+#[cfg(any(test, feature = "test-support"))]
+pub use graph::GRAPH_CEILINGS;
 pub use graph::{
-    restore_graph, restore_int8_graph, Distance, DumpBounds, GraphHit, Planned, Record, VectorGraph,
+    restore_graph, restore_int8_graph, CodeScores, Distance, DumpBounds, DumpRefusal, DumpRegion,
+    DumpRows, GraphCeilings, GraphHit, GraphRoom, Planned, Record, Restored, RowValues,
+    VectorGraph,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use ids::ID_CEILINGS;
 pub use ids::{refuse_unnamable, IdParts, IdStore, MAX_INTERNAL_ID};
 pub use int8::Int8Codec;
+#[cfg(any(test, feature = "test-support"))]
+pub use journal::encode_legacy_header;
+// The length a writer on the calling thread rolls at, for the tests that
+// reach a roll. Compiled away when `debug_assertions` are off.
+#[cfg(debug_assertions)]
+pub use journal::set_segment_roll_bytes;
 pub use journal::{
-    encode_journal_header, encode_journal_record, read_journal, CommitMode, JournalContents,
-    JournalDamage, JournalHeader, JournalKind, JournalRecord, JournalSyncHandle, JournalWriter,
-    OperationKind, JOURNAL_HEADER_BYTES, JOURNAL_MAGIC, JOURNAL_MAX_PAYLOAD,
-    JOURNAL_RECORD_CHECKSUM_BYTES, JOURNAL_RECORD_HEADER_BYTES, JOURNAL_RECORD_OVERHEAD_BYTES,
+    encode_journal_record, encode_segment_header, read_legacy_journal, read_segment_header,
+    read_segments, read_segments_for_repair, unknown_kind_at, whole_records_from, CommitMode, Cut,
+    Expected, JournalContents, JournalDamage, JournalKind, JournalRecord, JournalSyncHandle,
+    JournalWriter, LegacyContents, LegacyHeader, LiveRecord, OperationKind, RecordState,
+    ResumeFailure, SegmentBase, SegmentBytes, SegmentHeader, SegmentReport, StaleSegment,
+    Withdrawal, JOURNAL_MAGIC, JOURNAL_MAX_PAYLOAD, JOURNAL_RECORD_CHECKSUM_BYTES,
+    JOURNAL_RECORD_HEADER_BYTES, JOURNAL_RECORD_OVERHEAD_BYTES, LEGACY_HEADER_BYTES,
+    SEGMENT_HEADER_BYTES, SEGMENT_ROLL_BYTES,
 };
 // The abort hook the crash tests kill a process at. Compiled away when
 // `debug_assertions` are off, which is every profile the wheel is built
@@ -95,18 +140,38 @@ pub use kill::{
 #[cfg(any(test, feature = "test-support"))]
 pub use metadata::{MetadataCopy, MoveHook, METADATA_MOVE_HOOK};
 pub use metadata::{MetadataParts, MetadataStore, RecordFields};
-pub use operation::{InsertParts, Operation};
+pub use metadata_value::{record_metadata, MetadataValue, METADATA_MAX_DEPTH};
+pub use operation::{
+    AbortReason, Fitted, FittedRef, InsertParts, Operation, Values, STAMP_CEILING,
+};
+// The hook a test panics or pauses at inside a mutation, and the pause it
+// waits on. An empty function in every build without the `pause-points`
+// feature; see `panic_point`.
+#[cfg(any(test, feature = "pause-points"))]
+pub use panic_point::{
+    arm as panic_arm, disarm as panic_disarm, pause_arm, pause_call, pause_disarm, Pause, PauseAt,
+    PauseState,
+};
+pub use panic_point::{at as panic_at, PanicPoint};
 pub use pq::PQ;
 pub use rng::SeededRng;
 pub use space::{
-    read_artefact, write_artefact, ArtefactRecord, Bounds, Budget, CorpusStats, Cost, Dense, Hit,
-    Hits, IdfScope, Inventory, Kind, Ledger, Persist, Position, PositionWalk, Prepared, RecordId,
-    Restore, ScoreKind, Selectivity, SpaceKind, SpaceName, Sparse, SparseRef, SparseVector,
-    VectorIndex,
+    magnitude_bits, read_artefact, write_artefact, ArtefactRecord, Bounds, Budget, CorpusStats,
+    Cost, Dense, Hit, Hits, IdfScope, Inventory, Kind, Ledger, Persist, Position, PositionWalk,
+    Prepared, RecordId, Restore, ScoreKind, Selectivity, SpaceKind, SpaceName, Sparse, SparseRef,
+    SparseVector, VectorIndex, SPARSE_BOUND,
 };
+// The directory syncs a test makes fail. Present under the `test-support`
+// feature and in this crate's own tests; see `storage`.
+#[cfg(any(test, feature = "test-support"))]
+pub use storage::directory_sync_faults;
 pub use storage::{
-    ArtefactWriter, Dir, FsDir, FsStorage, JournalFile, Staged, Storage, JOURNAL_SUFFIX,
+    close_lock_files_in_forked_child, hold_lock_files_for_fork, refuses_writes,
+    release_lock_files_after_fork, ArtefactWriter, Dir, FsDir, FsStorage, JournalDir, JournalFile,
+    LockFailure, LockGuard, LockMode, Locked, Staged, Storage, JOURNAL_SUFFIX,
+    LEGACY_JOURNAL_SUFFIX, LOCK_SUFFIX, SEGMENT_SUFFIX,
 };
+pub use table::{bucket_capacity, table_buckets, table_bytes_of, SizedMap, HASH_CONTROL_TAIL};
 
 /// What a test in another crate measures against.
 ///
@@ -114,5 +179,8 @@ pub use storage::{
 /// and absent from every other build.
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support {
+    pub use crate::allocations::{bounded, read_bound, Bounded, CEILING};
+    pub use crate::graph::RESERVE_BYTES as GRAPH_RESERVE_BYTES;
+    pub use crate::pq::quantizer_fits;
     pub use crate::test_vectors::clustered;
 }

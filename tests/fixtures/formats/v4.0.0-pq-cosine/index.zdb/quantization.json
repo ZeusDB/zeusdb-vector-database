@@ -1,0 +1,24 @@
+{
+  "type": "pq",
+  "subvectors": 4,
+  "bits": 4,
+  "training_size": 1000,
+  "max_training_vectors": null,
+  "storage_mode": "quantized_only",
+  "is_trained": true,
+  "training_completed_at": "2026-10-22T08:44:30.207764200+00:00",
+  "memory_stats": {
+    "centroid_storage_mb": 0.00048828125,
+    "compression_ratio": 8.0,
+    "centroids_per_subvector": 16,
+    "total_centroids": 64
+  },
+  "pq_config": {
+    "dim": 8,
+    "sub_dim": 2,
+    "num_centroids": 16
+  },
+  "training_ids": [],
+  "training_threshold_reached": true,
+  "rerank_calibration": null
+}

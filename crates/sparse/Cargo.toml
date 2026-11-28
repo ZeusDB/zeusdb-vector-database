@@ -5,6 +5,12 @@
 # that, and `cargo test -p zeusdb-vector-sparse` links no Python library.
 [package]
 name = "zeusdb-vector-sparse"
+# What the crate is, and where the wheel's documentation is, an address the
+# root Cargo.toml declares once. cargo package, which maturin sdist runs on
+# each crate the wheel builds from, warns where a manifest has no
+# description, or has none of documentation, homepage and repository.
+description = "The sparse index, a mutable postings index over the engine's floor."
+documentation.workspace = true
 # The version, the edition and the licence are the workspace's, declared once
 # in the root Cargo.toml.
 version.workspace = true
@@ -16,10 +22,12 @@ publish = false
 
 [features]
 # The close-up made in place and the view of every part, for a test in
-# another crate that holds the close-up built off to the side to them. Off
-# in every build that is not a test, so the wheel carries neither. The
-# collection's crate turns it on through its dev-dependency on this crate,
-# which cargo applies to that crate's test targets and to nothing else.
+# another crate that holds the close-up built off to the side to them, and
+# the forward arena's ceiling, for a test that lowers it to reach the
+# refusal. Off in every build that is not a test, so the wheel carries none
+# of them. The collection's crate turns it on through its dev-dependency on
+# this crate, which cargo applies to that crate's test targets and to
+# nothing else.
 test-support = ["zeusdb-vector-core/test-support"]
 
 # Every version is the workspace's, declared once in the root Cargo.toml with

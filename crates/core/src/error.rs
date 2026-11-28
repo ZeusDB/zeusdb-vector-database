@@ -11,9 +11,8 @@
 //! select a phrase from a field, count and pluralise, or truncate a list, and
 //! a hand written arm keeps that in the one place the message lives.
 //!
-//! The messages are the ones the engine has always raised, byte for byte. A
-//! message that reads badly is kept as it is; changing one is a change to what
-//! a caller sees and is made on its own.
+//! A message that reads badly is kept as it is; changing one is a change to
+//! what a caller sees and is made on its own.
 
 use std::fmt;
 use std::path::PathBuf;
@@ -180,8 +179,13 @@ pub enum Error {
     SearchVectorEmpty,
     /// A query vector of the wrong width
     SearchVectorDimension { expected: usize, got: usize },
-    /// A query vector holding a NaN or an infinity
-    SearchVectorNotFinite { index: usize, value: f32 },
+    /// A query vector holding a NaN or an infinity, with the value the
+    /// caller gave there where a reader of the query read it
+    SearchVectorNotFinite {
+        index: usize,
+        value: f32,
+        given: Option<f64>,
+    },
     /// A record vector with no components
     VectorEmpty,
     /// A record vector of the wrong width
@@ -194,11 +198,13 @@ pub enum Error {
         expected: usize,
         got: usize,
     },
-    /// A vector in a query batch holding a NaN or an infinity
+    /// A vector in a query batch holding a NaN or an infinity, with the
+    /// value the caller gave there where a reader of the batch read it
     BatchVectorNotFinite {
         position: usize,
         index: usize,
         value: f32,
+        given: Option<f64>,
     },
     /// A NumPy array whose shape is not `(N, dim)`
     BatchArrayShape { dim: usize, shape: Vec<usize> },
@@ -375,12 +381,17 @@ pub enum Error {
     /// A journal's file header cannot be read
     JournalHeaderInvalid { file: String, detail: String },
     /// A record fails and records follow it, so its bytes changed after it
-    /// was written
+    /// was written. `cut_sequence` and `cut_at` are the record and the byte
+    /// in the same file a repair cuts at, being the first record of the call
+    /// the damage is in, or the damaged record itself in a journal of format
+    /// version 1, which frames no call.
     JournalCorrupt {
         file: String,
         sequence: u64,
         at: u64,
         detail: String,
+        cut_sequence: u64,
+        cut_at: u64,
     },
     /// A record's payload does not decode
     JournalRecordInvalid {
@@ -433,8 +444,16 @@ pub enum Error {
         detail: String,
     },
     /// A commit of the journal failed, so its records were refused and
-    /// nothing more is recorded until a checkpoint reconciles the journal
+    /// withdrawn where the journal allowed, and nothing more is recorded
+    /// until a checkpoint commits
     JournalCommitFailed { sequence: u64, error: String },
+    /// A checkpoint moved its directory into place and the folder it sits
+    /// in could not be synced, so nothing more is recorded until a
+    /// checkpoint commits
+    CheckpointNotDurable { target: String, error: String },
+    /// A load could not make the directory it read durable, its entries
+    /// and its name, before it changed the journal beside it
+    DirectoryNotDurable { directory: String, error: String },
     /// A checkpoint was asked of a collection that has no journal
     NotJournaled,
 
@@ -466,6 +485,19 @@ pub enum Error {
     },
     /// The staged index could not be moved into an empty place
     MoveIntoPlaceFailed { target: PathBuf, error: String },
+    /// A directory a save wrote could not be synced, so nothing moved
+    SaveSyncFailed {
+        directory: PathBuf,
+        target: PathBuf,
+        error: String,
+    },
+    /// The saved directory moved into place and the folder it sits in could
+    /// not be synced. `kept` names the directory it replaced, kept aside
+    SaveMoveNotDurable {
+        target: PathBuf,
+        error: String,
+        kept: Option<PathBuf>,
+    },
     /// A directory tree could not be removed
     RemoveTreeFailed {
         path: PathBuf,
@@ -552,12 +584,12 @@ pub enum Error {
     },
     /// The raw store of a `quantized_with_raw` index could not be restored
     RestoreRawFailed(String),
-    /// The restored record count is not the one config.json records
+    /// The restored record count is not the one config.json records.
+    /// `source` is a sentence naming where the restored records came from
     RestoredCountMismatch {
         restored: usize,
         expected: usize,
-        raw_count: usize,
-        code_count: usize,
+        source: String,
     },
     /// The codebook's shape is not the one quantization.json describes
     CodebookShapeMismatch {
@@ -575,18 +607,171 @@ pub enum Error {
     /// A scalar quantization artefact, or a field of quantization.json
     /// under `int8`, outside the bounds the loader holds it to
     Int8ArtefactInvalid { file: String, detail: String },
-    /// Records held as codes with no codebook to reconstruct them
+    /// Records held as codes in a directory whose quantization.json records
+    /// no trained codebook
     CodesWithoutCodebook { count: usize },
-    /// A record's codes did not reconstruct
-    ReconstructFailed {
-        id: String,
-        codes: usize,
-        error: String,
-    },
     /// The directory to load is not there
     IndexDirectoryNotFound { path: String },
     /// An artefact did not serialize
     SerializeFailed { what: &'static str, error: String },
+
+    // ------------------------------------------------------------------
+    // The journal of segments and the lock. Appended after every variant
+    // above, and none wider than the widest above, so the type's size and
+    // the tags of the variants above stay as they were.
+    // ------------------------------------------------------------------
+    /// The journal's segments do not form one history: out of order, a gap,
+    /// an overlap, an empty segment that is not the last, or a framing
+    /// record naming the wrong sequence
+    JournalSegmentsInvalid { journal: String, detail: String },
+    /// A segment holding records above the directory's sequence follows
+    /// another checkpoint than the directory's
+    JournalNotThisCheckpoint { file: String, detail: String },
+    /// A mutation in a process forked from the one that opened the journal
+    JournalForked { recorded: u32, current: u32 },
+    /// Another holder has the collection's lock
+    CollectionLocked { path: String, holder: String },
+    /// The filesystem cannot lock the collection
+    LockUnavailable { path: String, error: String },
+    /// A collection read from a directory this process cannot write
+    CollectionReadOnly { directory: String, reason: String },
+
+    // ------------------------------------------------------------------
+    // The backup and the target of a save. Appended after every variant
+    // above, and none wider than the widest above.
+    // ------------------------------------------------------------------
+    /// A backup was asked of the directory the collection's journal sits
+    /// beside
+    BackupIntoOwnDirectory { path: String },
+    /// A backup was asked of a directory with a journal beside it
+    BackupTargetJournaled { path: String, journal: String },
+    /// A save was asked of a path holding a file, or a folder of entries and
+    /// no `manifest.json` a save writes
+    TargetNotAnIndex { path: String, holds: String },
+
+    // ------------------------------------------------------------------
+    // The directory at format 5.0.0. Appended after every variant above,
+    // and none wider than the widest above.
+    // ------------------------------------------------------------------
+    /// The graph dump of a directory at format 5.x fails a check of its
+    /// header, its identity region or its rows region, which hold the only
+    /// copy of each record's stored row. `detail` reads after "since"
+    GraphDumpInvalid { name: String, detail: String },
+    /// A field of `manifest.json` at format 5.x does not describe the
+    /// directory. `detail` reads after "manifest.json"
+    ManifestFieldInvalid { detail: String },
+    /// A product quantized field of quantization.json outside the rule
+    /// create() applies. `detail` names the fields and the rule
+    QuantizationFieldInvalidInFile { file: String, detail: String },
+    /// The directory holds features this build does not know, marked
+    /// `read_only`, in name order. The collection refuses every change, every
+    /// save, a checkpoint, a journal and a backup
+    FeatureReadOnly { path: String, features: Vec<String> },
+    /// A directory holding features this build does not know, marked
+    /// `read_only`, holds a journal record of a kind this build cannot replay
+    FeatureJournalUnreadable {
+        path: String,
+        features: Vec<String>,
+        kind: u16,
+        sequence: u64,
+    },
+
+    // ------------------------------------------------------------------
+    // The ceilings of the graph's arenas, the sparse forward store and a
+    // term. Appended after every variant above, and none wider than the
+    // widest above.
+    // ------------------------------------------------------------------
+    /// A record the graph cannot be sure to place. `held` is what the
+    /// `arena` holds, `admitted` what the records the call admitted before
+    /// this one may add to it, `needed` what this record may add, and
+    /// `ceiling` what the arena can address. `call` is set where the record
+    /// would fit were it the only record the call admitted, and `rebuild`
+    /// where the graph is the replacement a rebuild or a load builds; see
+    /// [`Error::in_rebuild`]
+    GraphFull {
+        arena: &'static str,
+        held: usize,
+        admitted: usize,
+        needed: usize,
+        ceiling: usize,
+        call: bool,
+        rebuild: bool,
+    },
+    /// A sparse record whose nonzeros would take its space's forward store
+    /// past the offsets the store can address. `admitted` is the nonzeros
+    /// of the records the call admitted before this one
+    SparseForwardFull {
+        space: String,
+        held: usize,
+        admitted: usize,
+        nnz: usize,
+        ceiling: usize,
+    },
+    /// A term longer than a text space stores for one term
+    TermTooLong { bytes: usize, ceiling: usize },
+
+    // ------------------------------------------------------------------
+    // A call that panicked, a removed record inserted again and a negative
+    // count. Appended after every variant above, and none wider than the
+    // widest above.
+    // ------------------------------------------------------------------
+    /// A call that panicked inside the engine. `operation` names the call as
+    /// a caller writes it and `cause` is what the panic said. `stopped` is
+    /// set where the call was made on an index, which then refuses every
+    /// call with this refusal, naming the first call that panicked; a load
+    /// and the creation of an index have no index to stop
+    Panicked {
+        operation: &'static str,
+        cause: String,
+        stopped: bool,
+    },
+    /// An insert under an internal id the index holds as removed, which it
+    /// holds until a compaction or a close-up drops the removed records
+    RecordRemoved { id: u32 },
+    /// A count or a size a call takes, given below zero
+    ArgumentNegative { name: &'static str, value: i64 },
+
+    // ------------------------------------------------------------------
+    // A vector past the bound on its norm. Appended after every variant
+    // above, and none wider than the widest above.
+    // ------------------------------------------------------------------
+    /// A query vector of an index under l2, dot or l1 whose Euclidean norm
+    /// passes [`NORM_BOUND`](crate::NORM_BOUND)
+    SearchVectorPastBound { norm: f64 },
+    /// A vector in a query batch of an index under l2, dot or l1 whose
+    /// Euclidean norm passes [`NORM_BOUND`](crate::NORM_BOUND)
+    BatchVectorPastBound { position: usize, norm: f64 },
+
+    // ------------------------------------------------------------------
+    // A sparse value past the bound on its magnitude. Appended after every
+    // variant above, and none wider than the widest above.
+    // ------------------------------------------------------------------
+    /// A finite value of a sparse vector, offered to `add()` or to a sparse
+    /// arm of `query()`, whose magnitude passes
+    /// [`SPARSE_BOUND`](crate::SPARSE_BOUND)
+    SparseValuePastBound { index: usize, value: f32 },
+
+    // ------------------------------------------------------------------
+    // The lock a save takes. Appended after every variant above, and none
+    // wider than the widest above.
+    // ------------------------------------------------------------------
+    /// A save or a backup into a directory whose lock file this process
+    /// cannot open to write, so it cannot hold the lock exclusive
+    LockFileReadOnly { path: String, error: String },
+
+    // ------------------------------------------------------------------
+    // A plain load's refusal of damage a repair handles. Appended after
+    // every variant above, and none wider than the widest above.
+    // ------------------------------------------------------------------
+    /// The refusal `refusal` of a journal a load did not repair, where a
+    /// load with `repair=True` keeps every record before `cut_sequence` and
+    /// cuts the file holding that record at byte `cut_at`. It is raised as
+    /// the refusal's own class
+    JournalRepairable {
+        refusal: Box<Error>,
+        cut_sequence: u64,
+        cut_at: u64,
+    },
 }
 
 impl Error {
@@ -626,11 +811,13 @@ impl Error {
             | SearchVectorEmpty
             | SearchVectorDimension { .. }
             | SearchVectorNotFinite { .. }
+            | SearchVectorPastBound { .. }
             | VectorEmpty
             | VectorDimension { .. }
             | VectorNotFinite { .. }
             | BatchVectorDimension { .. }
             | BatchVectorNotFinite { .. }
+            | BatchVectorPastBound { .. }
             | BatchArrayShape { .. }
             | BatchEmpty
             | BatchVectorEmpty { .. }
@@ -649,6 +836,7 @@ impl Error {
             | BitsOutOfRangeInFile { .. }
             | SubvectorsZeroInFile { .. }
             | SubvectorsInvalidInFile { .. }
+            | QuantizationFieldInvalidInFile { .. }
             | SpaceNameEmpty
             | SpaceDeclaredTwice { .. }
             | SpacesTooMany { .. }
@@ -657,6 +845,7 @@ impl Error {
             | SparseVectorShape { .. }
             | SparseDimsNotIncreasing { .. }
             | SparseValueNotFinite { .. }
+            | SparseValuePastBound { .. }
             | JournalRecordTooLarge { .. }
             | SparseValueNotPositive { .. }
             | SparseValueNotWhole { .. }
@@ -666,7 +855,9 @@ impl Error {
             | QueryArmsEmpty
             | QueryArmsTooMany { .. }
             | FetchTooLarge { .. }
-            | FusionConstantInvalid { .. } => Exception::Value,
+            | FusionConstantInvalid { .. }
+            | UnsupportedSpace { .. }
+            | ArgumentNegative { .. } => Exception::Value,
 
             RecordsAbsent { .. }
             | ListCursorMissing { .. }
@@ -695,8 +886,7 @@ impl Error {
             | IndexDirectoryNotFound { .. }
             | JournalMissing { .. } => Exception::FileNotFound,
 
-            UnsupportedSpace { .. }
-            | NoQuantizer
+            NoQuantizer
             | CompactRefused { .. }
             | ReinsertCodesFailed(_)
             | AdoptRawFailed(_)
@@ -714,6 +904,8 @@ impl Error {
             | MoveAsideFailed { .. }
             | MoveIntoPlaceFailedAfterAside { .. }
             | MoveIntoPlaceFailed { .. }
+            | SaveSyncFailed { .. }
+            | SaveMoveNotDurable { .. }
             | RemoveTreeFailed { .. }
             | ArtefactCreateFailed { .. }
             | ArtefactWriteFailed { .. }
@@ -730,7 +922,6 @@ impl Error {
             | Int8ArtefactInvalid { .. }
             | CodebookAllZero
             | CodesWithoutCodebook { .. }
-            | ReconstructFailed { .. }
             | SerializeFailed { .. }
             | JournalHeaderInvalid { .. }
             | JournalCorrupt { .. }
@@ -743,7 +934,65 @@ impl Error {
             | JournalStartsAfterCheckpoint { .. }
             | JournalReplayFailed { .. }
             | JournalCommitFailed { .. }
-            | NotJournaled => Exception::Runtime,
+            | CheckpointNotDurable { .. }
+            | DirectoryNotDurable { .. }
+            | NotJournaled
+            | JournalSegmentsInvalid { .. }
+            | JournalNotThisCheckpoint { .. }
+            | JournalForked { .. }
+            | CollectionLocked { .. }
+            | LockUnavailable { .. }
+            | CollectionReadOnly { .. }
+            | LockFileReadOnly { .. }
+            | BackupIntoOwnDirectory { .. }
+            | BackupTargetJournaled { .. }
+            | TargetNotAnIndex { .. }
+            | GraphDumpInvalid { .. }
+            | ManifestFieldInvalid { .. }
+            | FeatureReadOnly { .. }
+            | FeatureJournalUnreadable { .. }
+            | GraphFull { .. }
+            | SparseForwardFull { .. }
+            | TermTooLong { .. }
+            | Panicked { .. }
+            | RecordRemoved { .. } => Exception::Runtime,
+            JournalRepairable { refusal, .. } => refusal.exception(),
+        }
+    }
+
+    /// `refusal`, of a journal a load did not repair, carrying the cut a
+    /// repair of the same journal makes, so its words name `repair=True`.
+    pub fn repairable(refusal: Error, cut_sequence: u64, cut_at: u64) -> Self {
+        Error::JournalRepairable {
+            refusal: Box::new(refusal),
+            cut_sequence,
+            cut_at,
+        }
+    }
+
+    /// The graph's refusal of a record as a rebuild gives it, and any other
+    /// error as it is. A rebuild or a load inserts every record into a
+    /// replacement graph, so the refusal names that graph and no remedy:
+    /// no smaller call or compaction places the records the index holds.
+    pub fn in_rebuild(self) -> Self {
+        match self {
+            Error::GraphFull {
+                arena,
+                held,
+                admitted,
+                needed,
+                ceiling,
+                ..
+            } => Error::GraphFull {
+                arena,
+                held,
+                admitted,
+                needed,
+                ceiling,
+                call: false,
+                rebuild: true,
+            },
+            other => other,
         }
     }
 
@@ -830,22 +1079,9 @@ impl fmt::Display for Error {
             ),
             ExpectedSizeTooLarge { source, value, max } => write!(
                 f,
-                "{}expected_size must be at most {}, got {}. The graph reserves one \
- slot per \
-                 declared record at creation, 8 bytes each, so this \
- declaration would ask for \
-                 {:.1} GB before a single record is \
- added. That allocation is not fallible: \
-                 above this bound the \
- process aborts rather than raising. expected_size is a \
-                 capacity \
- hint and not a limit, and under-declaring only costs some \
- \
-                 reallocation, so declare what you expect to hold.",
-                source,
-                max,
-                value,
-                (*value as f64 * 8.0) / 1_000_000_000.0
+                "{}expected_size must be at most {}, got {}. An index accepts more \
+                 records than its expected_size declares.",
+                source, max, value
             ),
             MBelowMinimum { source, m } => write!(
                 f,
@@ -970,7 +1206,7 @@ impl fmt::Display for Error {
 
             FilterBranchNotMapping { key, found } => write!(
                 f,
-                "Every entry of \"{}\" must be a filter mapping, for example \
+                "Every entry of \"{}\" must be a filter, for example \
                  {{\"lang\": \"en\"}}, but one of them is {}.",
                 key, found
             ),
@@ -998,11 +1234,19 @@ impl fmt::Display for Error {
                 "Search vector dimension mismatch: expected {}, got {}",
                 expected, got
             ),
-            SearchVectorNotFinite { index, value } => write!(
+            SearchVectorNotFinite {
+                index,
+                value,
+                given,
+            } => write!(
                 f,
                 "Search vector contains invalid value at index {}: {}",
-                index, value
+                index,
+                crate::not_finite_words(*value, *given)
             ),
+            SearchVectorPastBound { norm } => {
+                write!(f, "Search vector {}", crate::past_bound_words(*norm))
+            }
             VectorEmpty => f.write_str("Vector cannot be empty"),
             VectorDimension { expected, got } => write!(
                 f,
@@ -1027,10 +1271,19 @@ impl fmt::Display for Error {
                 position,
                 index,
                 value,
+                given,
             } => write!(
                 f,
                 "Vector {} in batch contains invalid value at index {}: {} (must be finite)",
-                position, index, value
+                position,
+                index,
+                crate::not_finite_words(*value, *given)
+            ),
+            BatchVectorPastBound { position, norm } => write!(
+                f,
+                "Vector {} in batch {}",
+                position,
+                crate::past_bound_words(*norm)
             ),
             BatchArrayShape { dim, shape } => write!(
                 f,
@@ -1131,9 +1384,7 @@ impl fmt::Display for Error {
             ),
             RebuildWithoutChanges => f.write_str(
                 "rebuild() changes m, expected_size, ef_construction or any combination \
-                 of them, and was given none. Rebuilding the graph as it stands is \
-                 compact(), which reclaims the nodes that removals and overwrites leave \
-                 behind.",
+                 of them, and was given none.",
             ),
             NoQuantizer => {
                 f.write_str("Index reports a quantized graph but holds no product quantizer")
@@ -1197,6 +1448,14 @@ impl fmt::Display for Error {
                 f,
                 "Sparse vector contains invalid value at index {}: {} (must be finite)",
                 index, value
+            ),
+            SparseValuePastBound { index, value } => write!(
+                f,
+                "Sparse vector value at index {} is {:e}, and a sparse space takes values of \
+                 at most 2^40, {:e}, in magnitude",
+                index,
+                value,
+                f64::from(crate::SPARSE_BOUND)
             ),
             SparseValueNotPositive { index, value } => write!(
                 f,
@@ -1285,14 +1544,18 @@ impl fmt::Display for Error {
                 sequence,
                 at,
                 detail,
+                cut_sequence,
+                cut_at,
             } => write!(
                 f,
                 "Record {} at byte {} of the journal {} is corrupt ({}) and records \
                  follow it, so it was written whole and its bytes changed afterwards. \
                  Refusing to open, because skipping it would recover a state nothing \
-                 acknowledged. Restore the journal from a copy, or repair it by name \
-                 to cut it at byte {} and lose record {} and everything after it.",
-                sequence, at, file, detail, at, sequence
+                 acknowledged. Restore the journal from a copy, or load the directory \
+                 with repair=True, which keeps every record before record {}, cuts the \
+                 journal at byte {} of the file holding that record, and sets aside \
+                 record {} and every record after it in the journal's quarantine folder.",
+                sequence, at, file, detail, cut_sequence, cut_at, cut_sequence
             ),
             JournalRecordInvalid {
                 file,
@@ -1453,6 +1716,43 @@ impl fmt::Display for Error {
                 target.display(),
                 error
             ),
+            SaveSyncFailed {
+                directory,
+                target,
+                error,
+            } => write!(
+                f,
+                "Failed to sync {} before the saved index moved into place: {}. Nothing was \
+                 moved, and the directory at {} is as it was.",
+                directory.display(),
+                error.strip_suffix('.').unwrap_or(error),
+                target.display()
+            ),
+            SaveMoveNotDurable {
+                target,
+                error,
+                kept,
+            } => {
+                let error = error.strip_suffix('.').unwrap_or(error);
+                match kept {
+                    Some(kept) => write!(
+                        f,
+                        "The saved index is in place at {}, and the folder it sits in could not \
+                         be synced: {}. The move may not survive a power loss, so the index it \
+                         replaced is kept at {} until the next save.",
+                        target.display(),
+                        error,
+                        kept.display()
+                    ),
+                    None => write!(
+                        f,
+                        "The saved index is in place at {}, and the folder it sits in could not \
+                         be synced: {}. The move may not survive a power loss.",
+                        target.display(),
+                        error
+                    ),
+                }
+            }
             RemoveTreeFailed { path, what, error } => write!(
                 f,
                 "Failed to remove {}, which is {}: {}",
@@ -1537,11 +1837,24 @@ impl fmt::Display for Error {
             ),
             JournalCommitFailed { sequence, error } => write!(
                 f,
-                "The journal's commit failed at sequence {}: {} The records that commit was \
-                 to make durable were refused and may or may not be on the device, so \
-                 nothing is recorded until a checkpoint reconciles the journal with the \
-                 directory. Call checkpoint().",
-                sequence, error
+                "The journal's commit failed at sequence {}: {}. A failed sync may also have \
+                 lost records of earlier calls that the device had not yet written, so nothing \
+                 more is recorded until a checkpoint writes the collection from memory. Call \
+                 checkpoint().",
+                sequence,
+                error.strip_suffix('.').unwrap_or(error)
+            ),
+            CheckpointNotDurable { target, error } => write!(
+                f,
+                "The checkpoint moved its directory into place at {} and the folder it sits in \
+                 could not be synced ({}), so nothing more is recorded until checkpoint() \
+                 succeeds.",
+                target, error
+            ),
+            DirectoryNotDurable { directory, error } => write!(
+                f,
+                "Failed to sync the index directory {} and the folder it sits in: {}",
+                directory, error
             ),
             NotJournaled => f.write_str(
                 "This index has no journal, so there is no directory for a checkpoint to \
@@ -1560,7 +1873,8 @@ impl fmt::Display for Error {
                 "manifest.json records an identity this build cannot read: {}. A saved \
                  directory records the id of its collection, its generation counting from 1, \
                  the id of its snapshot and, where it has one, the id of the snapshot it was \
-                 saved from, every id as 32 hexadecimal digits.",
+                 saved from, every id as 32 hexadecimal digits, and from format 5.0.0 the \
+                 journal sequence its state holds.",
                 detail
             ),
             FeatureUnsupported { features, known } => {
@@ -1640,8 +1954,8 @@ impl fmt::Display for Error {
                     f,
                     "manifest.json names {} under files_included and the index directory does \
                      not hold it. {} holds {}. manifest.json is written after every file it \
-                     names except the graph dump, so a directory in this state lost the file \
-                     after the save that wrote it finished, or was copied without it. \
+                     names, so a directory in this state lost the file after the save that \
+                     wrote it finished, or was copied without it. \
                      Refusing to load an index assembled from the files that survived, \
                      because it would not hold what was saved. Restore the directory from a \
                      copy.{}",
@@ -1707,16 +2021,13 @@ impl fmt::Display for Error {
             RestoredCountMismatch {
                 restored,
                 expected,
-                raw_count,
-                code_count,
+                source,
             } => write!(
                 f,
                 "Restored record count does not match config.json: the directory yields {} \
-                 records while config.json reports {}. vectors.bin holds {} records and \
-                 pq_codes.bin holds {}, so a data file is missing or truncated. Refusing to \
-                 load an index that would report a count it cannot produce; restore the \
-                 directory from a copy.",
-                restored, expected, raw_count, code_count
+                 records while config.json reports {}. {} Refusing to load an index that would \
+                 report a count it cannot produce; restore the directory from a copy.",
+                restored, expected, source
             ),
             CodebookShapeMismatch {
                 actual,
@@ -1751,23 +2062,270 @@ impl fmt::Display for Error {
             Int8ArtefactInvalid { file, detail } => write!(f, "{}: {}", file, detail),
             CodesWithoutCodebook { count } => write!(
                 f,
-                "{} records are stored as PQ codes with no raw vector, but the index has \
-                 no codebook to reconstruct them with. pq_codes.bin and quantization.json \
-                 disagree about whether this index was trained, so the directory cannot \
-                 be loaded without dropping those records.",
-                count
-            ),
-            ReconstructFailed { id, codes, error } => write!(
-                f,
-                "Failed to reconstruct record '{}' from its {} PQ codes: {}. The \
-                 codebook in pq_centroids.bin does not fit the codes in pq_codes.bin.",
-                id, codes, error
+                "pq_codes.bin holds codes for {} record{}, and quantization.json records no \
+                 trained codebook to decode them with. The two files disagree about whether \
+                 this index was trained, so the directory cannot be loaded without dropping \
+                 those codes.",
+                count,
+                if *count == 1 { "" } else { "s" }
             ),
             IndexDirectoryNotFound { path } => {
                 write!(f, "Index directory not found: {}", path)
             }
             SerializeFailed { what, error } => {
                 write!(f, "Failed to serialize {}: {}", what, error)
+            }
+            JournalSegmentsInvalid { journal, detail } => write!(
+                f,
+                "The journal {} cannot be read: {}. Nothing in it was replayed.",
+                journal, detail
+            ),
+            JournalNotThisCheckpoint { file, detail } => write!(
+                f,
+                "The journal segment {} {}. A journal holds the mutations made after one \
+                 checkpoint and replays onto that checkpoint alone, so it is not this \
+                 directory's journal and nothing in it was replayed.",
+                file, detail
+            ),
+            JournalForked { recorded, current } => write!(
+                f,
+                "This collection's journal was opened by process {} and this is process {}, a \
+                 child forked from it. The child shares the parent's open journal, so a record \
+                 it appended would land in the parent's file. Nothing was recorded. Change the \
+                 collection in the process that opened it.",
+                recorded, current
+            ),
+            CollectionLocked { path, holder } => write!(
+                f,
+                "The collection at {} is held by {}, so it cannot be opened, saved or journaled \
+                 here. A journaled collection holds its directory for as long as it lives, a \
+                 save for the save and a load while it reads. Let the other collection go, or \
+                 wait for the other process to finish, and try again.",
+                path, holder
+            ),
+            LockUnavailable { path, error } => write!(
+                f,
+                "The lock file {} cannot be locked: {}. This build journals and saves only \
+                 where it can lock the collection against a second writer, so nothing was \
+                 written. The lock file sits beside the directory, so the folder it is in must \
+                 take a new file, on a filesystem that supports file locks.",
+                path, error
+            ),
+            CollectionReadOnly { directory, reason } => write!(
+                f,
+                "The collection was read from {}, which this process cannot write: {}. It holds \
+                 every record the directory and its journal hold and refuses every change, \
+                 since a change it could not journal would be lost. Save it into another \
+                 directory to copy it somewhere writable.",
+                directory, reason
+            ),
+            LockFileReadOnly { path, error } => write!(
+                f,
+                "The lock file {} cannot be opened to write: {}. A save or a backup writes a \
+                 directory only while it holds this lock exclusive, so nothing was written. \
+                 Make the lock file writable, or save into another directory.",
+                path, error
+            ),
+            JournalRepairable {
+                refusal,
+                cut_sequence,
+                cut_at,
+            } => {
+                let words = refusal.to_string();
+                let stop = if words.ends_with('.') { "" } else { "." };
+                write!(
+                    f,
+                    "{}{} Restore the journal from a copy, or load the directory with \
+                     repair=True, which keeps every record before record {}, cuts the journal \
+                     at byte {} of the file holding that record, and sets aside record {} and \
+                     every record after it in the journal's quarantine folder.",
+                    words, stop, cut_sequence, cut_at, cut_sequence
+                )
+            }
+            BackupIntoOwnDirectory { path } => write!(
+                f,
+                "This collection's journal sits beside {}, so that directory is the \
+                 collection's own, and checkpoint() is what writes it. A backup writes a copy \
+                 into another directory.",
+                path
+            ),
+            BackupTargetJournaled { path, journal } => write!(
+                f,
+                "A journal sits beside {} at {}. A backup replaces the directory at its path \
+                 whole, which would leave that journal's records with no directory to replay \
+                 onto, so nothing was written. Back up into another path.",
+                path, journal
+            ),
+            TargetNotAnIndex { path, holds } => write!(
+                f,
+                "{} holds {}, so it is not an index directory, and a save replaces the \
+                 directory at its path whole, which would delete what it holds. Nothing was \
+                 written. Save into a new or empty path, or into a directory an earlier save \
+                 wrote.",
+                path, holds
+            ),
+            GraphDumpInvalid { name, detail } => write!(
+                f,
+                "The graph dump {} cannot be used, since {}. At format 5.0.0 the dump holds the \
+                 only copy of each record's stored vector, code or row, so the directory cannot \
+                 open without it. Restore the directory from a copy, such as one backup() wrote.",
+                name, detail
+            ),
+            ManifestFieldInvalid { detail } => write!(
+                f,
+                "manifest.json {}. A save writes every field of manifest.json from the \
+                 directory it describes, so this manifest does not describe the directory. \
+                 Restore the directory from a copy.",
+                detail
+            ),
+            QuantizationFieldInvalidInFile { file, detail } => write!(
+                f,
+                "{}: {}, so this file does not describe an index this build can rebuild.",
+                file, detail
+            ),
+            FeatureReadOnly { path, features } => {
+                let (noun, object) = if features.len() == 1 {
+                    ("feature", "the feature")
+                } else {
+                    ("features", "them")
+                };
+                write!(
+                    f,
+                    "The directory {} holds the {} {}, which this build does not know. Its \
+                     manifest marks {} read_only, so this build reads every record the \
+                     directory holds and refuses every change, every save, a checkpoint, a \
+                     journal and a backup, since a directory this build wrote would not hold \
+                     the {}. Upgrade the package to change the collection.",
+                    path,
+                    noun,
+                    quoted_list(features),
+                    object,
+                    noun
+                )
+            }
+            FeatureJournalUnreadable {
+                path,
+                features,
+                kind,
+                sequence,
+            } => write!(
+                f,
+                "The directory {} holds the {} {}, which this build does not know and its \
+                 manifest marks read_only, and its journal holds a record of kind {} at \
+                 sequence {}, which this build cannot replay. Load it with \
+                 checkpoint_only=True to read the directory as its last save left it, or \
+                 upgrade the package.",
+                path,
+                if features.len() == 1 {
+                    "feature"
+                } else {
+                    "features"
+                },
+                quoted_list(features),
+                kind,
+                sequence
+            ),
+            GraphFull {
+                arena,
+                held,
+                needed,
+                ceiling,
+                rebuild: true,
+                ..
+            } => write!(
+                f,
+                "The rebuilt graph is full: its {} number {} of the {} it can address, and the \
+                 next record to go in can add up to {}.",
+                arena, held, ceiling, needed
+            ),
+            GraphFull {
+                arena,
+                held,
+                admitted,
+                needed,
+                ceiling,
+                call: true,
+                rebuild: false,
+            } => write!(
+                f,
+                "This call is too large to place at once: the graph's {} number {}, the \
+                 records the call admitted before this one can add up to {} more and this one \
+                 up to {}, and the graph can address {}. The graph has room for the record on \
+                 its own, so add the records across smaller calls.",
+                arena, held, admitted, needed, ceiling
+            ),
+            GraphFull {
+                arena,
+                held,
+                needed,
+                ceiling,
+                call: false,
+                rebuild: false,
+                ..
+            } => write!(
+                f,
+                "The graph is full: its {} number {} of the {} it can address, and one more \
+                 record can add up to {}. compact() rebuilds the graph without the nodes that \
+                 removed and replaced records leave in it.",
+                arena, held, ceiling, needed
+            ),
+            SparseForwardFull {
+                space,
+                held,
+                admitted,
+                nnz,
+                ceiling,
+            } => write!(
+                f,
+                "The sparse space '{}' cannot take the record: its forward store holds {} \
+                 nonzeros{}, the record carries {}, and the store can address {}. compact() \
+                 reclaims the nonzeros of removed records.",
+                space,
+                held,
+                if *admitted > 0 {
+                    format!(", the records this call admitted before it carry {} more", admitted)
+                } else {
+                    String::new()
+                },
+                nnz,
+                ceiling
+            ),
+            TermTooLong { bytes, ceiling } => write!(
+                f,
+                "A term of {} bytes is longer than the {} bytes a text space stores for one \
+                 term.",
+                bytes, ceiling
+            ),
+            Panicked {
+                operation,
+                cause,
+                stopped: true,
+            } => write!(
+                f,
+                "This index stopped when {} failed inside the engine: {}. It refuses every \
+                 call from then on, since the failed call may have left a change part made. \
+                 Drop it, and load() opens the directory it was saved or journaled to.",
+                operation,
+                cause.trim_end_matches('.')
+            ),
+            Panicked {
+                operation,
+                cause,
+                stopped: false,
+            } => write!(
+                f,
+                "{} failed inside the engine: {}.",
+                operation,
+                cause.trim_end_matches('.')
+            ),
+            RecordRemoved { id } => write!(
+                f,
+                "Record {} was removed from this space and cannot be added again. An internal \
+                 id is never reused.",
+                id
+            ),
+            ArgumentNegative { name, value } => {
+                write!(f, "{} cannot be negative, got {}", name, value)
             }
         }
     }

@@ -28,7 +28,7 @@ pub(crate) struct TestGraph<T, D> {
 
 impl<T, D> TestGraph<T, D>
 where
-    T: Clone + Send + Sync,
+    T: Clone + Send + Sync + PartialEq,
     D: Distance<T> + Send + Sync,
 {
     /// Build a graph by inserting every record in order, as `add()` does.

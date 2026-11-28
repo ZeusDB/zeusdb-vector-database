@@ -51,6 +51,8 @@
 //! | `journal_tests` | a directory and the journal beside it |
 //! | `query` | a query over one or more arms, its plan and its fused page |
 //! | `search` | the four paths that reach the graph, and the page they build |
+//! | `stop` | the rule a panic inside a call keeps, which stops the index |
+//! | `stop_tests` | a panic inside a call, and what every later call sees |
 //! | `training` | fitting the codebook and rebuilding over the codes |
 //! | `stats` | what the index reports about itself |
 //! | `persist` | the accessors and setters `persistence.rs` speaks to |
@@ -74,15 +76,25 @@
 
 mod apply;
 #[cfg(test)]
+mod backup_tests;
+#[cfg(test)]
+mod bound_tests;
+#[cfg(test)]
 mod close_up_tests;
 mod construct;
 #[cfg(test)]
 mod crash_tests;
 mod dense;
 #[cfg(test)]
+mod directory_sync_tests;
+#[cfg(test)]
+mod directory_tests;
+#[cfg(test)]
 mod durability_tests;
 #[cfg(test)]
 mod features_tests;
+#[cfg(test)]
+mod finite_tests;
 #[cfg(test)]
 mod id_range_tests;
 #[cfg(test)]
@@ -92,13 +104,18 @@ mod insert;
 #[cfg(test)]
 mod int8_tests;
 #[cfg(test)]
+mod journal_support;
+#[cfg(test)]
 mod journal_tests;
+#[cfg(test)]
+mod lock_tests;
 #[cfg(test)]
 mod mutation_tests;
 #[cfg(test)]
 mod numbering_tests;
 mod page;
 mod persist;
+pub(crate) use persist::{BoundSources, DumpOutcome};
 #[cfg(test)]
 mod persist_tests;
 #[cfg(test)]
@@ -107,12 +124,25 @@ mod query;
 #[cfg(test)]
 mod query_tests;
 #[cfg(test)]
+mod read_only_tests;
+#[cfg(test)]
+mod repair_tests;
+#[cfg(test)]
 mod replay_tests;
 mod search;
 #[cfg(test)]
+mod segment_tests;
+#[cfg(test)]
 mod spaces_tests;
 mod stats;
+mod stop;
+#[cfg(test)]
+mod stop_tests;
 mod training;
+#[cfg(test)]
+mod traversal_tests;
+#[cfg(test)]
+mod upgrade_tests;
 
 // The declaration rules, so that `persistence::load_config` applies the same
 // ones to `config.json` that `Declaration::validate` applies to a caller's
@@ -121,9 +151,7 @@ pub use construct::Declaration;
 pub(crate) use construct::{
     validate_index_parameters, validate_space_supports_quantization, SparseDeclaration,
 };
-pub(crate) use dense::{
-    read_internal_id, shifted_internal_id, DenseIndex, DenseOpen, DenseParts, PositionReader,
-};
+pub(crate) use dense::{DenseIndex, DenseOpen, DenseParts, DenseRestored};
 pub use insert::{Added, RebuildPlan};
 pub use page::{FieldRef, HitRef, QueryHits};
 pub use query::{
@@ -131,20 +159,22 @@ pub use query::{
 };
 pub use search::SparseHits;
 pub use stats::{QuantizationReport, QuantizerReport};
+pub(crate) use stop::panic_words;
+pub use stop::run_without_index;
 
 use crate::journal::Durability;
 use crate::locks::{MutexAt, RwLockAt};
 use crate::RerankCalibration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use tracing::{trace, warn};
 use zeusdb_vector_core::{
     matches_filter, ColumnStore, Error, Filter, IdStore, Int8Codec, MetadataStore, Operation,
-    OperationKind, Persist, Position, Selection, SpaceName, SparseVector, VectorGraph, VectorIndex,
-    PQ,
+    OperationKind, Persist, Position, SegmentBase, Selection, SizedMap, SpaceName, SparseVector,
+    VectorGraph, VectorIndex, Withdrawal, PQ,
 };
 use zeusdb_vector_sparse::{PostingsIndex, SparseConfig};
 use zeusdb_vector_text::{count_record_with, TermDictionary, Tokenizer, TokenizerConfig};
@@ -222,23 +252,44 @@ impl From<(String, Vec<f32>, HashMap<String, Value>)> for ParsedRecord {
 /// through [`Collection::apply`], hands nothing here.
 ///
 /// Beyond the two a mutation uses, the trait carries what a checkpoint asks
-/// of the sink, being the sync, the sequence it has reached, the truncation
-/// once the directory holds those records, and the two values a manifest
-/// records so that a directory and its records are paired by content. They
-/// are on the trait rather than reached by detaching the sink around the
-/// save, because detaching and attaching each take the mutation guard and
-/// release it, and a mutation running in the window between the save and the
-/// reattachment would land in neither the directory nor the records.
+/// of the sink, being the sync, the sequence it has reached, the roll onto a
+/// segment naming the directory once the directory holds those records, and
+/// the two values a manifest records so that a directory and its records
+/// are paired by content. They are on the trait rather than reached by
+/// detaching the sink around the save, because detaching and attaching each
+/// take the mutation guard and release it, and a mutation running in the
+/// window between the save and the reattachment would land in neither the
+/// directory nor the records.
 pub trait OperationSink: Send + std::fmt::Debug {
     /// Take one record's bytes. Called with `writers` held on every
     /// mutation path and with the dictionary's write guard held for an
     /// interning, and with nothing else. A refusal refuses the mutation
-    /// before it runs, with the error carried out to the caller.
+    /// before it runs, with the error carried out to the caller, and leaves
+    /// nothing of the record behind.
     fn append(&mut self, kind: OperationKind, payload: &[u8]) -> Result<(), Error>;
 
-    /// Make everything appended so far durable, after the last record of a
-    /// call and before the call mutates anything a search can see.
+    /// The refusal of a process other than the one that opened the sink,
+    /// which is a child forked from it, or `None` in that process. The
+    /// collection asks it before any fault the sink holds, since the
+    /// checkpoint a fault's words ask for is one such a child cannot take.
+    /// The default answers `None`, for a sink that no process owns.
+    fn forked(&self) -> Option<Error> {
+        None
+    }
+
+    /// Close what was appended since the last commit and make it durable
+    /// under the sink's policy, after the last record of a call and before
+    /// the call mutates anything a search can see. A commit that fails
+    /// withdraws those records where the sink can, and its error says what
+    /// the withdrawal achieved.
     fn commit(&mut self) -> Result<(), Error>;
+
+    /// Withdraw what was appended since the last commit, after an append of
+    /// the call failed once its admission was over, and say what the
+    /// withdrawal achieved. The default holds nothing to withdraw.
+    fn withdraw(&mut self) -> Withdrawal {
+        Withdrawal::Nothing
+    }
 
     /// Make everything appended so far durable whatever the policy, which a
     /// checkpoint does before it records the sequence it is about to hold.
@@ -260,10 +311,12 @@ pub trait OperationSink: Send + std::fmt::Debug {
         0
     }
 
-    /// Drop every record handed over so far, which the checkpoint that just
-    /// ran now holds. Called after the save has committed its directory and
-    /// never before.
-    fn truncate(&mut self) -> Result<(), Error> {
+    /// Go on after the checkpoint `base`, which has just committed its
+    /// directory and holds every record handed over so far, and drop those
+    /// records. Called after the save has committed its directory and never
+    /// before.
+    fn roll(&mut self, base: SegmentBase) -> Result<(), Error> {
+        let _ = base;
         Ok(())
     }
 
@@ -294,10 +347,57 @@ pub trait OperationSink: Send + std::fmt::Debug {
         None
     }
 
-    /// The size of this sink's file, where it is a file, so a caller can
-    /// see what a replay would read.
+    /// The bytes of every segment this sink's journal holds, where it is a
+    /// journal, so a caller can see what a replay would read.
     fn journal_bytes(&self) -> Option<u64> {
         None
+    }
+
+    /// The segments this sink's journal holds, where it is a journal.
+    fn journal_segments(&self) -> Option<usize> {
+        None
+    }
+
+    /// Operation records committed since the checkpoint the sink follows,
+    /// which is what a replay applies, where the sink counts them.
+    fn committed_operations(&self) -> Option<u64> {
+        None
+    }
+
+    /// The directory this sink's collection was read from and why it cannot
+    /// be written, for a sink that takes no record at all. The collection
+    /// refuses every mutation, a checkpoint, a journal and a save into that
+    /// directory with it.
+    fn read_only(&self) -> Option<(&std::path::Path, &str)> {
+        None
+    }
+
+    /// The features that make this sink's collection read only, where the
+    /// directory it was read from holds features this build does not know
+    /// and its manifest marks `read_only`, in name order. The collection then
+    /// refuses a save into any directory and a backup as well, with
+    /// [`Error::FeatureReadOnly`].
+    fn read_only_features(&self) -> Option<&[String]> {
+        None
+    }
+
+    /// The generation that makes this sink's collection read only, where
+    /// the directory it was read from records the largest a manifest can
+    /// hold. The collection then refuses every mutation, a checkpoint, a
+    /// save into any directory and a backup in the words of
+    /// [`generation_exhausted`], since each records the next generation.
+    fn read_only_generation(&self) -> Option<u64> {
+        None
+    }
+
+    /// Whether this sink's collection is read only for a value its
+    /// directory holds past the bound on a vector's norm or on a sparse
+    /// value. The collection then
+    /// refuses every mutation, a checkpoint, a save into any directory and a
+    /// backup in the words of the sink's reason, since each would write that
+    /// value again.
+    fn read_only_bound(&self) -> bool {
+        false
     }
 
     /// The interval policy's thread, for the tests that hold it to its
@@ -308,18 +408,66 @@ pub trait OperationSink: Send + std::fmt::Debug {
     }
 }
 
+/// What the refusal of a sink that takes nothing names: the directory the
+/// collection was read from, why it cannot be written, and the features
+/// that make it read only where those do.
+pub(crate) struct Refusing {
+    directory: String,
+    reason: String,
+    features: Option<Vec<String>>,
+    generation: Option<u64>,
+    bound: bool,
+}
+
+impl Refusing {
+    /// What `sink` refuses with, where it takes nothing.
+    fn of(sink: &dyn OperationSink) -> Option<Self> {
+        let (directory, reason) = sink.read_only()?;
+        Some(Refusing {
+            directory: directory.display().to_string(),
+            reason: reason.to_string(),
+            features: sink.read_only_features().map(<[String]>::to_vec),
+            generation: sink.read_only_generation(),
+            bound: sink.read_only_bound(),
+        })
+    }
+
+    /// The refusal: the generation's words for a generation, the reason's
+    /// own words for a value past the bound, [`Error::FeatureReadOnly`] for
+    /// features and [`Error::CollectionReadOnly`] for a medium.
+    pub(crate) fn error(&self) -> Error {
+        if let Some(generation) = self.generation {
+            return Error::Engine(generation_exhausted(generation));
+        }
+        if self.bound {
+            return Error::Engine(self.reason.clone());
+        }
+        match &self.features {
+            Some(features) => Error::FeatureReadOnly {
+                path: self.directory.clone(),
+                features: features.clone(),
+            },
+            None => Error::CollectionReadOnly {
+                directory: self.directory.clone(),
+                reason: self.reason.clone(),
+            },
+        }
+    }
+}
+
 /// The sink a collection hands its records to, and the fault a failed
 /// commit left on it.
 ///
-/// A commit that fails leaves the records it was to make durable in the
-/// sink and out of the collection, since the call refuses them, and they
-/// may or may not be on the device. A replay would install them. So a
-/// mutation recorded after them would replay onto a collection holding
-/// records this one refused, and an insert under the same id, which is what
-/// a retry is, would refuse the whole open as a record the collection
-/// already holds. The fault stops that: every record is refused with it
-/// until a checkpoint syncs the journal, records a sequence at or above the
-/// refused records so a replay skips them, and truncates them.
+/// A commit that fails is withdrawn by the sink where it can be, so a
+/// replay does not install the records the call refused. The fault stands
+/// whatever the withdrawal achieved: a failed sync may also have lost
+/// records of earlier calls that the device had not yet written, and a
+/// mutation recorded after such a gap would replay onto a collection
+/// missing what came before it. So every record is refused with the fault
+/// until a checkpoint commits, which writes the collection from memory into
+/// files the failure never touched and rolls the journal onto a segment
+/// naming them. A checkpoint whose own sync fails leaves a fault the same
+/// way, which its commit then clears.
 #[derive(Debug, Default)]
 pub(crate) struct SinkSlot {
     attached: Option<Box<dyn OperationSink>>,
@@ -327,20 +475,40 @@ pub(crate) struct SinkSlot {
 }
 
 /// What the commit that failed said, and the sequence it had reached.
+/// `moved` names the directory a checkpoint moved into place when the fault
+/// is that checkpoint's, whose folder did not sync after the move.
 #[derive(Clone, Debug)]
 struct SinkFault {
     sequence: u64,
     error: String,
+    moved: Option<String>,
+}
+
+impl SinkFault {
+    /// The refusal every record meets while the fault stands.
+    fn refusal(&self) -> Error {
+        match &self.moved {
+            Some(target) => Error::CheckpointNotDurable {
+                target: target.clone(),
+                error: self.error.clone(),
+            },
+            None => Error::JournalCommitFailed {
+                sequence: self.sequence,
+                error: self.error.clone(),
+            },
+        }
+    }
 }
 
 impl SinkSlot {
-    /// The refusal every record meets while the fault stands.
+    /// The refusal every record meets in a child forked from the process
+    /// that opened the sink, and otherwise while the fault stands.
     fn refuse_if_faulted(&self) -> Result<(), Error> {
+        if let Some(forked) = self.attached.as_deref().and_then(|sink| sink.forked()) {
+            return Err(forked);
+        }
         match &self.fault {
-            Some(fault) => Err(Error::JournalCommitFailed {
-                sequence: fault.sequence,
-                error: fault.error.clone(),
-            }),
+            Some(fault) => Err(fault.refusal()),
             None => Ok(()),
         }
     }
@@ -349,24 +517,28 @@ impl SinkSlot {
 /// The journal a collection hands its records to, as a caller sees it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JournalStatus {
-    /// The file.
+    /// The journal, being its directory of segments.
     pub path: std::path::PathBuf,
     /// The policy every commit keeps.
     pub durability: Durability,
     /// The sequence the checkpoint in the directory holds.
     pub checkpoint_sequence: u64,
-    /// The last sequence handed to the journal.
+    /// The last sequence handed to the journal, a commit's or an abort's
+    /// among them.
     pub sequence_reached: u64,
-    /// The file's length, where the filesystem answered.
+    /// Operation records committed since the checkpoint.
+    pub records: u64,
+    /// The bytes of every segment.
     pub bytes: Option<u64>,
+    /// The segments the journal holds.
+    pub segments: usize,
 }
 
 impl JournalStatus {
-    /// Records a replay of the journal would apply, being every record
-    /// above the checkpoint's sequence.
+    /// Records a replay of the journal would apply, being every operation
+    /// record committed above the checkpoint's sequence.
     pub fn records_since_checkpoint(&self) -> u64 {
-        self.sequence_reached
-            .saturating_sub(self.checkpoint_sequence)
+        self.records
     }
 }
 
@@ -381,8 +553,7 @@ impl JournalStatus {
 /// `generation` counts the saves the collection has committed. A new
 /// collection is at 0, its first save writes 1, and every save writes one
 /// more than the generation of the directory the collection last committed
-/// or read, so of two directories of one collection the higher generation
-/// is the later save. It is not the journal's sequence, which counts
+/// or read. It is not the journal's sequence, which counts
 /// records, restarts when `journal_to` opens a journal, and does not move
 /// between two checkpoints with nothing between them.
 ///
@@ -393,8 +564,8 @@ impl JournalStatus {
 ///
 /// `parent` names the snapshot that directory was saved from. A copy left
 /// behind by a later save is therefore the parent the later directory
-/// names, and two directories naming one parent under two snapshots are two
-/// saves from one state.
+/// names, and two directories naming one parent under two snapshots were
+/// both saved from it.
 ///
 /// `snapshot` is absent on a collection that has neither been saved nor
 /// read from a directory that records one. `parent` is absent on a
@@ -413,6 +584,18 @@ pub struct Identity {
     pub parent: Option<u128>,
 }
 
+/// The words a collection refuses a save in, and every mutation where it
+/// was read only for it, when the directory it was read from records
+/// `generation` and that is the largest a manifest can hold.
+pub(crate) fn generation_exhausted(generation: u64) -> String {
+    format!(
+        "This collection was read from a directory recording generation {}, the largest a \
+         manifest can hold, so no save can record the one after it. No release writes that \
+         generation, so the directory's manifest was edited.",
+        generation
+    )
+}
+
 impl Identity {
     /// The identity the next save of a collection at this one records,
     /// under the snapshot `drawn`. `None` where the generation is the
@@ -427,13 +610,34 @@ impl Identity {
     }
 }
 
-/// The part of [`Identity`] a save moves, behind one guard; see the field
-/// on [`Collection`].
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// What a caller reads of a collection's identity, and what a backup
+/// returns of the copy it wrote: the four values of [`Identity`], the time
+/// the manifest of the directory `snapshot` names records as its save, and
+/// the journal sequence that manifest records under `identity`.
+///
+/// `saved_at` is `None` where `snapshot` is, or where that manifest records
+/// no time `Timestamp::parse_rfc3339` reads. `sequence` is 0 where the
+/// directory records none, which is every directory below format 5.0.0 and
+/// every collection never saved.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IdentityRecord {
+    pub identity: Identity,
+    /// The manifest's `saved_at`, a time `Timestamp::parse_rfc3339` reads.
+    pub saved_at: Option<String>,
+    /// The identity's `sequence` in that manifest.
+    pub sequence: u64,
+}
+
+/// The part of [`Identity`] a save moves, with the time and the sequence the
+/// directory it names records, behind one guard; see the field on
+/// [`Collection`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Lineage {
     generation: u64,
     snapshot: Option<u128>,
     parent: Option<u128>,
+    saved_at: Option<String>,
+    sequence: u64,
 }
 
 /// Layers every graph this crate builds is created with.
@@ -588,8 +792,9 @@ impl QuantizationConfig {
     }
 }
 
-/// One page of `list`, as (id, metadata) in ascending internal id.
-pub type Listing = Vec<(String, HashMap<String, Value>)>;
+/// One page of `list`, as (id, metadata) in ascending internal id, each
+/// record's names in code point order.
+pub type Listing = Vec<(String, BTreeMap<String, Value>)>;
 
 /// The name of the dense space the binding declares.
 ///
@@ -597,12 +802,13 @@ pub type Listing = Vec<(String, HashMap<String, Value>)>;
 /// through `Declaration` always holds a dense space under it, first.
 pub const DEFAULT_SPACE: &str = "default";
 
-/// One record as `get_records` returns it: its id, its metadata, and its
-/// vector where one was asked for and the index could supply one.
+/// One record as `get_records` returns it: its id, its metadata with its
+/// names in code point order, and its vector where one was asked for and the
+/// index could supply one.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RecordView {
     pub id: String,
-    pub metadata: HashMap<String, Value>,
+    pub metadata: BTreeMap<String, Value>,
     pub vector: Option<Vec<f32>>,
 }
 
@@ -694,7 +900,9 @@ pub(crate) struct DenseSpace {
     // Quantization configuration and PQ instance
     quantization_config: Option<QuantizationConfig>,
     pq: Option<Arc<PQ>>,
-    pq_codes: RwLockAt<HashMap<String, Vec<u8>>>, // PQ codes storage
+    /// Each quantized record's codes by its id, with the buckets of the
+    /// map's table kept beside it, which a removal leaves.
+    pq_codes: RwLockAt<SizedMap<String, Vec<u8>>>,
 
     /// The scalar codec, once a scalar quantized space has fitted it, and
     /// its trained flag is this slot being filled.
@@ -796,6 +1004,17 @@ impl DenseSpace {
         self.pq.as_ref().is_some_and(|pq| pq.is_trained()) || self.int8.get().is_some()
     }
 
+    /// [`DenseSpace::can_use_quantization`] without waiting for the
+    /// quantizer's lock, and `None` where a writer holds it or a panic
+    /// poisoned it.
+    pub(crate) fn try_can_use_quantization(&self) -> Option<bool> {
+        let fitted = match &self.pq {
+            Some(pq) => pq.try_is_trained()?,
+            None => false,
+        };
+        Some(fitted || self.int8.get().is_some())
+    }
+
     /// Whether the space was declared with scalar quantization, fitted or
     /// not.
     pub(crate) fn declares_int8(&self) -> bool {
@@ -826,6 +1045,16 @@ impl DenseSpace {
             return index.graph().is_quantized();
         }
         false
+    }
+
+    /// [`DenseSpace::is_quantized`] without waiting for the quantizer's lock
+    /// or the index's read guard, and `None` where a writer holds one or a
+    /// panic poisoned one.
+    pub(crate) fn try_is_quantized(&self) -> Option<bool> {
+        if self.try_can_use_quantization()? {
+            return Some(self.index.try_read()?.graph().is_quantized());
+        }
+        Some(false)
     }
 
     /// Whether the storage mode keeps a raw vector beside every code.
@@ -1115,9 +1344,14 @@ pub struct Collection {
     /// nothing said so.
     ///
     /// Splitting them lets each keep the property it needs. `id_counter` still
-    /// resets, so the internal ids start again. This one never goes backwards,
-    /// so a generated id is issued once in the life of an index and survives a
-    /// save and load. See `config.json`'s `generated_ids`.
+    /// resets, so the internal ids start again. This one never goes backwards
+    /// and follows every `vec_N` a record takes, by `follow_generated_id`,
+    /// and a generated id that a record installed since it was issued, or a
+    /// record of the same call, names is moved past under the mutation guard,
+    /// by `add_generated_records`, so a generated id never names a record the
+    /// index holds, across a save and
+    /// a load and a replay of its journal. See `config.json`'s
+    /// `generated_ids`.
     ///
     /// It also stops a generated id burning an internal one. `generate_id` used
     /// to call `get_next_id`, so a batch of three records with no ids of their
@@ -1178,7 +1412,8 @@ pub struct Collection {
     /// journal has had no record appended. A checkpoint syncs the sink,
     /// writes the sequence the sink had reached here, and the manifest
     /// records it, so a recovery replays every record above it and skips
-    /// every record at or below it.
+    /// every record at or below it. A checkpoint whose save fails puts back
+    /// the sequence it replaced.
     journal_sequence: MutexAt<u64>,
 
     /// The generation, snapshot and parent of the directory this collection
@@ -1197,15 +1432,21 @@ pub struct Collection {
     /// Timestamp when the index was created, in RFC 3339.
     ///
     /// Restored from `manifest.json` by the loader. `new_empty` stamps
-    /// `Utc::now()` because it has nothing better to start from, and until the
+    /// `Timestamp::now()` because it has nothing better to start from, and until the
     /// loader wrote the saved value back over it a load reset the field, so a
     /// save of a loaded index recorded the load as the creation.
     created_at: RwLockAt<String>,
 
     /// Set once the index has warned that it holds materially more records than
     /// `expected_size` declared, so the warning fires once rather than on every
-    /// subsequent `add`.
+    /// subsequent `add`, until `clear` or a rebuild naming `expected_size`
+    /// clears it.
     overgrowth_warned: AtomicBool,
+
+    /// What stopped the index, set once by the first call that panicked
+    /// inside it, after which every call made through [`Collection::run`] is
+    /// refused. See the `stop` module.
+    stopped: OnceLock<stop::Stop>,
 }
 
 impl Collection {
@@ -1258,6 +1499,14 @@ impl Collection {
         self.positions_agree_with(true)
     }
 
+    /// Whether the dense space's graph holds its own structure, with the
+    /// first rule it breaks where it does not; see
+    /// `VectorGraph::structure_holds`.
+    #[cfg(test)]
+    pub(crate) fn structure_holds(&self) -> Result<(), String> {
+        self.dense().index.read().unwrap().graph().structure_holds()
+    }
+
     /// [`Collection::positions_agree`] with the holes left unbounded, for a
     /// reader that holds no `writers`, which `get_stats` is. A removal batch
     /// lets its guards go before its close-up builds its copies, so such a
@@ -1306,6 +1555,10 @@ impl Collection {
                 continue;
             }
             held += 1;
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a position, below MAX_INTERNAL_ID, refused at admit and at load"
+            )]
             if graph.record_of_at(node) != at as u32 {
                 return false;
             }
@@ -1378,6 +1631,34 @@ impl Collection {
         })
     }
 
+    /// `error` with the sparse space named in it, where it is a refusal the
+    /// sparse index gave with the space left for its caller to name.
+    pub(crate) fn sparse_refusal_named(&self, error: Error) -> Error {
+        let name = || {
+            self.sparse_named()
+                .map_or_else(String::new, |(name, _)| name.as_str().to_string())
+        };
+        match error {
+            Error::SparseForwardFull {
+                held,
+                admitted,
+                nnz,
+                ceiling,
+                ..
+            } => Error::SparseForwardFull {
+                space: name(),
+                held,
+                admitted,
+                nnz,
+                ceiling,
+            },
+            Error::SparseRecordUnmapped { id, .. } => {
+                Error::SparseRecordUnmapped { space: name(), id }
+            }
+            other => other,
+        }
+    }
+
     /// The prefix a sparse space's artefacts are written under, being
     /// `spaces/<name>/`.
     pub(crate) fn space_prefix(name: &SpaceName) -> String {
@@ -1409,6 +1690,14 @@ impl Collection {
     pub(crate) fn text_layer(&self) -> Result<&TextLayer, Error> {
         let space = self.sparse().ok_or(Error::NoSparseSpace)?;
         space.text.as_ref().ok_or(Error::NoTextLayer)
+    }
+
+    /// The terms the text layer's dictionary holds, and zero where the
+    /// collection has no text layer. A segment of `add` reads it before and
+    /// after its admission, to know whether it interned a term.
+    pub(crate) fn interned_terms(&self) -> usize {
+        self.text_layer()
+            .map_or(0, |layer| layer.dictionary.read().unwrap().len())
     }
 
     /// Every term of `text` as the sparse space's tokenizer hands them over,
@@ -1446,11 +1735,12 @@ impl Collection {
     /// sparse space, or one that takes term ids alone.
     ///
     /// Every term given an id here is handed to the sink as an
-    /// [`Operation::Intern`] at the moment of issue, under the dictionary's
-    /// guard, so the records arrive in id order and each precedes the
-    /// insert whose sparse half carries the id. A sink that refuses the
-    /// record refuses the count, with the term interned, which is the state
-    /// a replay of the records before it reaches.
+    /// [`Operation::Intern`] naming the id it is about to take, under the
+    /// dictionary's guard and before the term is interned, so the records
+    /// arrive in id order and each precedes the insert whose sparse half
+    /// carries the id. A sink that refuses the record refuses the count with
+    /// the term not interned, so the dictionary holds no term a replay of the
+    /// records cannot reach.
     fn count_record_terms(&self, terms: &[String]) -> Result<SparseVector, Error> {
         let layer = self.text_layer()?;
         let mut dictionary = layer.dictionary.write().unwrap();
@@ -1501,7 +1791,7 @@ impl Collection {
     /// What this collection is: its id, and the generation, snapshot and
     /// parent of the directory it last committed or read. See [`Identity`].
     pub fn identity(&self) -> Identity {
-        let lineage = *self.lineage.lock().unwrap();
+        let lineage = self.lineage.lock().unwrap();
         Identity {
             collection_id: self.collection_id,
             generation: lineage.generation,
@@ -1510,16 +1800,34 @@ impl Collection {
         }
     }
 
-    /// Record `identity` as the directory this collection last committed or
+    /// [`Collection::identity`], with the time and the journal sequence the
+    /// directory `snapshot` names records. See [`IdentityRecord`].
+    pub fn identity_record(&self) -> IdentityRecord {
+        let lineage = self.lineage.lock().unwrap();
+        IdentityRecord {
+            identity: Identity {
+                collection_id: self.collection_id,
+                generation: lineage.generation,
+                snapshot: lineage.snapshot,
+                parent: lineage.parent,
+            },
+            saved_at: lineage.saved_at.clone(),
+            sequence: lineage.sequence,
+        }
+    }
+
+    /// Record `record` as the directory this collection last committed or
     /// read, which a save does once its directory is committed and a load
     /// does from the manifest it read. The id is the field's and is set
     /// apart from this.
-    pub(crate) fn set_lineage(&self, identity: &Identity) {
-        debug_assert_eq!(identity.collection_id, self.collection_id);
+    pub(crate) fn set_lineage(&self, record: &IdentityRecord) {
+        debug_assert_eq!(record.identity.collection_id, self.collection_id);
         *self.lineage.lock().unwrap() = Lineage {
-            generation: identity.generation,
-            snapshot: identity.snapshot,
-            parent: identity.parent,
+            generation: record.identity.generation,
+            snapshot: record.identity.snapshot,
+            parent: record.identity.parent,
+            saved_at: record.saved_at.clone(),
+            sequence: record.sequence,
         };
     }
 
@@ -1541,7 +1849,7 @@ impl Collection {
     /// The sink's guard is taken alone and released before the checkpoint
     /// sequence is read, so nothing is held across anything.
     pub fn journal_status(&self) -> Option<JournalStatus> {
-        let (path, durability, sequence_reached, bytes) = {
+        let (path, durability, sequence_reached, records, bytes, segments) = {
             let slot = self.sink.lock().unwrap();
             let sink = slot.attached.as_ref()?;
             let path = sink.journal_path()?.to_path_buf();
@@ -1550,7 +1858,9 @@ impl Collection {
                 path,
                 durability,
                 sink.sequence_reached(),
+                sink.committed_operations().unwrap_or(0),
                 sink.journal_bytes(),
+                sink.journal_segments().unwrap_or(0),
             )
         };
         Some(JournalStatus {
@@ -1558,7 +1868,9 @@ impl Collection {
             durability,
             checkpoint_sequence: self.journal_sequence(),
             sequence_reached,
+            records,
             bytes,
+            segments,
         })
     }
 
@@ -1574,34 +1886,116 @@ impl Collection {
     ///
     /// The mutation guard is the caller's, because a checkpoint syncs and
     /// then saves under one hold, so nothing is handed over between the two.
-    /// A fault a failed commit left stands through this: the sync makes the
-    /// refused records durable, and it is the truncation after the save
-    /// that puts them behind the sequence the directory names.
-    pub(crate) fn sync_sink_locked(&self) -> Result<Option<u64>, Error> {
+    ///
+    /// A sync that fails does not stop the checkpoint, since the save writes
+    /// the collection from memory and its commit makes every record durable
+    /// whatever the journal holds. It is logged, and it leaves a fault where
+    /// none stands, so a save that then fails leaves the collection refusing
+    /// mutations, as a failed commit does. A child forked from the process
+    /// that opened the journal is refused, since its save would race the
+    /// parent's. `backup` says the sync is a backup's, whose commit leaves
+    /// the fault, since a backup does not write the collection's own
+    /// directory. A sync that succeeds clears no fault, and leaves a failed
+    /// sync the interval policy's thread holds where it is.
+    pub(crate) fn sync_sink_locked(&self, backup: bool) -> Result<Option<u64>, Error> {
         let mut slot = self.sink.lock().unwrap();
         let Some(sink) = slot.attached.as_mut() else {
             return Ok(None);
         };
-        sink.sync()?;
-        Ok(Some(sink.sequence_reached()))
+        let synced = sink.sync();
+        let reached = sink.sequence_reached();
+        match synced {
+            Ok(()) => {}
+            Err(error @ Error::JournalForked { .. }) => return Err(error),
+            Err(error) => {
+                let message = error.to_string();
+                if backup {
+                    warn!(target: "zeusdb_vector_database::journal",
+                        operation = "backup_sync_failed",
+                        sequence = reached,
+                        error = %message,
+                        "The journal could not be synced before the backup; the backup writes the \
+                         collection from memory and goes on, and the fault stands until a \
+                         checkpoint commits"
+                    );
+                } else {
+                    warn!(target: "zeusdb_vector_database::journal",
+                        operation = "checkpoint_sync_failed",
+                        sequence = reached,
+                        error = %message,
+                        "The journal could not be synced before the checkpoint; the checkpoint \
+                         writes the collection from memory and goes on, and its commit clears the \
+                         fault"
+                    );
+                }
+                if slot.fault.is_none() {
+                    slot.fault = Some(SinkFault {
+                        sequence: reached,
+                        error: message,
+                        moved: None,
+                    });
+                }
+            }
+        }
+        Ok(Some(reached))
     }
 
-    /// Drop every record the sink holds, which the checkpoint that has just
-    /// committed its directory now holds itself, and with them the fault a
-    /// failed commit left, since the records it refused are now at or below
-    /// the sequence the directory names and a replay skips them. Does
-    /// nothing where no sink is attached. The mutation guard is the
-    /// caller's.
-    pub(crate) fn truncate_sink_locked(&self) -> Result<(), Error> {
+    /// Roll the sink onto the checkpoint `base`, whose directory has just
+    /// committed and holds every record the sink holds, and clear the fault
+    /// a failed commit left, since that directory holds the collection as
+    /// this process has it. The sink's roll discards a failed sync the
+    /// interval policy's thread holds, for the same reason. Does nothing
+    /// where no sink is attached. The
+    /// mutation guard is the caller's. A roll that fails leaves the fault,
+    /// and the sink takes nothing more until a later checkpoint rolls it.
+    pub(crate) fn roll_sink_locked(&self, base: SegmentBase) -> Result<(), Error> {
         let mut slot = self.sink.lock().unwrap();
         match slot.attached.as_mut() {
             Some(sink) => {
-                sink.truncate()?;
+                sink.roll(base)?;
                 slot.fault = None;
                 Ok(())
             }
             None => Ok(()),
         }
+    }
+
+    /// The refusal a collection read only meets for a mutation, a checkpoint
+    /// and a journal, where its sink takes nothing.
+    pub(crate) fn sink_refusal(&self) -> Option<Error> {
+        let slot = self.sink.lock().unwrap();
+        Refusing::of(slot.attached.as_deref()?).map(|refusing| refusing.error())
+    }
+
+    /// Whether the collection is read only for features its directory
+    /// holds, which refuses a save into any directory and a backup.
+    pub(crate) fn sink_read_only_features(&self) -> bool {
+        let slot = self.sink.lock().unwrap();
+        slot.attached
+            .as_ref()
+            .is_some_and(|sink| sink.read_only_features().is_some())
+    }
+
+    /// The refusal of a collection read only for a value its directory
+    /// holds past the bound on a vector's norm or on a sparse value, which
+    /// refuses a save into any
+    /// directory and a backup as well as every mutation and checkpoint, in
+    /// the words of the sink's reason. `None` for every other collection.
+    pub(crate) fn sink_bound_refusal(&self) -> Option<Error> {
+        let slot = self.sink.lock().unwrap();
+        let sink = slot.attached.as_deref()?;
+        if !sink.read_only_bound() {
+            return None;
+        }
+        Refusing::of(sink).map(|refusing| refusing.error())
+    }
+
+    /// The directory a collection read from a medium it cannot write was
+    /// read from, where its sink takes nothing.
+    pub(crate) fn sink_read_only_directory(&self) -> Option<std::path::PathBuf> {
+        let slot = self.sink.lock().unwrap();
+        let (directory, _) = slot.attached.as_ref()?.read_only()?;
+        Some(directory.to_path_buf())
     }
 
     /// The file name and the collection id the sink names, for the manifest
@@ -1638,6 +2032,17 @@ impl Collection {
     /// under `writers`, and skips the encode when none is.
     fn sink_attached(&self) -> bool {
         self.sink.lock().unwrap().attached.is_some()
+    }
+
+    /// Whether a sink is attached, and, where it takes nothing, what its
+    /// refusal names, under one hold of the sink's guard. The insert path
+    /// asks once per batch, under `writers`.
+    fn sink_state(&self) -> (bool, Option<Refusing>) {
+        let slot = self.sink.lock().unwrap();
+        match slot.attached.as_deref() {
+            None => (false, None),
+            Some(sink) => (true, Refusing::of(sink)),
+        }
     }
 
     /// Hand one operation's record to the sink, where one is attached,
@@ -1690,11 +2095,11 @@ impl Collection {
     /// record of a call and before the call mutates.
     ///
     /// A commit that fails is the one failure the seam holds on to. The
-    /// caller refuses every record the commit was to make durable, so they
-    /// are in the sink and not in the collection, and they may or may not
-    /// be on the device. The failure is written onto the slot with the
-    /// sequence the sink had reached, and every record after it is refused
-    /// with it until a checkpoint reconciles the two; see [`SinkSlot`].
+    /// caller refuses every record the commit was to make durable, and the
+    /// sink has withdrawn them where it could. The failure is written onto
+    /// the slot with the sequence the sink had reached, and every record
+    /// after it is refused with it until a checkpoint commits; see
+    /// [`SinkSlot`].
     fn commit_records(&self) -> Result<(), Error> {
         let mut slot = self.sink.lock().unwrap();
         let Some(sink) = slot.attached.as_mut() else {
@@ -1709,16 +2114,131 @@ impl Collection {
                     operation = "journal_commit_failed",
                     sequence = sequence,
                     error = %message,
-                    "The journal's commit failed; its records are refused and nothing is \
-                     recorded until a checkpoint reconciles the journal with the directory"
+                    "The journal's commit failed; its records are refused and withdrawn where \
+                     the journal allowed, and nothing is recorded until a checkpoint commits"
                 );
                 slot.fault = Some(SinkFault {
                     sequence,
                     error: message,
+                    moved: None,
                 });
                 Err(error)
             }
         }
+    }
+
+    /// The refusal a child forked from the process that opened the sink
+    /// meets, where this is such a child; see [`OperationSink::forked`].
+    fn sink_forked(&self) -> Option<Error> {
+        self.sink
+            .lock()
+            .unwrap()
+            .attached
+            .as_deref()
+            .and_then(|sink| sink.forked())
+    }
+
+    /// The fault a failed commit left, where it stands, which a batch reads
+    /// at the start of each segment.
+    fn sink_fault(&self) -> Option<SinkFault> {
+        self.sink.lock().unwrap().fault.clone()
+    }
+
+    /// Withdraw what the sink holds since the last commit, after `error`
+    /// failed an append once a call's admission was over, and leave the
+    /// fault, as a failed commit leaves it. Returns `error` with what the
+    /// withdrawal achieved said after it.
+    ///
+    /// The ids and the levels admission issued for the call stay issued
+    /// while a replay of the withdrawn records may not consume them, so the
+    /// collection takes nothing more until a checkpoint writes it from
+    /// memory. A refusal the sink gives before it writes anything is
+    /// returned as it is: the fault's own, a forked child's, and a sink that
+    /// takes no record.
+    fn withdraw_records(&self, error: Error) -> Error {
+        if matches!(
+            error,
+            Error::JournalCommitFailed { .. }
+                | Error::CheckpointNotDurable { .. }
+                | Error::JournalForked { .. }
+                | Error::CollectionReadOnly { .. }
+                | Error::FeatureReadOnly { .. }
+        ) {
+            return error;
+        }
+        let mut slot = self.sink.lock().unwrap();
+        let Some(sink) = slot.attached.as_mut() else {
+            return error;
+        };
+        let error = sink.withdraw().attach_to(error);
+        let sequence = sink.sequence_reached();
+        let message = error.to_string();
+        tracing::error!(target: "zeusdb_vector_database::journal",
+            operation = "journal_append_failed",
+            sequence = sequence,
+            error = %message,
+            "An append failed once the call's admission was over; the call's records are \
+             refused and withdrawn where the journal allowed, and nothing is recorded until a \
+             checkpoint commits"
+        );
+        slot.fault = Some(SinkFault {
+            sequence,
+            error: message,
+            moved: None,
+        });
+        error
+    }
+
+    /// Leave the fault on the sink after `error`, a failure that no valid
+    /// record reaches once its record has committed, so the collection
+    /// takes nothing more until a checkpoint writes it from memory. Does
+    /// nothing where no sink is attached.
+    fn fault_sink(&self, error: &str) {
+        let mut slot = self.sink.lock().unwrap();
+        let Some(sink) = slot.attached.as_ref() else {
+            return;
+        };
+        let sequence = sink.sequence_reached();
+        tracing::error!(target: "zeusdb_vector_database::journal",
+            operation = "journal_install_failed",
+            sequence = sequence,
+            error = %error,
+            "A committed record could not be installed; nothing is recorded until a checkpoint \
+             commits"
+        );
+        slot.fault = Some(SinkFault {
+            sequence,
+            error: error.to_string(),
+            moved: None,
+        });
+    }
+
+    /// Leave the fault of a checkpoint that moved its directory `target`
+    /// into place and could not sync the folder it sits in, where `error`
+    /// is the sync's. A record taken under the checkpoint the journal still
+    /// follows would not replay over the directory now in place, so nothing
+    /// is recorded until a checkpoint commits. The fault replaces one that
+    /// stands, since this refusal is the one the next checkpoint clears.
+    /// Does nothing where no sink is attached.
+    pub(crate) fn fault_after_move(&self, target: &str, error: &str) {
+        let mut slot = self.sink.lock().unwrap();
+        let Some(sink) = slot.attached.as_ref() else {
+            return;
+        };
+        let sequence = sink.sequence_reached();
+        tracing::error!(target: "zeusdb_vector_database::journal",
+            operation = "checkpoint_not_durable",
+            sequence = sequence,
+            directory = target,
+            error = %error,
+            "A checkpoint moved its directory into place and the folder it sits in could not be \
+             synced; nothing is recorded until a checkpoint commits"
+        );
+        slot.fault = Some(SinkFault {
+            sequence,
+            error: error.to_string(),
+            moved: Some(target.to_string()),
+        });
     }
 
     /// Distinct terms the sparse space's dictionary holds, where it has
@@ -1791,9 +2311,15 @@ impl Collection {
 
     /// The storage mode as `get_storage_mode` reports it.
     ///
-    /// Reaches the graph's read guard through `is_quantized`, so it cannot be
-    /// asked under a storage guard; `remove_point_internal` reads it before it
-    /// takes any.
+    /// Reads each value only where the name depends on it. The declaration
+    /// comes first, the quantizer is asked only on a space that declares one,
+    /// and the graph only once the quantizer is fitted, so a space without
+    /// quantization reads neither. `try_storage_mode` gives the same names
+    /// through `storage_mode_name`.
+    ///
+    /// Reaches the graph's read guard through `is_quantized` where the
+    /// quantizer is fitted, so it cannot be asked under a storage guard;
+    /// `remove_point_internal` reads it before it takes any.
     pub fn storage_mode(&self) -> String {
         if !self.has_quantization() {
             "raw_only".to_string()
@@ -1807,6 +2333,24 @@ impl Collection {
             "quantized_active".to_string()
         } else {
             "raw_trained_not_rebuilt".to_string()
+        }
+    }
+
+    /// The storage mode's name, from whether the quantizer is fitted and
+    /// whether the graph scores against codes.
+    fn storage_mode_name(&self, fitted: bool, active: bool) -> &'static str {
+        if !self.has_quantization() {
+            "raw_only"
+        } else if !fitted {
+            if self.training_threshold_reached.load(Ordering::Acquire) {
+                "raw_ready_for_training"
+            } else {
+                "raw_collecting_for_training"
+            }
+        } else if active {
+            "quantized_active"
+        } else {
+            "raw_trained_not_rebuilt"
         }
     }
 
@@ -1837,20 +2381,117 @@ impl Collection {
         self.ids.read().unwrap().contains_name(id)
     }
 
+    // ------------------------------------------------------------------
+    // The reads a caller holding the interpreter makes without waiting.
+    // Each is the accessor of its name without the `try_` prefix, taking
+    // every guard it takes without waiting, and gives `None` where a writer
+    // holds one of them or a panic poisoned one. The binding asks one of
+    // these with the interpreter held, and asks the waiting accessor with
+    // the interpreter released only where it gives `None`, so a cheap call
+    // pays no hand-off of the interpreter and never waits with it held.
+    // ------------------------------------------------------------------
+
+    /// [`Collection::len`] without waiting.
+    pub fn try_len(&self) -> Option<usize> {
+        Some(self.ids.try_read()?.len())
+    }
+
+    /// [`Collection::contains`] without waiting.
+    pub fn try_contains(&self, id: &str) -> Option<bool> {
+        Some(self.ids.try_read()?.contains_name(id))
+    }
+
+    /// [`Collection::vector_count`] without waiting.
+    pub fn try_vector_count(&self) -> Option<usize> {
+        Some(*self.vector_count.try_lock()?)
+    }
+
+    /// [`Collection::can_use_quantization`] without waiting.
+    pub fn try_can_use_quantization(&self) -> Option<bool> {
+        self.dense().try_can_use_quantization()
+    }
+
+    /// [`Collection::is_quantized`] without waiting.
+    pub fn try_is_quantized(&self) -> Option<bool> {
+        self.dense().try_is_quantized()
+    }
+
+    /// [`Collection::storage_mode`] without waiting.
+    pub fn try_storage_mode(&self) -> Option<String> {
+        let fitted = self.dense().try_can_use_quantization()?;
+        let active = self.dense().try_is_quantized()?;
+        Some(self.storage_mode_name(fitted, active).to_string())
+    }
+
+    /// [`Collection::indexed_fields`] without waiting.
+    pub fn try_indexed_fields(&self) -> Option<Vec<String>> {
+        Some(self.columns.try_read()?.declared().to_vec())
+    }
+
+    /// [`Collection::metadata`] without waiting.
+    pub fn try_metadata(&self, key: &str) -> Option<Option<String>> {
+        Some(self.metadata.try_lock()?.get(key).cloned())
+    }
+
+    /// [`Collection::all_metadata`] without waiting.
+    pub fn try_all_metadata(&self) -> Option<BTreeMap<String, String>> {
+        let meta_lock = self.metadata.try_lock()?;
+        Some(
+            meta_lock
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        )
+    }
+
+    /// The `path` [`Collection::journal_status`] reports, read under the
+    /// sink's guard alone and without waiting.
+    pub fn try_journal_path(&self) -> Option<Option<std::path::PathBuf>> {
+        let slot = self.sink.try_lock()?;
+        Some(slot.attached.as_ref().and_then(|sink| {
+            sink.durability()?;
+            sink.journal_path().map(std::path::Path::to_path_buf)
+        }))
+    }
+
+    /// [`Collection::identity_record`] without waiting.
+    pub fn try_identity_record(&self) -> Option<IdentityRecord> {
+        let lineage = self.lineage.try_lock()?;
+        Some(IdentityRecord {
+            identity: Identity {
+                collection_id: self.collection_id,
+                generation: lineage.generation,
+                snapshot: lineage.snapshot,
+                parent: lineage.parent,
+            },
+            saved_at: lineage.saved_at.clone(),
+            sequence: lineage.sequence,
+        })
+    }
+
+    /// Whether the sparse space has a text layer, read without a guard,
+    /// since the layer is declared at creation and never changes.
+    pub fn takes_text(&self) -> bool {
+        self.sparse().is_some_and(|space| space.text.is_some())
+    }
+
     /// Live records matching a filter, or every live record when none is given.
     ///
-    /// **Exact, and therefore a complete walk.** With a filter this evaluates
-    /// every record's metadata and counts the matches. It cannot stop early:
+    /// **Exact.** Where every field the filter names is declared, this counts
+    /// the bits of the columns' selection. Where some are, it judges the
+    /// metadata of the records the declared fields leave, or of every record
+    /// where they leave more than a third, and where none are, the metadata
+    /// of every record. It cannot stop early:
     /// a count is a statement about the whole index, so the first record it
     /// skipped would make the answer a lower bound rather than a count.
-    /// `scan_candidates` stops at `FULL_SCAN_THRESHOLD` because a search only
+    /// `admit_plan` stops at `FULL_SCAN_THRESHOLD` because a search only
     /// needs to know whether the matching set is small enough to rank directly,
     /// which is a question an early exit answers and this one is not.
     ///
     /// The filter arrives compiled, so nothing here can fail on it and there is
-    /// no error channel, which is the argument `Filtered::judge` makes for the
-    /// search path. A filter matching every record is one map length, as is no
-    /// filter at all.
+    /// no error channel, which is the argument `MetadataAdmit::judge` makes for
+    /// the search path. A filter matching every record is one map length, as is
+    /// no filter at all.
     pub fn count(&self, filter: Option<&Filter>) -> usize {
         let Some(conditions) = filter else {
             return self.ids.read().unwrap().len();
@@ -1917,10 +2558,10 @@ impl Collection {
 
     /// Records by id, with the vector where one was asked for.
     ///
-    /// Looks the ids up in the union of the raw vectors and the quantized
-    /// codes. An absent id is dropped, or reported through
-    /// `Error::RecordsAbsent` naming every absent id in sorted order when
-    /// `strict` is set. The vector is the raw one where the index holds one
+    /// Looks the ids up in the id store. An absent id is dropped, or reported
+    /// through `Error::RecordsAbsent`, which counts the absent ids and names
+    /// the first ten in sorted order, when `strict` is set. The vector is the
+    /// raw one where the index holds one
     /// and the reconstruction from the codes where it does not, which under
     /// `quantized_only` is every record once training completes. The contract
     /// behind those choices is documented on the Python entry point.
@@ -2109,10 +2750,13 @@ impl Collection {
         meta_lock.get(key).cloned()
     }
 
-    /// Get all index-level metadata
-    pub fn all_metadata(&self) -> HashMap<String, String> {
+    /// Get all index-level metadata, the keys in code point order
+    pub fn all_metadata(&self) -> BTreeMap<String, String> {
         let meta_lock = self.metadata.lock().unwrap();
-        meta_lock.clone()
+        meta_lock
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
     }
 
     /// Generate a unique ID for a vector
@@ -2125,12 +2769,54 @@ impl Collection {
         *counter += 1;
         format!("vec_{}", *counter)
     }
+
+    /// Raise the counter behind generated ids to the N of `id` where `id`
+    /// is `vec_N` and N is one [`generated_number`] counts, so the next
+    /// generated id follows every id a record of the collection has held.
+    ///
+    /// Called by every install, the live one and a replayed one, and by a
+    /// withdrawn insert, whose id the live collection issued before its
+    /// commit failed. A load raises the counter the same way over the ids
+    /// its checkpoint holds, so the rule is one rule on every path.
+    pub(crate) fn follow_generated_id(&self, id: &str) {
+        if let Some(held) = generated_number(id) {
+            let mut counter = self.generated_ids.lock().unwrap();
+            *counter = (*counter).max(held);
+        }
+    }
+}
+
+/// The largest N the counter behind generated ids follows, being half of
+/// `usize`'s range, so a counter raised to it still issues that many ids
+/// before it could wrap. An id `vec_N` above it is one the counter reaches
+/// only after that many ids.
+pub(crate) const GENERATED_ID_CEILING: usize = usize::MAX >> 1;
+
+/// The N of an id of the form `vec_N`, where N parses as a `usize` at or
+/// below [`GENERATED_ID_CEILING`], and `None` for every other id.
+pub(crate) fn generated_number(id: &str) -> Option<usize> {
+    id.strip_prefix("vec_")
+        .and_then(|rest| rest.parse::<usize>().ok())
+        .filter(|&n| n <= GENERATED_ID_CEILING)
 }
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_types)]
+
     use super::construct::MAX_DIM;
-    use zeusdb_vector_core::JOURNAL_MAX_PAYLOAD;
+    use super::journal_support::TempDir;
+    use super::{
+        Collection, Declaration, Int8Codec, Int8Scale, ParsedRecord, SparseHalf, StorageMode,
+    };
+    use crate::journal::Durability;
+    use serde_json::{json, Value};
+    use std::collections::HashMap;
+    use std::sync::mpsc::{channel, Receiver, Sender};
+    use std::sync::Arc;
+    use zeusdb_vector_core::test_support::clustered;
+    use zeusdb_vector_core::{SparseVector, JOURNAL_MAX_PAYLOAD};
+    use zeusdb_vector_sparse::SparseConfig;
 
     /// The journal's payload ceiling is derived from this crate's ceilings,
     /// being a codebook at the widest `dim` and the most centroids `bits`
@@ -2143,5 +2829,422 @@ mod tests {
             JOURNAL_MAX_PAYLOAD,
             MAX_DIM * most_centroids * 4 + (1 << 20)
         );
+    }
+
+    /// `hold` takes a guard on a thread of its own and holds it, sending on
+    /// its first channel once it holds it and letting it go once the second
+    /// receives, and `check` runs on this thread while it is held.
+    fn while_held(hold: impl FnOnce(Sender<()>, Receiver<()>) + Send, check: impl FnOnce()) {
+        std::thread::scope(|scope| {
+            let (held_tx, held_rx) = channel();
+            let (done_tx, done_rx) = channel();
+            scope.spawn(move || hold(held_tx, done_rx));
+            held_rx.recv().unwrap();
+            check();
+            done_tx.send(()).unwrap();
+        });
+    }
+
+    /// A collection of `n` records of width two, each with the field `cat`
+    /// declared and filled, quantized by a codebook that fits at 1,000.
+    fn quantized(n: usize) -> Collection {
+        let declaration =
+            Declaration::validate(2, "l2", 4, 50, 2000, vec!["cat".to_string()]).unwrap();
+        let quantization = declaration
+            .quantization(1, 2, 1000, None, StorageMode::QuantizedWithRaw)
+            .unwrap();
+        let collection = Collection::build(declaration, Some(quantization));
+        let records: Vec<ParsedRecord> = (0..n)
+            .map(|i| {
+                let metadata: HashMap<String, Value> =
+                    HashMap::from([("cat".to_string(), json!(i % 3))]);
+                let x = (i % 97) as f32 / 97.0;
+                let y = (i % 89) as f32 / 89.0;
+                ParsedRecord::from((format!("r{i}"), vec![x, y], metadata))
+            })
+            .collect();
+        let added = collection.add_records(records, vec![], false);
+        assert_eq!(added.total_errors, 0, "{:?}", added.errors);
+        collection
+            .add_metadata(HashMap::from([("owner".to_string(), "test".to_string())]))
+            .unwrap();
+        collection
+    }
+
+    /// Each read a caller holding the interpreter makes without waiting
+    /// gives what the waiting read gives where every guard it takes is free,
+    /// and `None` while another thread holds one of them, or once a panic
+    /// has poisoned one.
+    #[test]
+    fn every_read_without_waiting_gives_none_while_its_guard_is_held() {
+        let dir = TempDir::new("try-reads");
+        let trained = quantized(1000);
+        trained
+            .journal_to(
+                dir.at("trained.zdb").to_str().unwrap(),
+                Durability::default(),
+            )
+            .unwrap();
+        let collecting = quantized(10);
+        assert!(trained.is_quantized() && !collecting.can_use_quantization());
+
+        for collection in [&trained, &collecting] {
+            assert_eq!(collection.try_len(), Some(collection.len()));
+            assert_eq!(collection.try_contains("r1"), Some(true));
+            assert_eq!(collection.try_contains("absent"), Some(false));
+            assert_eq!(
+                collection.try_vector_count(),
+                Some(collection.vector_count())
+            );
+            assert_eq!(
+                collection.try_can_use_quantization(),
+                Some(collection.can_use_quantization())
+            );
+            assert_eq!(
+                collection.try_is_quantized(),
+                Some(collection.is_quantized())
+            );
+            assert_eq!(
+                collection.try_storage_mode(),
+                Some(collection.storage_mode())
+            );
+            assert_eq!(
+                collection.try_indexed_fields(),
+                Some(collection.indexed_fields())
+            );
+            assert_eq!(
+                collection.try_metadata("owner"),
+                Some(collection.metadata("owner"))
+            );
+            assert_eq!(
+                collection.try_all_metadata(),
+                Some(collection.all_metadata())
+            );
+            assert_eq!(
+                collection.try_journal_path(),
+                Some(collection.journal_status().map(|status| status.path))
+            );
+            assert_eq!(
+                collection.try_identity_record(),
+                Some(collection.identity_record())
+            );
+            assert_eq!(collection.try_info(), Some(collection.info()));
+            assert_eq!(
+                collection.try_quantization_report(),
+                Some(collection.quantization_report())
+            );
+            assert_eq!(
+                collection.try_training_progress(),
+                Some(collection.training_progress())
+            );
+            assert_eq!(
+                collection.try_training_vectors_needed(),
+                Some(collection.training_vectors_needed())
+            );
+        }
+
+        let held = |held: Sender<()>, done: Receiver<()>| {
+            held.send(()).unwrap();
+            done.recv().unwrap();
+        };
+        let trained = &trained;
+        let collecting = &collecting;
+        while_held(
+            |tx, rx| {
+                let _ids = trained.ids.write().unwrap();
+                held(tx, rx);
+            },
+            || {
+                assert_eq!(trained.try_len(), None);
+                assert_eq!(trained.try_contains("r1"), None);
+                assert_eq!(trained.try_info(), None);
+            },
+        );
+        while_held(
+            |tx, rx| {
+                let _index = trained.dense().index.write().unwrap();
+                held(tx, rx);
+            },
+            || {
+                assert_eq!(trained.try_is_quantized(), None);
+                assert_eq!(trained.try_storage_mode(), None);
+                assert_eq!(trained.try_info(), None);
+            },
+        );
+        while_held(
+            |tx, rx| {
+                let _trained = trained
+                    .dense()
+                    .pq
+                    .as_ref()
+                    .unwrap()
+                    .is_trained
+                    .write()
+                    .unwrap();
+                held(tx, rx);
+            },
+            || {
+                assert_eq!(trained.try_can_use_quantization(), None);
+                assert_eq!(trained.try_quantization_report(), None);
+                assert_eq!(trained.try_training_progress(), None);
+            },
+        );
+        while_held(
+            |tx, rx| {
+                let _count = trained.vector_count.lock().unwrap();
+                held(tx, rx);
+            },
+            || assert_eq!(trained.try_vector_count(), None),
+        );
+        while_held(
+            |tx, rx| {
+                let _columns = trained.columns.write().unwrap();
+                held(tx, rx);
+            },
+            || assert_eq!(trained.try_indexed_fields(), None),
+        );
+        while_held(
+            |tx, rx| {
+                let _metadata = trained.metadata.lock().unwrap();
+                held(tx, rx);
+            },
+            || {
+                assert_eq!(trained.try_metadata("owner"), None);
+                assert_eq!(trained.try_all_metadata(), None);
+            },
+        );
+        while_held(
+            |tx, rx| {
+                let _sink = trained.sink.lock().unwrap();
+                held(tx, rx);
+            },
+            || {
+                assert_eq!(trained.try_journal_path(), None);
+                assert_eq!(trained.try_info(), None);
+            },
+        );
+        while_held(
+            |tx, rx| {
+                let _lineage = trained.lineage.lock().unwrap();
+                held(tx, rx);
+            },
+            || assert_eq!(trained.try_identity_record(), None),
+        );
+        while_held(
+            |tx, rx| {
+                let _training = collecting.training_ids.write().unwrap();
+                held(tx, rx);
+            },
+            || {
+                assert_eq!(collecting.try_training_progress(), None);
+                assert_eq!(collecting.try_training_vectors_needed(), None);
+            },
+        );
+
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ids = collecting.ids.write().unwrap();
+            panic!("a panic under the id store's guard");
+        }));
+        assert!(poisoned.is_err());
+        assert_eq!(collecting.try_len(), None);
+        assert_eq!(collecting.try_contains("r1"), None);
+    }
+
+    /// `storage_mode` names each state of each kind of space, and
+    /// `try_storage_mode` gives the same name where no guard is held.
+    ///
+    /// A space without quantization is `raw_only`, empty or filled, with or
+    /// without a sparse space. A quantized space is
+    /// `raw_collecting_for_training` below its training size,
+    /// `raw_ready_for_training` once the threshold is reached with no
+    /// quantizer fitted, `raw_trained_not_rebuilt` once the quantizer is
+    /// fitted while the graph still scores raw vectors, and
+    /// `quantized_active` once the training's rebuild has run. The ready
+    /// state is set through the loader's setter, which a load of a directory
+    /// saved in that state calls. The state between the fit and the rebuild
+    /// is reached by fitting the space's own quantizer, or installing its
+    /// codec, without the rebuild, which is what a failed rebuild leaves.
+    #[test]
+    fn storage_mode_names_each_state_of_each_kind_of_space() {
+        const DIM: usize = 8;
+        const TRAINING_SIZE: usize = 1000;
+        let vectors = clustered(TRAINING_SIZE, DIM, 0x0228_b001);
+        let records = |n: usize, sparse: bool| -> Vec<ParsedRecord> {
+            vectors[..n]
+                .iter()
+                .enumerate()
+                .map(|(i, vector)| ParsedRecord {
+                    id: format!("r{i}"),
+                    vector: vector.clone(),
+                    sparse: sparse.then(|| {
+                        SparseHalf::Vector(SparseVector {
+                            dims: vec![(i % 7) as u32, 7 + (i % 5) as u32],
+                            values: vec![1.0, 2.0],
+                        })
+                    }),
+                    metadata: HashMap::new(),
+                })
+                .collect()
+        };
+        let fill = |collection: &Collection, n: usize, sparse: bool| {
+            let added = collection.add_records(records(n, sparse), vec![], false);
+            assert_eq!(added.total_errors, 0, "{:?}", added.errors);
+        };
+        let names = |collection: &Collection, expected: &str, state: &str| {
+            assert_eq!(collection.storage_mode(), expected, "storage_mode, {state}");
+            assert_eq!(
+                collection.try_storage_mode().as_deref(),
+                Some(expected),
+                "try_storage_mode, {state}"
+            );
+        };
+        let declaration = || Declaration::validate(DIM, "l2", 6, 60, 2000, Vec::new()).unwrap();
+
+        let raw = Collection::build(declaration(), None);
+        names(&raw, "raw_only", "no quantization, empty");
+        fill(&raw, 200, false);
+        names(&raw, "raw_only", "no quantization, filled");
+
+        let with_sparse = Collection::build(
+            declaration()
+                .with_sparse("terms", SparseConfig::default())
+                .unwrap(),
+            None,
+        );
+        names(
+            &with_sparse,
+            "raw_only",
+            "no quantization, a sparse space, empty",
+        );
+        fill(&with_sparse, 200, true);
+        names(
+            &with_sparse,
+            "raw_only",
+            "no quantization, a sparse space, filled",
+        );
+
+        type Fit = fn(&Collection, &[Vec<f32>]);
+        let fit_codebook: Fit = |collection, sample| {
+            let pq = collection.dense().pq.as_ref().unwrap();
+            pq.train(sample).unwrap();
+        };
+        let fit_scales: Fit = |collection, sample| {
+            let codec = Int8Codec::fit(sample[0].len(), sample).unwrap();
+            assert!(collection
+                .dense()
+                .install_int8_codec(Arc::new(codec))
+                .is_ok());
+        };
+        let pq = |mode: StorageMode| {
+            declaration()
+                .quantization(4, 4, TRAINING_SIZE, None, mode)
+                .unwrap()
+        };
+        let scalar = declaration()
+            .scalar_quantization(
+                Int8Scale::PER_DIMENSION,
+                TRAINING_SIZE,
+                None,
+                StorageMode::QuantizedOnly,
+            )
+            .unwrap();
+        let kinds = [
+            (
+                "product quantized, keeping raw vectors",
+                pq(StorageMode::QuantizedWithRaw),
+                fit_codebook,
+            ),
+            (
+                "product quantized, keeping codes alone",
+                pq(StorageMode::QuantizedOnly),
+                fit_codebook,
+            ),
+            ("scalar quantized", scalar, fit_scales),
+        ];
+        for (kind, config, fit) in kinds {
+            let mut collection = Collection::build(declaration(), Some(config.clone()));
+            fill(&collection, 200, false);
+            names(
+                &collection,
+                "raw_collecting_for_training",
+                &format!("{kind}, collecting"),
+            );
+            collection.set_training_threshold_reached(true);
+            names(
+                &collection,
+                "raw_ready_for_training",
+                &format!("{kind}, ready"),
+            );
+            fit(&collection, &vectors);
+            names(
+                &collection,
+                "raw_trained_not_rebuilt",
+                &format!("{kind}, fitted and not rebuilt"),
+            );
+
+            let active = Collection::build(declaration(), Some(config));
+            fill(&active, TRAINING_SIZE, false);
+            names(&active, "quantized_active", &format!("{kind}, active"));
+        }
+    }
+
+    /// Under `cosine`, a vector whose `f32` sum of squares falls below the
+    /// smallest normal `f32` is stored at unit length, as a record and as a
+    /// query, whether its squares underflow in full or in part.
+    #[test]
+    fn a_cosine_vector_whose_squares_underflow_part_way_is_stored_at_unit_length() {
+        let collection = Collection::build(
+            Declaration::validate(2, "cosine", 4, 50, 100, vec![]).unwrap(),
+            None,
+        );
+        for vector in [
+            vec![3e-23_f32, 0.0],
+            vec![3e-23, 3e-23],
+            vec![1e-21, 2e-22],
+            vec![1e-30, 0.0],
+        ] {
+            for (what, processed) in [
+                (
+                    "record",
+                    collection.process_vector_for_space(vector.clone()),
+                ),
+                ("query", collection.validate_query(vector.clone()).unwrap()),
+            ] {
+                let norm = processed
+                    .iter()
+                    .map(|&x| f64::from(x) * f64::from(x))
+                    .sum::<f64>()
+                    .sqrt();
+                assert!(
+                    (norm - 1.0).abs() < 1e-6,
+                    "{what} {vector:?} is stored as {processed:?}, of norm {norm}"
+                );
+            }
+        }
+    }
+
+    /// The counter behind generated ids follows an id `vec_N` with N at or
+    /// below `GENERATED_ID_CEILING` and no other id, so it never wraps.
+    #[test]
+    fn the_counter_follows_a_generated_number_up_to_its_ceiling() {
+        use super::{generated_number, GENERATED_ID_CEILING};
+        assert_eq!(generated_number("vec_7"), Some(7));
+        assert_eq!(generated_number("vec_0012"), Some(12));
+        let ceiling = format!("vec_{GENERATED_ID_CEILING}");
+        assert_eq!(generated_number(&ceiling), Some(GENERATED_ID_CEILING));
+        let past = format!("vec_{}", GENERATED_ID_CEILING as u128 + 1);
+        assert_eq!(generated_number(&past), None);
+        assert_eq!(generated_number(&format!("vec_{}", u64::MAX)), None);
+        for id in ["vec_", "vec_x", "vec_-1", "vector_3", "Vec_3", "vec_1.5"] {
+            assert_eq!(generated_number(id), None, "{id}");
+        }
+        let collection = Collection::build(
+            Declaration::validate(2, "l2", 4, 50, 100, vec![]).unwrap(),
+            None,
+        );
+        collection.follow_generated_id(&past);
+        assert_eq!(collection.generate_id(), "vec_1");
+        collection.follow_generated_id(&ceiling);
+        assert_eq!(collection.generate_id(), past);
     }
 }

@@ -2,6 +2,12 @@
 # reaches it through manifest-path in pyproject.toml.
 [package]
 name = "zeusdb-vector-python"
+# What the crate is, and where the wheel's documentation is, an address the
+# root Cargo.toml declares once. cargo package, which maturin sdist runs on
+# each crate the wheel builds from, warns where a manifest has no
+# description, or has none of documentation, homepage and repository.
+description = "The Python binding, which the wheel's extension module is built from."
+documentation.workspace = true
 # The version, the edition and the licence are the workspace's, declared once
 # in the root Cargo.toml.
 version.workspace = true
@@ -49,21 +55,37 @@ crate-type = ["cdylib"]
 [features]
 default = ["extension-module"]
 extension-module = ["pyo3/extension-module"]
+# The pause a test arms: the engine's pause points and the index's, the pause
+# at the start of every released part of a call and of a search, and the
+# private class `_engine._Pause`; see src/test_support.rs. Off in the wheel
+# and in every build that does not name it, so `_engine` has no `_Pause`
+# there. The checks in tests/test_interpreter.py and tests/test_overlap.py
+# run on an extension built with it,
+#
+#   maturin develop --release --features test-support
+#
+# and the rest of the suite runs on the build without it.
+test-support = ["zeusdb-vector-core/pause-points", "zeusdb-vector-hnsw/pause-points"]
 
 # Every version is the workspace's, declared once in the root Cargo.toml with
 # the reason for each pin. The index is zeusdb-vector-hnsw, taken by path,
 # the engine's floor it stands on is zeusdb-vector-core, taken the same way
-# for the error and filter types the entry points name, and this crate holds
-# what touches Python. Nothing here serialises to disk, forks or draws a
-# random number; the crates that do that are the index's. chrono stays for
-# the date the rotating log file is named by.
+# for the error and filter types the entry points name and the date the
+# rotating log file is named by, and this crate holds what touches Python.
+# Nothing here serialises to disk, forks or draws a random number; the
+# crates that do that are the index's.
 [dependencies]
 zeusdb-vector-core = { workspace = true }
 zeusdb-vector-hnsw = { workspace = true }
 pyo3 = { workspace = true }
 numpy = { workspace = true }
 serde_json = { workspace = true }
-chrono = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+# The engine again, with its test support turned on, for the allocator the test
+# build holds every request to a ceiling with. cargo applies a dev-dependency's
+# features to this crate's test targets and to nothing else.
+zeusdb-vector-core = { workspace = true, features = ["test-support"] }

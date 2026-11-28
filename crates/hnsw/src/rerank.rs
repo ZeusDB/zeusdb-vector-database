@@ -2,11 +2,11 @@
 //! against raw vectors, and how the depth it needs is measured on the index's
 //! own data when training completes.
 //!
-//! Everything here is a free function or a plain value. Nothing reads an index,
-//! which is what lets the whole rule be exercised without building one, and it
-//! is why this sits in its own crate rather than inside the index. The index decides
-//! whether a search reranks at all and hands the training sample to the
-//! calibration; see `collection::search::rerank_plan` and
+//! Everything here is a free function or a plain value. Nothing but
+//! `RawVectors` reads an index, which is what lets the whole rule be exercised
+//! without building one. The index decides whether a search reranks at all
+//! and hands the training sample to the calibration; see
+//! `collection::search::rerank_plan` and
 //! `collection::training::calibrate_rerank`.
 
 use crate::collection::DenseIndex;
@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
-use zeusdb_vector_core::{CosineDist, Distance, DotDist, L1Dist, L2Dist, PQ};
+use zeusdb_vector_core::{CodeKernel, PqMetric, PQ};
 /// The three terms of the default rerank fetch.
 ///
 /// A rerank fetch has to be deep enough to contain the true neighbours in the
@@ -25,134 +25,60 @@ use zeusdb_vector_core::{CosineDist, Distance, DotDist, L1Dist, L2Dist, PQ};
 /// own cluster, because a 128x code resolves which cluster a record belongs to
 /// and resolves very little inside it.
 ///
-/// The 90th percentile depth of the deepest true neighbour, at dimension 768
-/// and the default subvectors, 100 queries per cell, over seven cells that
-/// vary the cluster count and the record count independently.
-///
-///   clusters   records   records per cluster   depth   share of corpus
-///        500    25,000                    50      60            0.24%
-///        200    25,000                   125     119            0.48%
-///        100    20,000                   200     197            0.99%
-///        500   100,000                   200     190            0.19%
-///         50    25,000                   500     469            1.88%
-///        200   100,000                   500     461            0.46%
-///         50   100,000                 2,000   1,863            1.86%
-///
-/// The depth column tracks the records per cluster and not the record count,
-/// across a fortyfold range and at roughly 0.93 times it. Two pairs of rows
-/// make the point without arithmetic. 500 records to a cluster returns 469 at
-/// 25,000 records and 461 at 100,000, being the same rank at four times the
-/// corpus. 200 records to a cluster returns 197 and 190 at 20,000 and 100,000.
 /// The depth is the cluster size in records and it is not a share of anything.
-///
-/// An earlier version of this comment claimed the depth held at 2 percent of
-/// the corpus across eight sizes. That measurement varied the record count
-/// while holding the generator at fifty clusters, which forced the cluster size
-/// to be one fiftieth of the corpus, and one fiftieth is 2 percent. The claim
-/// restated the generator rather than measuring the codes.
-///
-/// Two data models with no cluster structure to find. An anisotropic corpus
-/// with a power law covariance spectrum and a multi-scale topic hierarchy
-/// returns 713 at 25,000 records and 1,506 at 100,000. Uniform points on the
-/// sphere, and 5,000 clusters over 25,000 records where a cluster holds five
-/// records, both put the deepest true neighbour beyond the 12,500th candidate
-/// on more than half of the queries.
-///
-/// The fetch is the largest of three terms, capped at the live record count.
 ///
 /// `DEFAULT_RERANK_CORPUS_DIVISOR` is the corpus term. It is a bound rather
 /// than a law, because how a corpus's indistinguishable groups grow with the
 /// record count is a property of the corpus and no index measurement settles
-/// it. Recall at 10 at 100,000 records, derived from the ADC ordering over 100
-/// queries, at four data models where recall 0.99 is reachable at all. Every
-/// column is at a training set of 1,000 vectors, and the shipped default of
-/// 10,000 moves the last column by at most 0.008 at any of these fetches.
+/// it.
 ///
-///   fetch     50 clusters  200 clusters  500 clusters  embedding-like
-///     100         0.234        0.448         0.761          0.645
-///     200         0.316        0.675         0.996          0.759
-///     500         0.535        1.000         1.000          0.897
-///   1,000         0.793        1.000         1.000          0.960
-///   2,000         0.999        1.000         1.000          0.991
-///
-/// 2,000 candidates is what a divisor of 50 produces at that size and it is the
-/// smallest value in the grid that clears 0.99 on every model. A constant
-/// multiple of `top_k` in the range the field uses, being 10 to 40 candidates
-/// at `top_k` 10, returns between 0.10 and 0.20 on the hardest of them, which
-/// is why this term is corpus proportional where every other vector database
-/// uses a multiple of the page.
+/// At the largest record count measured, the divisor gives the smallest fetch
+/// that clears recall at 10 of 0.99 on every data model where that recall is
+/// reachable at all. A constant multiple of `top_k` falls short of it on the
+/// hardest of them, which is why this term is corpus proportional.
 ///
 /// # Where no fetch works
 ///
 /// Once the group of records the codes cannot separate is smaller than
-/// `top_k`, the true top ten span groups, the distances between groups differ
-/// in the fourth decimal, and no fetch reaches them. At 5,000 clusters over
-/// 25,000 records, being five records to a cluster, recall at 10 reaches 0.917
-/// at a fetch of half the corpus. Uniform points on the sphere reach 0.859 at
-/// the same fetch. The defaults return 0.473 and 0.191 on those two. That is
-/// what a 128x code does to data with no resolvable structure and no rerank
-/// value repairs it.
+/// `top_k`, the true top ten span groups whose distances differ by less than
+/// the codes resolve, and no fetch reaches them. That is what a 128x code does
+/// to data with no resolvable structure and no rerank value repairs it.
 ///
 /// `DEFAULT_RERANK_MIN_CANDIDATES` is the floor, which holds the fetch up
 /// where the corpus term is too small to reach the neighbours. It governs up
 /// to `DEFAULT_RERANK_CORPUS_DIVISOR * DEFAULT_RERANK_MIN_CANDIDATES` records.
-/// At 10,000 records on fifty clusters the fetch that reaches 0.99 is 195
-/// candidates, and over ten independent codebook draws a fetch of 200 returns
-/// a mean of 0.9930 with a worst case of 0.9905 where a fetch of 250 returns
-/// 0.9997 with a worst case of 0.9990. On the embedding-like corpus at the same
-/// size the fetch reaching 0.99 is 250.
+/// It is the smallest fetch that reaches 0.99 at 10,000 records on every data
+/// model measured.
 ///
-/// It costs nothing anywhere the criteria can see. It changes only corpus
-/// sizes below 12,500 records, where a reranked quantized search is already
-/// faster than an unquantized one, and at dimension 768 it reads 0.82 times the
-/// unquantized query time at 3,000 records and 0.91 at 5,000.
+/// It changes only corpus sizes below 12,500 records, where a reranked
+/// quantized search is already faster than an unquantized one.
 ///
 /// `DEFAULT_RERANK_PAGE_FACTOR` is the page term, because the hundredth true
 /// neighbour sits deeper than the tenth. It is small, since the candidate
 /// count that saturates recall is a property of the corpus and not of the page
-/// size, and at `top_k` 100 on 10,000 records recall reaches 0.986 at a fetch
-/// of 200 and 1.000 at 500.
+/// size.
 ///
 /// On a calibrated index this term is a floor and nothing else. The page is
-/// handled by the page exponent the calibration measures, and five times
-/// `top_k` sits below the calibrated fetch at every corpus size measured, so it
-/// never governs there. See `RERANK_CALIBRATION_PAGES`.
+/// handled by the page exponent the calibration measures. See
+/// `RERANK_CALIBRATION_PAGES`.
 ///
 /// # Why the fetch is the whole cost, and why nothing narrows it
 ///
-/// `Hnsw::search_filter` raises the traversal width to the number of
-/// neighbours asked for at `hnsw.rs:1650`, and then cuts the result to
-/// `knbn.min(ef)` at `hnsw.rs:1666`. Removing the first would not decouple the
-/// two, because the second caps the page at `ef` regardless. The candidate
-/// heap `search_layer` returns holds at most `ef` entries, so a fetch of F
-/// candidates cannot be served by a traversal narrower than F. That is a
-/// property of the algorithm rather than a choice, and it is why an
-/// `ef_search` below the fetch is discarded.
-///
-/// A traversal wider than the fetch buys nothing. Quadrupling `ef_search` at a
-/// fixed fetch moves recall at 10 by at most 0.008 and by nothing at all in
-/// fourteen of twenty measured pairs, because the candidates a fetch returns
-/// are limited by the ADC ordering rather than by the traversal. It costs
-/// query time in every case.
+/// `search` in the core crate's `graph::traverse` raises the traversal width
+/// to the number of neighbours asked for, and then cuts the result to
+/// `knbn.min(ef)`. Removing the first would not decouple the two, because the
+/// second caps the page at `ef` regardless. The candidate heap `search_layer`
+/// returns holds at most `ef` entries, so a fetch of F candidates cannot be
+/// served by a traversal narrower than F. That is a property of the algorithm
+/// rather than a choice, and it is why an `ef_search` below the fetch is
+/// discarded.
 ///
 /// A lower compression ratio mostly does not buy query time either. It puts
 /// the true neighbours shallower, so the fetch shrinks, and it lengthens the
 /// code, so each candidate costs more to score. Between 384x and 32x the two
-/// cancel. Measured at dimension 768 and 100,000 records, the fetch that
-/// reaches recall at 10 of 0.99 runs 1,995 candidates at 384x, 1,921 at 128x
-/// and 960 at 32x, and the query costs 9.40, 13.08 and 9.34 ms. Only at 16x
-/// does the fetch collapse, to 222 candidates and 4.32 ms, and that ratio
-/// holds more memory than an unquantized index at 10,000 records and builds
-/// five times slower at 100,000, so it is documented rather than defaulted to.
-///
-/// A staged fetch is not ruled out, and an earlier version of this comment said
-/// it was. It needs a long thin tail of hard queries. On fifty clusters there
-/// is none, the median and the 90th percentile depth reading 1,530 and 1,863 at
-/// 100,000 records, and at 10,000 records the share of queries whose true top
-/// ten sit inside the first F candidates runs 0.060 at F of 100, 0.355 at 150
-/// and 0.935 at 200. On the embedding-like corpus at 100,000 records the same
-/// two percentiles read 314 and 1,506, which is the tail a staged fetch wants.
-/// Which of the two a real corpus resembles is not settled here.
+/// cancel. Only at 16x does the fetch collapse, and that ratio holds more
+/// memory than an unquantized index at 10,000 records and builds slower at
+/// 100,000, so it is documented rather than defaulted to.
 ///
 /// # The cost, stated where a user reads it
 ///
@@ -160,9 +86,8 @@ use zeusdb_vector_core::{CosineDist, Distance, DotDist, L1Dist, L2Dist, PQ};
 /// a reranked quantized search costs time proportional to the record count
 /// where an unquantized one costs time proportional to its logarithm. The two
 /// cross once, and above the crossing this default is slower than an
-/// unquantized search while holding roughly 60 percent of the memory. No value
-/// of `subvectors` and no rerank expression that holds recall moves that
-/// crossing. See the README table.
+/// unquantized search. No value of `subvectors` and no rerank expression that
+/// holds recall moves that crossing. See the README table.
 pub const DEFAULT_RERANK_CORPUS_DIVISOR: usize = 50;
 pub(crate) const DEFAULT_RERANK_MIN_CANDIDATES: usize = 250;
 pub(crate) const DEFAULT_RERANK_PAGE_FACTOR: usize = 5;
@@ -170,12 +95,9 @@ pub(crate) const DEFAULT_RERANK_PAGE_FACTOR: usize = 5;
 /// The calibrated rerank fetch, measured on the index's own data
 ///
 /// The three terms above are a formula in the record count, and no formula in
-/// the record count fits real data. At 100,000 records the fetch that reaches
-/// mean recall at 10 of 0.99 is 494 candidates on OpenAI ada-002 embeddings,
-/// 426 on SIFT descriptors and 5,143 on GloVe word vectors, being 0.49, 0.43
-/// and 5.14 percent of the same corpus. The corpus term produces 2,000 for all
-/// three, which is four times what two of them need and two fifths of what the
-/// third needs.
+/// the record count fits real data. The fetch that reaches mean recall at 10 of
+/// 0.99 differs between corpora of one size, and the corpus term gives them all
+/// one fetch, more than some need and less than others.
 ///
 /// Training completion is where the index can measure it instead. It holds
 /// `training_size` raw vectors and a codebook fitted to them, so exact
@@ -203,37 +125,23 @@ pub(crate) const DEFAULT_RERANK_PAGE_FACTOR: usize = 5;
 /// the fetch reaching that recall.
 ///
 /// The percentile of the pooled ranks and the percentile of the per query
-/// deepest neighbour are different statistics and the second is far larger.
-/// On ada-002 embeddings at 100,000 records they read 494 and 2,060. Mean
-/// recall is what the pooled statistic answers.
+/// deepest neighbour are different statistics and the second is the larger.
+/// Mean recall is what the pooled statistic answers.
 ///
 /// # Why the measurement does not transfer as a share
 ///
 /// The depth grows with the record count, and how fast it grows is a property
-/// of the corpus rather than of the codes. Measured on three real datasets at
-/// three codebook draws each, holding the codebook fixed and taking prefixes
-/// of a permuted corpus. The fetch reaching recall 0.99, and the same figure
-/// as a share of the corpus.
-///
-///   records    ada-002        GloVe          SIFT
-///    10,000    151, 1.51%     948,  9.48%    135, 1.35%
-///    25,000    263, 1.05%   2,175,  8.70%    210, 0.84%
-///    50,000    418, 0.84%   3,244,  6.49%    313, 0.63%
-///   100,000    494, 0.49%   5,143,  5.14%    426, 0.43%
-///
-/// The share falls by 3.1, 1.8 and 3.2 times over a tenfold range in the
-/// record count, so a share does not transfer. What transfers is a power law,
-/// and fitting the exponent over that range returns 0.515, 0.734 and 0.499.
+/// of the corpus rather than of the codes. On three real datasets the depth
+/// falls as a share of the corpus as the corpus grows, so a share does not
+/// transfer. What transfers is a power law.
 ///
 /// **That exponent is not a constant either.** Those three corpora are random
 /// subsamples of a fixed source, so the number of groups the codes cannot
 /// separate is fixed by the source and each group grows as a root of the
 /// record count. A corpus whose group count is fixed instead grows each group
-/// linearly. Two generators at dimension 256, 50 and 200 clusters at every
-/// size, return exponents of 0.987 and 0.952 over the same tenfold range. One
-/// constant cannot serve 0.499 and 0.987, and a constant chosen for the real
-/// datasets loses recall on the generators. At 0.60 the fifty cluster corpus
-/// returns 0.727 at 25,000 records where the corpus term returns 0.999.
+/// linearly, and two generators that hold 50 and 200 clusters at every size
+/// fit an exponent near one. One constant cannot serve both, and a constant
+/// chosen for the real datasets loses recall on the generators.
 ///
 /// # The exponent is measured, not assumed
 ///
@@ -242,40 +150,21 @@ pub(crate) const DEFAULT_RERANK_PAGE_FACTOR: usize = 5;
 /// squares slope of the log fetch on the log record count. A doubling of the
 /// records that doubles the fetch is an exponent of one.
 ///
-/// A two point fit over the sample and its first half was measured first and
-/// it is not good enough. Against the held out exponent over 10,000 to 100,000
-/// records, mean error over three codebook draws and three subset draws, with
-/// the standard deviation of the estimate beside it:
+/// A fit over two points, the sample and its first half, reads too steep on
+/// the corpus whose true exponent is shallowest and swings more widely on the
+/// others. The information is in the short fractions: a fit over the sample
+/// and its half spans a factor of two, and one over a quarter to the whole
+/// spans a factor of four.
 ///
-///   estimator                              ada-002   GloVe    SIFT
-///   two points, insertion order prefix       +0.261  -0.186  -0.101
-///   two points, random half                  +0.349  -0.152  -0.030
-///   four fractions, least squares            +0.100  -0.177  -0.094
-///
-///   spread of the estimate, standard deviation
-///   two points, random half                   0.094   0.073   0.078
-///   four fractions, least squares             0.088   0.039   0.031
-///
-/// The two point fit reads 0.26 to 0.35 too steep on ada-002, which is the
-/// corpus whose true exponent is shallowest, and it swings more widely on the
-/// two corpora whose exponent it gets right. The information is in the short
-/// fractions: a fit over the sample and its half spans a factor of two, and one
-/// over a quarter to the whole spans a factor of four. Dropping the quarter
-/// point returns the two point error, at +0.328 on ada-002.
-///
-/// The fit still reads low on the two corpora whose exponent is steep, because
-/// a subset is small enough for the leave one out geometry to compress its
-/// ranks. `RERANK_CALIBRATION_EXPONENT_BIAS` is that correction. The result is
+/// The fit reads low on corpora whose exponent is steep, because a subset is
+/// small enough for the leave one out geometry to compress its ranks.
+/// `RERANK_CALIBRATION_EXPONENT_BIAS` is that correction. The result is
 /// clamped between `RERANK_CALIBRATION_EXPONENT_MIN` and
 /// `RERANK_CALIBRATION_EXPONENT_MAX`, so it can never grow faster than linear
 /// and never slower than the floor.
 ///
-/// The floor was 0.60 and it is 0.40, because 0.60 sat above the true exponent
-/// of two of the three real datasets and governed the fetch on both of them
-/// once the fit stopped reading steep. Measured true exponents over 10,000 to
-/// 100,000 records are 0.27 to 0.32 on ada-002, 0.48 to 0.58 on SIFT and 0.64
-/// to 0.74 on GloVe, against 0.95 to 0.99 on the generators. The floor is a
-/// guard against a fit that collapses, not a term that should govern.
+/// The floor is a guard against a fit that collapses, not a term that should
+/// govern.
 ///
 /// A subset that measures a deeper fetch than the whole sample sits below the
 /// size at which the codes resolve the data at all, which is the case of a
@@ -284,29 +173,17 @@ pub(crate) const DEFAULT_RERANK_PAGE_FACTOR: usize = 5;
 /// fifty clusters at a `training_size` of 1,000, where a quarter of the sample
 /// holds five records to a cluster.
 ///
-/// `RERANK_CALIBRATION_SAFETY` is 1.75 and it was 1.5. A fetch equal to the
-/// measured percentile lands at recall 0.99 in expectation, so it lands below
-/// it on about half of the draws, and the in sample measurement is taken with
+/// `RERANK_CALIBRATION_SAFETY` is 1.75. A fetch equal to the measured
+/// percentile lands at recall 0.99 in expectation, so it lands below it on
+/// about half of the draws, and the in sample measurement is taken with
 /// queries drawn from the corpus where a caller's queries are not. The
-/// multiplier covers both. It went up rather than down because the exponent fit
-/// that replaced the two point one removed the surplus that used to hide inside
-/// the extrapolation: at 1.5 the fetch on ada-002 reads 665 candidates where
-/// 750 are needed.
+/// multiplier covers both.
 ///
 /// # What the whole rule delivers
 ///
-/// Mean recall at 10 measured on built indexes, one query at a time through the
-/// ordinary search path, 1,000 queries. The requirement is the smallest fetch on
-/// the same index reaching 0.99, read off a sweep of the explicit `rerank`
-/// argument over that index at 300 queries.
-///
-///   records   corpus     calibrated   requirement   ratio   recall
-///    50,000   ada-002           554           860    0.64   0.9883
-///    50,000   GloVe           6,534         3,060    2.14   0.9982
-///    50,000   SIFT              465           370    1.26   0.9953
-///   100,000   ada-002           747           620    1.20   0.9907
-///   100,000   GloVe          11,439         4,620    2.48   0.9985
-///   100,000   SIFT              656           450    1.46   0.9968
+/// What the rule delivers is held against the requirement, the smallest fetch
+/// on a built index reaching 0.99, read off a sweep of the explicit `rerank`
+/// argument over that index.
 ///
 /// A requirement has to be read off the index the fetch will run on, and not
 /// off the codes. A fetch is served by a traversal of the graph over the codes
@@ -315,47 +192,37 @@ pub(crate) const DEFAULT_RERANK_PAGE_FACTOR: usize = 5;
 /// # Why the ratio is not the same on the three
 ///
 /// The rule is `SAFETY * fetch * ratio.powf(slope + BIAS)`, and everything in it
-/// except `fetch` and `slope` is the same constant on every index. Taking the
-/// raw least squares slope alone, with no safety factor and no bias, the
-/// extrapolation to 100,000 records reads 4,626 candidates on GloVe against a
-/// requirement of 4,620, being 1.001 times what the index needs. On ada-002 it
-/// reads 302 against 620 and on SIFT 265 against 450, being 0.49 and 0.59 times.
-/// **The uncorrected extrapolation is exact on GloVe and about half of what the
-/// other two need**, and the correction those constants apply is 2.47 at a
-/// tenfold ratio, being 1.75 for the safety factor and 1.41 for the bias.
+/// except `fetch` and `slope` is the same constant on every index. The
+/// correction those constants apply is 2.47 at a tenfold ratio, being 1.75 for
+/// the safety factor and 1.41 for the bias.
 ///
-/// So the margin on GloVe is not a defect in GloVe's calibration. It is the
-/// correction sized for the dataset whose calibration is least accurate,
-/// applied to the one whose calibration needs none. The correction the three
-/// need spans 2.05 to 1.00 at 100,000 records and 3.46 to 1.06 at 50,000, and
-/// one constant cannot serve that.
+/// The uncorrected extrapolation comes nearer the requirement on some corpora
+/// than on others, so the ratio of the calibrated fetch to the requirement
+/// differs between them. The correction is sized for the dataset whose
+/// calibration is least accurate and applied to every index. The correction
+/// each corpus needs differs by corpus and by size, and one constant cannot
+/// serve that.
 ///
-/// Neither constant can come down. At 100,000 records the constant that would
-/// bring GloVe to a 1.20 ratio, being what ada-002 has there, is 0.48 of the
-/// present one, and it takes the ada-002 fetch from 747 to 359 where a sweep of
-/// that index reads recall 0.9787 at 360 candidates. ada-002 also sits below the
-/// target at three of the four sizes measured, reading 0.9878, 0.9800 and 0.9883
-/// at 10,000, 25,000 and 50,000 records, so it has nothing to give back.
+/// Neither constant can come down. A constant that brought the corpus with the
+/// largest ratio down to the ratio of the corpus with the smallest would take
+/// the least accurate corpus's fetch below its requirement, and that corpus
+/// already sits below the target at some sizes, so it has nothing to give back.
 ///
 /// What separates them is the ratio between the requirement read off a built
 /// index and the depth this calibration measures in the exact code ordering over
-/// the training sample. At 10,000 records those read 340 against 158 on ada-002,
-/// 880 against 1,017 on GloVe and 140 against 119 on SIFT, so the sample
-/// understates the index by 2.15 times on one corpus and overstates it by 1.16
-/// on another. Nothing in the training sample measures that ratio, because the
-/// graph the fetch will traverse does not exist until the rebuild that follows
-/// the calibration. Measuring it there is the change that would let the safety
-/// factor come down, and it is a change to what training measures rather than to
-/// a constant.
+/// the training sample. The sample understates the index on some corpora and
+/// overstates it on others. Nothing in the training sample measures that ratio,
+/// because the graph the fetch will traverse does not exist until the rebuild
+/// that follows the calibration. Measuring it there is the change that would let
+/// the safety factor come down, and it is a change to what training measures
+/// rather than to a constant.
 ///
 /// A generator holding a fixed number of clusters at every size is the case
-/// that breaks a constant exponent, and it is checked rather than assumed. At
-/// fifty clusters and dimension 256 the calibration reads recall 0.9972 at
-/// 25,000 records and 0.9972 at 100,000, where the corpus term reads 0.9864 and
-/// 0.9924. At a `training_size` of 1,000 on the same corpus neither reaches the
-/// target, the calibration reading 0.968 and 0.942 against the corpus term's
-/// 0.744 and 0.794, because a codebook fitted to twenty records per cluster
-/// does not order those clusters and no fetch repairs that.
+/// that breaks a constant exponent. On fifty clusters the calibration holds the
+/// target where the corpus term falls below it. At a `training_size` of 1,000 on
+/// the same corpus neither reaches the target, because a codebook fitted to
+/// twenty records per cluster does not order those clusters and no fetch
+/// repairs that.
 ///
 /// # The page
 ///
@@ -398,19 +265,14 @@ pub(crate) const RERANK_CALIBRATION_EXPONENT_MAX: f64 = 1.00;
 ///
 /// The calibration measures the depth of the true neighbours in the code
 /// ordering and asks for it, and on a corpus whose codes rank badly that depth
-/// is a large share of the corpus. On GloVe word vectors at 100,000 records the
-/// rule asks for 11,439 candidates, being 11.44 percent of the corpus, against
-/// 656 and 747 on SIFT descriptors and ada-002 embeddings from the same
-/// constants. The calibration is reading that corpus correctly. It is not a
-/// mis-set constant.
+/// is a large share of the corpus. The calibration is reading such a corpus
+/// correctly. It is not a mis-set constant.
 ///
 /// The cost of reading it correctly is that the fetch sets the traversal width
 /// and the rescoring count together, so a reranked quantized search at that
-/// depth is 48 times slower than an unquantized search of the same records at
-/// the default `ef_search`, and 2.7 times slower than an unquantized one raised
-/// to the same recall while holding 10 MiB more. A default that can reach a
-/// tenth of the corpus is a default that can turn a graph search into a scan
-/// without saying so.
+/// depth is slower than an unquantized search of the same records, even one
+/// raised to the same recall. A default that can reach a tenth of the corpus is
+/// a default that can turn a graph search into a scan without saying so.
 ///
 /// # Why this share
 ///
@@ -421,19 +283,12 @@ pub(crate) const RERANK_CALIBRATION_EXPONENT_MAX: f64 = 1.00;
 /// as the corpus grows, because the count of records the codes cannot separate
 /// from a query grows more slowly than the record count does.
 ///
-/// Measured on three real datasets at four record counts, the fetch reaching
-/// mean recall at 10 of 0.99 read off a built index runs 0.5 to 0.8 percent of
-/// the corpus on two of them and 6.0 to 7.5 percent on the third, while the
-/// rule asks for 0.7 to 2.8 percent on the two and 11.4 to 17.8 percent on the
-/// third. A tenth of the corpus is above every one of those requirements and
-/// below the request on the third at every size, so it takes back the surplus
-/// there and touches nothing else.
+/// A tenth of the corpus sits above the requirement of every corpus it was
+/// measured on, at every size.
 ///
-/// It is the loosest share that does so, and it is loose on purpose. A ceiling
-/// is a guard against a fetch out of proportion to the corpus, not a tuning
-/// knob, and every point of tightening past the guard is recall a caller did
-/// not ask to give up. Against the uncapped request it costs 0.0004 to 0.0032
-/// of recall at 10 on the corpus it binds, and nothing at all on the other two.
+/// It is loose on purpose. A ceiling is a guard against a fetch out of
+/// proportion to the corpus, not a tuning knob, and every point of tightening
+/// past the guard is recall a caller did not ask to give up.
 ///
 /// # What it bounds
 ///
@@ -441,7 +296,7 @@ pub(crate) const RERANK_CALIBRATION_EXPONENT_MAX: f64 = 1.00;
 /// the index's own data and multiplies whatever survives the ceiling, because
 /// a caller asking for a hundred results is not the pathology this bounds and
 /// a bound that did not scale with the page would take back what the page term
-/// was added to fix.
+/// exists to fix.
 ///
 /// What a given index asks for and what it performs are both in `get_stats`,
 /// under `rerank_requested_fetch` and `rerank_default_fetch`, with
@@ -451,20 +306,18 @@ pub(crate) const RERANK_FETCH_CAP_DIVISOR: usize = 10;
 /// The absolute ceiling on the depth term of a default rerank fetch
 ///
 /// A share alone does not bound the query. The calibrated fetch grows as a
-/// power of the record count, with a measured exponent of 0.27 to 0.74 on real
-/// data and 0.95 to 0.99 on a generator holding a fixed cluster count, so a
-/// corpus large enough reaches any share's ceiling and goes on growing under
-/// it. Every candidate is one exact distance over a full width vector, so a
-/// fetch of a hundred thousand is a hundred thousand vector reads for one page.
+/// power of the record count, so a corpus large enough reaches any share's
+/// ceiling and goes on growing under it. Every candidate is one exact distance
+/// over a full width vector, so a fetch of a hundred thousand is a hundred
+/// thousand vector reads for one page.
 ///
 /// This is what stops that, and it binds only where a share of
 /// `RERANK_FETCH_CAP_DIVISOR` would still ask for more than this many
 /// candidates, which is above 250,000 live records at that divisor. Below it
 /// the share governs and this is never consulted, so it binds on nothing this
-/// was measured on. Above roughly 600,000 records a corpus whose codes rank as
-/// badly as the worst measured one needs a deeper fetch than this, and gets
-/// this instead: `rerank_fetch_capped` is what says so, and an explicit
-/// `rerank` factor is not held under it.
+/// was measured on. A corpus large enough whose codes rank badly needs a deeper
+/// fetch than this, and gets this instead: `rerank_fetch_capped` is what says
+/// so, and an explicit `rerank` factor is not held under it.
 pub(crate) const RERANK_FETCH_CEILING: usize = 25_000;
 
 /// The shallowest a default rerank fetch is ever held to
@@ -472,16 +325,13 @@ pub(crate) const RERANK_FETCH_CEILING: usize = 25_000;
 /// The share alone binds at every corpus size, and on a small corpus it binds
 /// close to what the codes need while bounding nothing worth bounding. At
 /// 10,000 records a tenth of the corpus is 1,000 candidates, and on the corpus
-/// whose codes rank worst the fetch reaching recall at 10 of 0.99 there is 745,
-/// so the share sits at 1.34 times the requirement against the 1.75 the
-/// calibration's own safety factor carries. Holding the ceiling here instead
-/// costs 0.0010 of recall at that size against 0.0050 at the share.
+/// whose codes rank worst that sits closer to the requirement than the
+/// calibration's own safety factor does.
 ///
 /// And there is nothing to bound. The cost this ceiling exists to bound is a
 /// fetch in proportion to the corpus, and a fetch of this many candidates over
-/// ten thousand records is a bounded query whatever the codes do: measured at
-/// 1.0 ms against 2.4 ms at 25,000 records and 13.4 ms at 100,000 on that same
-/// corpus, where the growth rather than the value is the problem.
+/// ten thousand records is a bounded query whatever the codes do, since the
+/// growth rather than the value is the problem.
 ///
 /// So the ceiling is flat at this figure below 15,000 live records and is a
 /// share above it.
@@ -495,10 +345,9 @@ pub(crate) const RERANK_FETCH_CEILING_FLOOR: usize = 1_500;
 /// large enough against a corpus small enough would ask for most of it. This is
 /// the bound on the product.
 ///
-/// A quarter of the live records, which is what the calibration's own cap was
-/// before the depth term got one of its own. It governs nothing the depth
-/// ceiling already governs, since a quarter is two and a half tenths, and it
-/// takes over exactly where a deep page has multiplied a bounded depth past it.
+/// A quarter of the live records. It governs nothing the depth ceiling already
+/// governs, since a quarter is two and a half tenths, and it takes over exactly
+/// where a deep page has multiplied a bounded depth past it.
 /// The floor is still the floor, so this can never cut below what a page needs.
 pub(crate) const RERANK_FETCH_WHOLE_DIVISOR: usize = 4;
 
@@ -508,7 +357,7 @@ pub(crate) const RERANK_FETCH_WHOLE_DIVISOR: usize = 4;
 /// draw over it and a prefix is the cheapest way to take one. The whole sample
 /// has to be one of them, since its fetch is what the search scales from. The
 /// measurement costs the sum of these in units of one pass over the sample, so
-/// this set costs 2.5 against the 1.5 the two point fit cost.
+/// this set costs 2.5.
 pub(crate) const RERANK_CALIBRATION_FIT_FRACTIONS: [f64; 4] = [0.25, 0.50, 0.75, 1.00];
 
 pub(crate) const RERANK_CALIBRATION_QUERIES: usize = 512;
@@ -517,7 +366,7 @@ pub(crate) const RERANK_CALIBRATION_QUERIES: usize = 512;
 ///
 /// The fetch a page of 10 needs. It is the reference page, so the scaling in
 /// `RerankCalibration::fetch_at` is exactly one at this page and a search at
-/// `top_k` 10 fetches what it fetched before the page term was calibrated.
+/// `top_k` 10 fetches the reference fetch unscaled.
 pub const RERANK_CALIBRATION_TOP_K: usize = 10;
 
 /// Pages the calibration measures the depth at, ascending
@@ -528,35 +377,31 @@ pub const RERANK_CALIBRATION_TOP_K: usize = 10;
 ///
 /// # Why a page term is calibrated at all
 ///
-/// The fetch used to be measured for a page of ten and nothing scaled it, so a
-/// search at `top_k` 100 fetched exactly what a search at `top_k` 10 fetched.
-/// `DEFAULT_RERANK_PAGE_FACTOR` was the only page term and at five times
-/// `top_k` it is 500 at a page of 100, which sits below the calibrated fetch at
-/// every corpus this was measured on and therefore never governed. Measured
-/// recall at 100 on `quantized_with_raw` read 0.9243 at 50,000 dbpedia-openai
-/// records against 0.9940 for the same records unquantized, and it got worse as
-/// the corpus shrank, because a smaller corpus calibrates a smaller fetch.
+/// A fetch measured for a page of ten and not scaled gives a search at `top_k`
+/// 100 exactly what a search at `top_k` 10 fetches. `DEFAULT_RERANK_PAGE_FACTOR`
+/// at five times `top_k` sits below the calibrated fetch at every corpus this
+/// was measured on, so it never governs. Recall at a deep page then falls, and
+/// it falls further as the corpus shrinks, because a smaller corpus calibrates
+/// a smaller fetch.
 ///
 /// # The page requirement is sublinear
 ///
-/// The smallest fetch reaching mean recall 0.99 at a page, read off built
-/// indexes by sweeping the explicit `rerank` argument, 200 queries against
-/// exact ground truth to depth 1,000.
+/// The page requirement is the smallest fetch reaching mean recall 0.99 at a
+/// page, read off built indexes by sweeping the explicit `rerank` argument.
 ///
-/// See the report for the full table. The requirement rises with the page and
-/// it rises far more slowly than the page does, because what buries a true
-/// neighbour in the ADC ordering is the number of records the codes cannot
-/// separate from the query and that count does not move when a caller asks for
-/// more results. Only once the page approaches that count does the requirement
-/// track it, which is why the exponent is fitted rather than fixed and why it
-/// is clamped below one.
+/// The requirement rises with the page and it rises far more slowly than the
+/// page does, because what buries a true neighbour in the ADC ordering is the
+/// number of records the codes cannot separate from the query and that count
+/// does not move when a caller asks for more results. Only once the page
+/// approaches that count does the requirement track it, which is why the
+/// exponent is fitted rather than fixed and why it is clamped below one.
 pub const RERANK_CALIBRATION_PAGES: [usize; 3] = [1, 10, 100];
 
 /// Bounds on the fitted page exponent
 ///
-/// Zero is a fetch that ignores the page, which is what shipped before this was
-/// measured. One is a fetch proportional to the page, which is what every
-/// constant multiple of `top_k` assumes and which no measured corpus needs.
+/// Zero is a fetch that ignores the page. One is a fetch proportional to the
+/// page, which is what every constant multiple of `top_k` assumes and which no
+/// measured corpus needs.
 pub(crate) const RERANK_CALIBRATION_PAGE_EXPONENT_MIN: f64 = 0.0;
 pub(crate) const RERANK_CALIBRATION_PAGE_EXPONENT_MAX: f64 = 1.0;
 
@@ -566,11 +411,8 @@ pub(crate) const RERANK_CALIBRATION_PAGE_EXPONENT_MAX: f64 = 1.0;
 /// with no field for it, and a sample too small to compare two pages measures
 /// no slope. Both take this value rather than a flat fetch.
 ///
-/// It is the median of the six exponents the calibration fitted on the three
-/// real datasets at 50,000 and 100,000 records, being 0.346 and 0.381 on
-/// glove-100, 0.474 and 0.499 on sift-128 and 0.551 and 0.567 on
-/// dbpedia-openai. It is a default and not a calibration, since it is not
-/// anything the index it applies to measured.
+/// It is a default and not a calibration, since it is not anything the index
+/// it applies to measured.
 ///
 /// Applying it to an index that did not measure its own pages cannot cost
 /// recall at the reference page, because the scaling is exactly one there
@@ -673,31 +515,19 @@ impl RerankCalibration {
     ///
     /// The measured pages are interpolated rather than fitted to one exponent,
     /// because the relation is convex in log space and a single slope through
-    /// it is wrong at both ends. On dbpedia-openai the calibration measures 60,
-    /// 162 and 777 candidates at pages 1, 10 and 100, which is a slope of 0.431
-    /// over the first decade and 0.681 over the second, and the least squares
-    /// line through all three reads 0.556. Against the requirement read off a
-    /// built index at 50,000 records, the second decade is the one that matters
-    /// and it needs 0.652. The line asks for 2,062 candidates at a page of 100
-    /// where interpolating asks for 2,748 and the index needs 2,962.
+    /// it is wrong at both ends.
     ///
     /// Interpolation passes exactly through the reference page, so the
     /// multiplier there is exactly one and a search at `RERANK_CALIBRATION_TOP_K`
-    /// asks for precisely what it asked for before any page term existed.
+    /// asks for the reference fetch unscaled.
     ///
     /// Outside the measured pages the nearest segment's slope carries on.
     ///
     /// **The result is never below one, so the page term only ever deepens the
     /// fetch.** The measurement says a page below the reference needs less, and
-    /// acting on that costs recall. Measured on glove-100 at 50,000 records, the
-    /// calibration reads 310 and 811 candidates at pages 1 and 10 over its
-    /// training sample, which is a ratio of 0.382, where the requirement read
-    /// off the built index is 1,673 against 3,468, a ratio of 0.482. Scaling the
-    /// live fetch of 3,490 by the sample's ratio asks for 1,334 where the index
-    /// needs 1,673, and recall at a page of one fell from 1.000 to 0.988. The
-    /// ratio between two pages measured on a tenth of the records does not carry
-    /// the safety factor the reference measurement carries, so it is trusted
-    /// upward and not downward.
+    /// acting on that costs recall. The ratio between two pages measured on the
+    /// training sample does not carry the safety factor the reference
+    /// measurement carries, so it is trusted upward and not downward.
     ///
     /// It is also held at or below the page ratio, so no extrapolation can ask
     /// for more than a fetch proportional to the page.
@@ -766,8 +596,8 @@ impl RerankCalibration {
     /// record count are the caller's, on `default_rerank_fetch`.
     ///
     /// `page_scale` is exactly one at `RERANK_CALIBRATION_TOP_K`, which is the
-    /// page `fetch` was measured at, so a search there asks for exactly what it
-    /// asked for before the page term existed.
+    /// page `fetch` was measured at, so a search there asks for the depth
+    /// unscaled.
     fn fetch_at(&self, live_records: usize, top_k: usize) -> usize {
         self.fetch_from_depth(self.depth_at(live_records), top_k)
     }
@@ -785,6 +615,10 @@ impl RerankCalibration {
             return floor;
         };
         let scaled = depth * self.page_scale(top_k);
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a fetch from a finite positive f64, a cast that saturates by design"
+        )]
         let wanted = if scaled.is_finite() && scaled > 0.0 {
             scaled.round() as usize
         } else {
@@ -853,15 +687,11 @@ pub fn reconstruction_needs_unit(space: &str) -> bool {
 ///
 /// A reconstruction is the concatenation of the nearest centroid per subvector
 /// and nothing renormalises it, so it is not a unit vector even where the
-/// record it approximates was. Measured norms run 0.85 to 0.96 at the shipped
-/// dbpedia default and down to 0.41 at two subvectors and four bits.
+/// record it approximates was.
 ///
 /// `CosineDist::eval` is `1 - dot` and assumes both arguments are unit, so
 /// handing it a raw reconstruction returns neither a cosine distance nor a
-/// squared L2. On one `quantized_only` cosine index at 25,000 records that put
-/// the same record at 0.19118 through a narrow filter's exact scan and 0.19678
-/// through the traversal, with a true cosine distance of 0.10381, and the ratio
-/// between the two paths ran with the distance rather than being a constant.
+/// squared L2.
 ///
 /// Normalising here is what `add` would have done to the same vector. The
 /// doctrine `rescore_candidate` states is that a rescored score is the number a
@@ -893,17 +723,14 @@ pub fn prepare_reconstruction(needs_unit: bool, mut reconstructed: Vec<f32>) -> 
 /// hands to a raw graph, so a rescored score is the number a raw index would
 /// have reported for the same pair rather than a second implementation of the
 /// same formula.
+///
+/// The function is the space's distance on the kernel path of this
+/// processor, resolved once in this call, so a caller that scores many
+/// vectors through it checks the processor once. An unrecognised name is
+/// cosine. A dot index is never quantized, so nothing rescores against its
+/// function, and the filtered exact scan scores with it.
 pub fn raw_distance_fn(space: &str) -> fn(&[f32], &[f32]) -> f32 {
-    match space {
-        "l2" => |a: &[f32], b: &[f32]| L2Dist {}.eval(a, b),
-        "l1" => |a: &[f32], b: &[f32]| L1Dist {}.eval(a, b),
-        // A dot index is never quantized, so nothing rescores against this. The
-        // filtered exact scan does score with it, and scoring that page with
-        // cosine while the traversal scored with the inner product would have
-        // been two different orderings from one query.
-        "dot" => |a: &[f32], b: &[f32]| DotDist {}.eval(a, b),
-        _ => |a: &[f32], b: &[f32]| CosineDist {}.eval(a, b),
-    }
+    zeusdb_vector_core::raw_distance(space)
 }
 
 /// The fetch a sample of `records` needs at each of `pages`, measured over that
@@ -914,6 +741,12 @@ pub fn raw_distance_fn(space: &str) -> fn(&[f32], &[f32]) -> f32 {
 /// `codes` holds the whole sample and only its first `records` entries are
 /// scored, so the measurements `calibrate_rerank_from_sample` takes share one
 /// quantization pass.
+///
+/// The ADC ordering is the order a graph over these codes under `metric`
+/// traverses: each code is scored by [`CodeKernel`], which is the kernel the
+/// traversal evaluates over the table it installs for the query. So the depth
+/// a true neighbour is measured at is its depth in the order the search reads
+/// the candidates in, under cosine as under l2.
 ///
 /// Every page is answered from one pass. The exact neighbours are found once to
 /// the deepest page asked for and their ranks are kept in true neighbour order,
@@ -927,7 +760,8 @@ pub fn raw_distance_fn(space: &str) -> fn(&[f32], &[f32]) -> f32 {
 /// page, being fewer records than twice that page. A page the sample is too
 /// small for returns zero in its slot.
 pub(crate) fn measure_rerank_fetches(
-    pq: &PQ,
+    pq: &Arc<PQ>,
+    metric: PqMetric,
     sample: &[Vec<f32>],
     codes: &[Vec<u8>],
     distance: fn(&[f32], &[f32]) -> f32,
@@ -953,8 +787,6 @@ pub(crate) fn measure_rerank_fetches(
     if query_ids.is_empty() {
         return None;
     }
-
-    let subvectors = pq.subvectors();
 
     // One rank list per query, in true neighbour order, so that the pool for a
     // page is a prefix of each of them.
@@ -988,9 +820,10 @@ pub(crate) fn measure_rerank_fetches(
             }
 
             // The ADC ordering the search would traverse, over the same records
-            // and with the query excluded from it as well.
-            let lut = match pq.compute_adc_lut(query) {
-                Ok(lut) => lut,
+            // and with the query excluded from it as well. The kernel holds the
+            // query's table on this worker's thread until the scores are taken.
+            let kernel = match CodeKernel::new(pq.clone(), metric, query) {
+                Ok(kernel) => kernel,
                 Err(_) => return Vec::new(),
             };
             let adc: Vec<f32> = codes
@@ -1001,13 +834,10 @@ pub(crate) fn measure_rerank_fetches(
                     if i == qi {
                         return f32::INFINITY;
                     }
-                    let mut sum = 0.0f32;
-                    for s in 0..subvectors {
-                        sum += lut[s][code[s] as usize];
-                    }
-                    sum
+                    kernel.score(code)
                 })
                 .collect();
+            drop(kernel);
 
             // Ranks come off a sorted copy rather than a scan per neighbour.
             // The scan is one pass over the sample for every true neighbour,
@@ -1047,6 +877,10 @@ pub(crate) fn measure_rerank_fetches(
             continue;
         }
         pool.sort_unstable();
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a rank from f64, a cast that saturates, clamped to the pool on its line"
+        )]
         let position =
             ((RERANK_CALIBRATION_TARGET * pool.len() as f64).ceil() as usize).clamp(1, pool.len());
         out.push(pool[position - 1]);
@@ -1056,8 +890,8 @@ pub(crate) fn measure_rerank_fetches(
 
 /// The rerank calibration, with no index around it
 ///
-/// Split from `Collection::calibrate_rerank` so the measurement is reachable
-/// without an index, which is what lets it be tested directly. The method
+/// Held apart from `Collection::calibrate_rerank` so the measurement is
+/// reachable without an index, which is what lets it be tested directly. The method
 /// decides whether to run this, and this decides what it produces.
 ///
 /// One measurement per fraction in `RERANK_CALIBRATION_FIT_FRACTIONS`. The one
@@ -1065,10 +899,15 @@ pub(crate) fn measure_rerank_fetches(
 /// them is what fixes the record exponent. That last measurement also answers
 /// every page in `RERANK_CALIBRATION_PAGES` from the same pass, which is what
 /// fixes the page exponent; see `RerankCalibration`.
+///
+/// `space` decides both orders the measurement compares: its raw distance,
+/// [`raw_distance_fn`], finds the true neighbours, and the kernel a graph over
+/// `pq`'s codes for that space evaluates, [`PqMetric::of_space`], orders the
+/// candidates, as the search over that graph orders them.
 pub fn calibrate_rerank_from_sample(
-    pq: &PQ,
+    pq: &Arc<PQ>,
+    space: &str,
     sample: &[Vec<f32>],
-    distance: fn(&[f32], &[f32]) -> f32,
 ) -> Option<RerankCalibration> {
     let total = sample.len();
     if total < RERANK_CALIBRATION_TOP_K * 4 + 2 {
@@ -1076,6 +915,8 @@ pub fn calibrate_rerank_from_sample(
     }
 
     let started = Instant::now();
+    let distance = raw_distance_fn(space);
+    let metric = PqMetric::of_space(space);
 
     let refs: Vec<&[f32]> = sample.iter().map(|v| v.as_slice()).collect();
     let codes = pq.quantize_batch(&refs).ok()?;
@@ -1096,13 +937,18 @@ pub fn calibrate_rerank_from_sample(
     let mut points: Vec<(f64, f64)> = Vec::with_capacity(fit_fetches.len());
     let last = fit_fetches.len() - 1;
     for (i, fraction) in RERANK_CALIBRATION_FIT_FRACTIONS.iter().enumerate() {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a record count from f64, a cast that saturates, held to the total on its line"
+        )]
         let records = ((total as f64 * fraction).round() as usize).min(total);
         let pages: &[usize] = if i == last {
             &RERANK_CALIBRATION_PAGES
         } else {
             &reference
         };
-        let Some(measured) = measure_rerank_fetches(pq, sample, &codes, distance, records, pages)
+        let Some(measured) =
+            measure_rerank_fetches(pq, metric, sample, &codes, distance, records, pages)
         else {
             continue;
         };
@@ -1169,6 +1015,10 @@ pub fn calibrate_rerank_from_sample(
             .take(RERANK_CALIBRATION_QUERIES)
             .count(),
         target: RERANK_CALIBRATION_TARGET,
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "an elapsed time in milliseconds, which a u64 holds for 584 million years"
+        )]
         millis: started.elapsed().as_millis() as u64,
     })
 }
@@ -1237,16 +1087,13 @@ impl SearchParams {
     /// Candidates to ask the graph for
     ///
     /// The requested page unless the page is going to be reordered, and the
-    /// over-fetch capped at the live record count when it is. The cap means a
-    /// large factor degrades to a full scan rather than to an allocation the
-    /// size of the factor, and it is also what keeps the default from
-    /// over-fetching more than a small index holds.
+    /// over-fetch capped at the larger of the live record count and the page
+    /// when it is. The cap means a large factor degrades to a full scan rather
+    /// than to an allocation the size of the factor, and it is also what keeps
+    /// the default from over-fetching more than a small index holds.
     ///
-    /// A caller's own factor is a multiple of the page, unchanged. An unset
-    /// factor takes what training measured on this index's own data, scaled to
-    /// the live record count; see `RerankCalibration`. Where there is no
-    /// calibration it takes the largest of the corpus term, the floor and the
-    /// page term, for the reasons recorded on those three constants.
+    /// A caller's own factor is a multiple of the page, under the cap. An unset
+    /// factor takes `default_rerank_fetch`.
     pub fn fetch_k(&self, live_records: usize) -> usize {
         match self.rerank {
             Some(plan) => match plan.factor {
@@ -1264,10 +1111,8 @@ impl SearchParams {
 /// The fetch a search asks for when the caller named no factor
 ///
 /// One rule, read by `SearchParams::fetch_k` on the search path and by
-/// `get_stats` when it reports `rerank_default_fetch`. The two used to state it
-/// separately, so the figure `get_stats` reported was a second copy of the rule
-/// rather than a reading of it, and a change to either would have left the
-/// reported number describing a fetch no search performs.
+/// `get_stats` when it reports `rerank_default_fetch`, so the figure `get_stats`
+/// reports is a reading of the rule and describes the fetch a search performs.
 ///
 /// A calibrated index takes what training measured on its own data, scaled to
 /// the live record count and to the requested page; see `RerankCalibration`.
@@ -1283,8 +1128,7 @@ impl SearchParams {
 /// differ.
 ///
 /// **A caller's own `rerank` factor does not come through here.** The ceiling
-/// bounds the default and nothing else, so an explicit factor still asks for
-/// exactly what it names; see `SearchParams::fetch_k`.
+/// bounds the default and nothing else; see `SearchParams::fetch_k`.
 pub fn default_rerank_fetch(
     calibration: Option<RerankCalibration>,
     live_records: usize,
@@ -1387,7 +1231,8 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use zeusdb_vector_core::{
-        test_support::clustered, CosineDist, Position, RecordId, VectorGraph, VectorIndex, PQ,
+        test_support::clustered, CosineDist, Distance, L1Dist, L2Dist, Position, RecordId,
+        VectorGraph, VectorIndex, PQ,
     };
 
     /// `RawVectors` is passed by value down every search path into the loop
@@ -1449,8 +1294,8 @@ mod tests {
     /// The plan a caller who named no factor gets on a calibrated index.
     ///
     /// No page was measured and the page exponent is zero, so the page term is
-    /// exactly one at every page. That is the behaviour before the page term,
-    /// and keeping it here is what lets the tests below compare against it.
+    /// exactly one at every page. That is a fetch with no page term, and keeping
+    /// it here is what lets the tests below compare against it.
     fn calibrated_plan(fetch: usize, sample_records: usize, exponent: f64) -> RerankPlan {
         RerankPlan {
             factor: None,
@@ -1516,8 +1361,7 @@ mod tests {
         assert_eq!(params(10, Some(auto_plan())).fetch_k(100_000), 2_000);
         assert_eq!(params(10, Some(auto_plan())).fetch_k(1_000_000), 20_000);
 
-        // The page term takes over for a large page on a small corpus, where
-        // the old default would have fetched twenty times the page.
+        // The page term takes over for a large page on a small corpus.
         assert_eq!(params(100, Some(auto_plan())).fetch_k(10_000), 500);
         assert_eq!(params(100, Some(auto_plan())).fetch_k(1_000_000), 20_000);
 
@@ -1529,19 +1373,18 @@ mod tests {
 
     /// A calibrated index takes the fetch from what training measured, scaled
     /// to the live record count by the exponent training fitted, rather than
-    /// from the corpus term. The three arms below are the figures the three
-    /// real datasets calibrate to on 10,000 training records.
+    /// from the corpus term. The three arms below take the shapes three real
+    /// datasets calibrate to on 10,000 training records.
     #[test]
     fn a_calibration_governs_the_default_fetch() {
-        // ada-002 embeddings, which measure a fetch of 164 candidates and fit
-        // an exponent of 0.432.
+        // ada-002 embeddings, a shallow depth at a shallow exponent.
         let ada = calibrated_plan(164, 10_000, 0.432);
         assert_eq!(params(10, Some(ada)).fetch_k(10_000), 287);
         assert_eq!(params(10, Some(ada)).fetch_k(100_000), 776);
         // The corpus term would have asked for 2,000 at that size.
         assert_eq!(params(10, Some(auto_plan())).fetch_k(100_000), 2_000);
 
-        // GloVe word vectors, which measure 904 at a fitted 0.690 and need
+        // GloVe word vectors, a deep depth at a steep exponent, which need
         // more than the corpus term gives, not less. At 10,000 records the rule
         // asks for 1,582 candidates, being 15.8 percent of the corpus, and the
         // ceiling holds it at its floor; see `RERANK_FETCH_CEILING_FLOOR`. At
@@ -1555,7 +1398,7 @@ mod tests {
         );
         assert_eq!(params(10, Some(glove)).fetch_k(100_000), 7_748);
 
-        // SIFT descriptors, which measure 111 at a fitted 0.487.
+        // SIFT descriptors, a shallow depth at a middle exponent.
         let sift = calibrated_plan(111, 10_000, 0.487);
         assert_eq!(params(10, Some(sift)).fetch_k(100_000), 596);
 
@@ -1602,15 +1445,14 @@ mod tests {
 
     /// The measured pages are interpolated, not fitted to one slope.
     ///
-    /// The three page fetches below are what the calibration measures on
-    /// dbpedia-openai over 10,000 training records, and the relation through
-    /// them is convex: 0.431 over the first decade and 0.681 over the second.
+    /// The relation through the three page fetches below is convex: 0.431 over
+    /// the first decade and 0.681 over the second.
     #[test]
     fn the_measured_pages_are_interpolated() {
         let dbpedia = measured_page_plan(10_000, 0.437, [60, 162, 777]);
         let flat = calibrated_plan(162, 10_000, 0.437);
 
-        // The reference page is exactly what it was.
+        // The reference page asks for what the flat plan asks for.
         assert_eq!(
             params(RERANK_CALIBRATION_TOP_K, Some(dbpedia)).fetch_k(50_000),
             params(RERANK_CALIBRATION_TOP_K, Some(flat)).fetch_k(50_000),
@@ -1681,8 +1523,8 @@ mod tests {
     /// The page term scales the fetch and leaves the reference page alone.
     ///
     /// The reference page is what the calibration measured, so a search there
-    /// has to ask for exactly what it asked for before the page term existed.
-    /// That is the whole guarantee that recall at ten cannot regress.
+    /// has to ask for the depth unscaled. That is the whole guarantee that the
+    /// page term cannot cost recall at ten.
     #[test]
     fn the_page_term_leaves_the_reference_page_alone() {
         let flat = calibrated_plan(164, 10_000, 0.432);
@@ -1712,8 +1554,8 @@ mod tests {
             at_ten
         );
 
-        // A page exponent of zero is the behaviour before this was measured,
-        // and a page exponent of one is a fetch proportional to the page.
+        // A page exponent of zero is a fetch that ignores the page, and a page
+        // exponent of one is a fetch proportional to the page.
         let ignores_page = paged_plan(164, 10_000, 0.432, 0.0);
         assert_eq!(
             params(100, Some(ignores_page)).fetch_k(50_000),
@@ -1751,7 +1593,7 @@ mod tests {
             RERANK_CALIBRATION_DEFAULT_PAGE_EXPONENT
         );
 
-        // It reaches the reference page at exactly the fetch it always did, and
+        // It reaches the reference page at the fetch the flat plan reaches, and
         // it deepens above it.
         let plan = RerankPlan {
             factor: None,
@@ -1804,11 +1646,11 @@ mod tests {
     #[test]
     fn a_sample_whose_depth_does_not_grow_takes_the_maximum_exponent() {
         let sample = clustered(1_000, 32, 31337);
-        let pq = PQ::new(32, 8, 6, 1_000, None);
+        let pq = Arc::new(PQ::new(32, 8, 6, 1_000, None));
         pq.train(&sample).unwrap();
 
-        let calibration = calibrate_rerank_from_sample(&pq, &sample, raw_distance_fn("cosine"))
-            .expect("1,000 records calibrate");
+        let calibration =
+            calibrate_rerank_from_sample(&pq, "cosine", &sample).expect("1,000 records calibrate");
 
         // Fifty clusters of twenty records, and the true ten of a query are its
         // own cluster whatever fraction of the sample is present, so the depth
@@ -1855,7 +1697,7 @@ mod tests {
 
         // The ceiling is a tenth of the corpus wherever that sits above its
         // own floor, and it is that floor below 15,000 records, so a small
-        // corpus is bounded by the whole-fetch quarter exactly as it was.
+        // corpus is bounded by the whole-fetch quarter.
         assert_eq!(rerank_fetch_ceiling(2_000), RERANK_FETCH_CEILING_FLOOR);
         assert_eq!(params(10, Some(pathological)).fetch_k(2_000), 500);
         assert_eq!(params(10, Some(pathological)).fetch_k(400), 250);
@@ -1910,10 +1752,10 @@ mod tests {
     #[test]
     fn the_calibration_measures_a_fetch_and_an_exponent() {
         let sample = clustered(400, 64, 4242);
-        let pq = PQ::new(64, 8, 6, 400, None);
+        let pq = Arc::new(PQ::new(64, 8, 6, 400, None));
         pq.train(&sample).unwrap();
 
-        let calibration = calibrate_rerank_from_sample(&pq, &sample, raw_distance_fn("cosine"))
+        let calibration = calibrate_rerank_from_sample(&pq, "cosine", &sample)
             .expect("a sample of 400 records calibrates");
 
         assert_eq!(calibration.sample_records, 400);
@@ -1944,8 +1786,8 @@ mod tests {
             );
         }
 
-        // The exponent is always inside the clamp, whatever the two
-        // measurements were.
+        // The exponent is always inside the clamp, whatever the fractions
+        // measured.
         assert!(calibration.exponent >= RERANK_CALIBRATION_EXPONENT_MIN);
         assert!(calibration.exponent <= RERANK_CALIBRATION_EXPONENT_MAX);
 
@@ -1958,9 +1800,7 @@ mod tests {
         );
 
         // A sample with no room for two measurements is not calibrated.
-        assert!(
-            calibrate_rerank_from_sample(&pq, &sample[..8], raw_distance_fn("cosine")).is_none()
-        );
+        assert!(calibrate_rerank_from_sample(&pq, "cosine", &sample[..8]).is_none());
     }
 
     /// The page comes back ascending and cut to size, and a non-finite score
@@ -2037,7 +1877,7 @@ mod tests {
         // the reconstruction is normalised first. It arrives from the codebook
         // at whatever length the centroids give it, and `CosineDist` is
         // `1 - dot` on a pair assumed to be unit, so handing it the raw
-        // reconstruction returned a third quantity that was neither a cosine
+        // reconstruction would return a quantity that is neither a cosine
         // distance nor a squared L2. See `prepare_reconstruction`.
         let approximate =
             rescore_candidate(&p, &query, coded, vectors, Some(&pq), &pq_codes).unwrap();

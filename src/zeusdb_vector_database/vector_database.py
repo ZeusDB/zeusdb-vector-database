@@ -4,6 +4,7 @@ vector_database.py
 Factory for creating vector indexes with support for multiple types and quantization.
 Currently supports HNSW (Hierarchical Navigable Small World) with extensible design.
 """
+import operator
 from typing import Dict, Any, Optional
 from ._engine import _create_hnsw_index
 # Index types are registered in _index_types and dispatched in _build_index.
@@ -35,6 +36,27 @@ class VectorDatabase:
         "hnsw": "Hierarchical Navigable Small World graph",
     }
 
+    # The largest dim and expected_size the engine takes, being MAX_DIM and
+    # MAX_EXPECTED_SIZE in crates/hnsw/src/collection/construct.rs. Read by
+    # _engine_takes alone, so a rule here that derives from either value
+    # stands aside for a value the engine refuses.
+    _ENGINE_MAX_DIM = 65_536
+    _ENGINE_MAX_EXPECTED_SIZE = 100_000_000
+
+    @staticmethod
+    def _engine_takes(value: Any, ceiling: int) -> bool:
+        """Whether the engine takes `value` for an argument from 1 to `ceiling`.
+
+        The engine reads the argument through `__index__`, as
+        `operator.index` does, and refuses a value below zero, zero and one
+        above `ceiling`, before it reads the quantization config.
+        """
+        try:
+            number = operator.index(value)
+        except TypeError:
+            return False
+        return 1 <= number <= ceiling
+
     @staticmethod
     def _build_index(index_type: str, **kwargs) -> Any:
         """Dispatch to the extension factory for the requested index type."""
@@ -57,11 +79,8 @@ class VectorDatabase:
 
         The ladder stops at 32 because that is where the measurements stop. At
         100,000 records m 64 bought 0.0060 recall over m 32 for 1.55x the build
-        time, and it raises the capacity the graph reserves at creation from
-        3,787 to 4,542 bytes per declared record, which matters most to exactly
-        the large indexes a third step would be aimed at. An index well past
-        250,000 records may want 64, but nothing here measured that, so it is
-        left to the caller rather than guessed at.
+        time. An index well past 250,000 records may want 64, but nothing here
+        measured that, so it is left to the caller rather than guessed at.
 
         expected_size is a declaration rather than a limit, so understating it
         leaves the graph under-provisioned for the data that actually arrives.
@@ -76,13 +95,13 @@ class VectorDatabase:
 
     @staticmethod
     def _warn_if_selection_disabled(m: Any, ef_construction: Any) -> None:
-        """Warn where ef_construction switches the neighbour selection heuristic off.
+        """Warn where ef_construction switches the neighbour selection heuristic off at layer zero.
 
-        `select_neighbours` in the vendored crate opens with
-        `if candidates.len() <= nb_neighbours_asked`, and with
-        `extend_candidates` false it copies every candidate into the neighbour
-        list and returns from inside that branch. The budget is `2 * m` at
-        layer zero and `m` above it, both set at `hnsw.rs:1270` to `:1278`.
+        `select_neighbours` in `crates/core/src/graph/mutable/insert.rs` opens
+        with `if candidates.len() <= nb_neighbours_asked`, and in that branch it
+        copies every candidate into the neighbour list and returns. The budget
+        is `2 * m` at layer zero and `m` above it, both set in `plan` in the
+        same file.
 
         The candidate list is exactly `ef_construction` long once the index
         holds more records than that, which is a property of `search_layer`
@@ -133,7 +152,7 @@ class VectorDatabase:
         import warnings
         warnings.warn(
             f"ef_construction={ef_construction} is not greater than 2*m={budget}, "
-            f"so the neighbour selection heuristic does not run. Layer zero "
+            f"so the neighbour selection heuristic does not run at layer zero. Layer zero "
             f"insertion keeps every candidate the construction search returns, in "
             f"distance order, and prunes none of them. {remedy}, to run it.",
             UserWarning,
@@ -146,31 +165,32 @@ class VectorDatabase:
 
     @staticmethod
     def _validate_indexed_fields(fields: Any) -> list:
-        """Every rule a declared field list has to satisfy, checked here first.
+        """The shape of a declared field list, checked here first.
 
-        The Rust constructor enforces the same rules and raises the same kind of
-        error, because a directory loaded from disk has to be held to them too.
-        This exists so that a mistake in a create() call is reported against the
-        argument the caller wrote rather than wrapped in the RuntimeError
-        create() raises for a backend failure.
+        A single string, a value that is not iterable and a name that is not
+        a string are refused here with TypeError, against the argument
+        the caller wrote. The count of fields, the names themselves and a
+        name given twice are held to their rules by the Rust constructor
+        alone, which holds a directory loaded from disk to the same rules and
+        raises ValueError.
         """
         if isinstance(fields, str):
-            raise ValueError(
+            raise TypeError(
                 f"indexed_fields must be a list of field names, not a single string. "
                 f"Pass indexed_fields=['{fields}'] to declare one field."
             )
         try:
             names = list(fields)
         except TypeError:
-            raise ValueError(
+            raise TypeError(
                 f"indexed_fields must be a list of metadata field names, got "
                 f"{type(fields).__name__}."
             ) from None
         for name in names:
             if not isinstance(name, str):
-                raise ValueError(
+                raise TypeError(
                     f"indexed_fields must hold field names as strings, but it holds "
-                    f"{name!r}, which is a {type(name).__name__}."
+                    f"{name!r}, of type {type(name).__name__}."
                 )
         return names
 
@@ -209,7 +229,8 @@ class VectorDatabase:
                   0.017 and 0.039 of recall at 10 below a raw index under
                   'dot' and 'l1', against 0.006 to 0.018 under 'cosine' and
                   'l2'.
-                - m (int): Bidirectional links per node (min: 2, max: 256). Defaults
+                - m (int): The most links a node keeps per layer, twice that at
+                  layer zero (min: 2, max: 256). Defaults
                   to 16 up to an expected_size of 25,000 and 32 above it. A graph
                   too sparse for the record count loses recall that no search
                   width recovers and no add() revises m, so set expected_size
@@ -219,21 +240,18 @@ class VectorDatabase:
                   degenerate.
                 - ef_construction (int): Width of the candidate search each
                   insertion runs (default: 200, max: 4,096). It sets the supply the
-                  neighbour selection draws from, and m sets how much of it is
-                  kept, so it changes neither search latency nor the size of
-                  the finished index. Build time is linear in it above 100: at
-                  50,000 records of 1,536 dimensions, 62.7s, 131.2s, 262.8s and
-                  464.9s at 100, 200, 400 and 800. Recall at 10 plateaus at 100
-                  on SIFT and at 200 on OpenAI embeddings, and on GloVe raising
-                  ef_search on the graph already built buys more than raising
-                  this. The neighbour selection heuristic runs only while this
-                  is above 2 * m, and create() warns where it is not.
+                  neighbour selection draws from, and m caps how much of it is
+                  kept. Build time is linear in it above 100.
+                  Recall at 10 plateaus at 100 on SIFT and at 200 on OpenAI
+                  embeddings, and on GloVe raising ef_search on the graph
+                  already built buys more than raising this. create() warns
+                  where this is at or below 2 * m.
                   index.rebuild(ef_construction=...) changes it afterwards, at
                   the cost of a full rebuild.
                 - expected_size (int): Expected number of vectors (default: 10000,
                   max: 100,000,000). Also selects the default m, see above. It is
                   a capacity hint rather than a limit, and an index that grows
-                  past twice its declaration logs a warning once.
+                  past twice its declaration logs a warning.
                 - indexed_fields (list[str]): Metadata fields this index builds a
                   column for, so that a search filtering on them does not have to
                   read every record. Empty by default, which is what every index
@@ -260,9 +278,9 @@ class VectorDatabase:
                       over the corpus at the moment of the query, so it takes
                       whole numbers above zero alone, and is the default where
                       a tokenizer is declared, since a text layer stores term
-                      counts; as a mapping, {"type": "bm25", "k1": 1.2,
-                      "b": 0.75} sets its two parameters, k1 finite and at least
-                      zero and b between zero and one.
+                      counts; as a dict, {"type": "bm25", "k1": 1.2,
+                      "b": 0.75} sets its two parameters, k1 finite, at least
+                      zero and at most 2^40, and b between zero and one.
                     - unlink: What a removal does to the record's postings,
                       "lazy" (default), "strand" or "eager".
                     - lazy_threshold_percent (int): The dead share of a
@@ -282,10 +300,9 @@ class VectorDatabase:
 
                   A filter naming only declared fields is answered from the
                   columns. A filter naming anything else returns exactly the same
-                  records and reads every record's metadata to do it, which costs
-                  about 250 nanoseconds a record, and the index logs one warning
-                  naming the field. Declaring a field is not required and nothing
-                  becomes unfilterable by being left out.
+                  records and reads records' metadata to do it, which costs about
+                  250 nanoseconds a record. Declaring a field is not required and
+                  nothing becomes unfilterable by being left out.
 
                   What it costs is four bytes a record for a field with few
                   distinct values. A field whose value differs on nearly every
@@ -297,10 +314,10 @@ class VectorDatabase:
                     'type': 'pq',              # 'pq' (Product Quantization) or 'int8' (scalar), see below
                     'subvectors': 24,          # Number of subvectors (must divide dim evenly).
                                                # Default: dim / 32 clamped to 8..192 and snapped to
-                                               # a divisor of dim, so 128x compression from dim 256 up
+                                               # a divisor of dim
                     'bits': 8,                 # Bits per subvector (1-8, controls centroids, default: 8)
-                    'training_size': None,     # Auto-calculated based on subvectors & bits (or specify manually)
-                    'max_training_vectors': None,  # Optional limit on training vectors used
+                    'training_size': None,     # Records collected before training (default 10000)
+                    'max_training_vectors': None,  # Optional, at least training_size; training uses training_size records
                     'storage_mode': 'quantized_only' # 'quantized_only' for memory, 'quantized_with_raw' for accuracy
                 }
 
@@ -309,28 +326,25 @@ class VectorDatabase:
                     'type': 'int8',
                     'scale': 'per_dimension',  # The one scale rule this build fits (default)
                     'training_size': None,     # Records collected before the scales are fitted (default 10000)
-                    'max_training_vectors': None,  # Optional limit on training vectors used
+                    'max_training_vectors': None,  # Optional, at least training_size; fitting uses training_size records
                     'storage_mode': 'quantized_only' # The one mode a scalar index takes
                 }
 
-            Note on 'int8': every value is held as one signed byte, decoded
-            through one scale per dimension fitted as the largest magnitude
-            seen in that dimension over the training sample divided by 127,
-            so a record costs dim bytes, plus four for its length under
-            'cosine', against dim * 4 raw. The graph scores against the
-            decoded values inside the distance, so no vector is held at full
-            width anywhere in the index and all four spaces are served. A
-            value beyond the range its dimension's sample reached is clipped
-            to the edge of the range rather than refused; get_stats() counts
-            such values under quantization_saturated_values. Measured on
-            this engine's own corpora at 100,000 records, a scalar index sits
+            Note on 'int8': once its scales are fitted, every value is held as
+            one signed byte, decoded through one scale per dimension, so a
+            record costs dim bytes, plus four under 'cosine', against dim * 4
+            raw. The graph scores against the decoded values inside the
+            distance, so all four spaces are served. A value its byte cannot
+            hold is clipped rather than refused; get_stats() counts such
+            values under quantization_saturated_values. Measured on this
+            engine's own corpora at 100,000 records, a scalar index sits
             between 0.006 and 0.018 of recall at 10 below a raw index and
             searches no slower, and it holds about a third of what a raw
-            index holds at 100 dimensions and a fifth at 1,536. It keeps no
-            raw vector and never reranks, so 'quantized_with_raw' is refused
-            for it, and 'subvectors' and 'bits' are refused under it as
-            'scale' is refused under 'pq'. get_records() returns the decoded
-            vector, at unit length under 'cosine'.
+            index holds at 100 dimensions and a fifth at 1,536.
+            'quantized_with_raw' is refused for it, and 'subvectors' and
+            'bits' are refused under it as 'scale' is refused under 'pq'.
+            get_records() returns the decoded vector once fitted, at unit
+            length under 'cosine'.
 
             Note: Product quantization replaces each vector with a code of one byte per
             subvector, so the code is dim * 4 / subvectors smaller than the vector.
@@ -377,7 +391,7 @@ class VectorDatabase:
             vdb = VectorDatabase()
             index = vdb.create("hnsw", dim=1536)
             
-            # HNSW index with Product Quantization (auto-calculated training size)
+            # HNSW index with Product Quantization (default training size)
             quantization_config = {
                 'type': 'pq',
                 'subvectors': 8,
@@ -394,7 +408,7 @@ class VectorDatabase:
                 'type': 'pq',
                 'subvectors': 16,         # More subvectors = longer code, lower ratio, better accuracy
                 'bits': 6,                # Fewer bits = fewer centroids, smaller codebook and table
-                'training_size': 75000,    # Override auto-calculation
+                'training_size': 75000,    # Override the default
                 'storage_mode': 'quantized_only'  # Drop raw vectors once training completes
             }
             index = vdb.create(
@@ -405,10 +419,22 @@ class VectorDatabase:
             )
 
         Raises:
-            ValueError: If index_type is not supported or quantization config is invalid.
-            RuntimeError: If index creation fails due to backend validation.
+            TypeError: If dim is missing, a parameter is of the wrong type, or a
+                keyword is not one the index type takes.
+            ValueError: If index_type is not supported, a parameter breaks the
+                rules above, or the quantization config is invalid.
+            OverflowError: If dim, m, ef_construction, expected_size,
+                training_size or max_training_vectors lies outside the signed
+                64 bit range.
+            RuntimeError: If the call fails inside the engine.
         """
-        index_type = (index_type or "").strip().lower()
+        # A wrong type is a TypeError, as the docstring says, before the
+        # name is read. None is not a str either.
+        if not isinstance(index_type, str):
+            raise TypeError(
+                f"index_type must be a str such as 'hnsw', got {type(index_type).__name__}."
+            )
+        index_type = index_type.strip().lower()
 
         if index_type not in self._index_types:
             available = ', '.join(sorted(self._index_types.keys()))
@@ -477,28 +503,65 @@ class VectorDatabase:
                 quantization_config, dim, kwargs.get("expected_size")
             )
 
-        try:
-            # Always pass quantization_config parameter
-            if quantization_config is not None:
-                # Remove keys with None values and internal keys
-                clean_config = {k: v for k, v in quantization_config.items() if not k.startswith('_') and v is not None}
-            else:
-                clean_config = None
+        # Always pass quantization_config parameter
+        if quantization_config is not None:
+            # Remove keys with None values and internal keys
+            clean_config = {k: v for k, v in quantization_config.items() if not k.startswith('_') and v is not None}
+        else:
+            clean_config = None
 
-            return self._build_index(index_type, quantization_config=clean_config, **kwargs)
-        except Exception as e:
-            raise RuntimeError(f"Failed to create {index_type.upper()} index: {e}") from e
+        # What the builder raises reaches the caller as it is: ValueError for a
+        # value its rules refuse and TypeError for a value of the wrong type or
+        # a keyword it does not take, in the engine's words.
+        return self._build_index(index_type, quantization_config=clean_config, **kwargs)
 
 
     def load(self, path: str, tokenizer: Any = None, durability: Optional[str] = None,
-             interval_ms: Optional[int] = None, checkpoint_only: bool = False) -> Any:
+             interval_ms: Optional[int] = None, checkpoint_only: bool = False,
+             repair: bool = False) -> Any:
         """
         Load a previously saved ZeusDB index from disk.
 
         A directory saved with a journal beside it is recovered: every
         mutation the journal holds since the directory was last saved is
         replayed, the journal is reopened, and the index keeps recording to
-        it. See HNSWIndex.journal_to for what a journal is.
+        it. See HNSWIndex.journal_to for what a journal is. A journaled
+        directory saved by a release before 0.14.0 is upgraded by its first
+        load to format 5.0.0, which those releases do not open, so keep a
+        copy from before the upgrade where you may need to go back.
+
+        The load holds the directory's lock, a file beside it named
+        <path>.zdblock, while it reads where that file can be locked, and a
+        journaled index keeps it until the index is dropped, so a second
+        index on the same directory, in this process or another, raises
+        RuntimeError (CollectionLocked). A journaled directory on a medium
+        that refuses writes, or one this process has no permission to write,
+        opens read only with a RuntimeWarning where the load replays its
+        journal: every record is replayed in memory, nothing on the medium
+        changes, add() names every record in errors, every other change is
+        refused with RuntimeError (CollectionReadOnly), and save() into
+        another directory copies it somewhere writable. A directory holding a
+        feature this build does
+        not know, which its manifest marks read_only, opens read only the
+        same way whatever the medium, where its journal holds no record of a
+        kind this build does not know, and there add() names every record in
+        errors, and every other change, every save, checkpoint(), journal_to()
+        and backup() is refused with RuntimeError (FeatureReadOnly). A
+        journaled directory below format 5.0.0 whose identity records the
+        largest generation a manifest can hold opens read only the same way
+        where the load replays its journal, since that load's upgrade is a
+        save and no save can record the generation after it, and add() names
+        every record in errors, and every other
+        change, save, checkpoint() and backup() is refused with RuntimeError
+        naming that generation. A directory a release before 0.14.0 wrote
+        from values past a bound, being a stored vector of an l2, dot or l1
+        index whose Euclidean norm passes 2^62, a codebook value past 2^62, a
+        scale past the largest one vectors within 2^62 fit, a sparse value
+        whose magnitude passes 2^40 or a term weighting k1 past 2^40, opens
+        read only the same way, journaled or not and whatever the medium: a
+        RuntimeWarning names the value, its file and the bound, add() names
+        every record in errors, and every other change, save, checkpoint()
+        and backup() is refused with RuntimeError in the same words.
 
         Args:
             path: Path to the .zdb directory containing the saved index
@@ -507,8 +570,8 @@ class VectorDatabase:
                 whose sparse space was declared with tokenizer="simple"
                 records that and needs nothing here. One declared with a
                 callable of your own records the tokenizer as external and
-                cannot reproduce it, so it opens only when the same callable
-                is handed here, and raises RuntimeError naming the space
+                cannot reproduce it, so it opens only when a callable is
+                handed here, and raises RuntimeError naming the space
                 otherwise. A callable handed for a directory that recorded
                 "simple", "simple" handed for one that recorded external,
                 and anything handed for a directory with no text layer are
@@ -530,21 +593,47 @@ class VectorDatabase:
                 10 by default. Refused under any other durability.
             checkpoint_only: Open the directory as it was at its last save
                 and leave the journal beside it alone: nothing is replayed,
-                the file is neither read nor opened, and the index records
-                nothing until journal_to is called on it. This is the way in
-                for a directory copied without its journal, which load
-                otherwise refuses with FileNotFoundError naming the file,
-                and for a caller who wants the state as of the checkpoint.
-                durability and interval_ms do not apply and are refused
-                beside it.
+                the journal is neither read nor opened, and the index
+                records nothing until journal_to is called on it. This is
+                the way in for a directory copied without its journal, which
+                load otherwise refuses with FileNotFoundError naming the
+                journal, and for a caller who wants the state as of the
+                checkpoint. durability and interval_ms do not apply and are
+                refused beside it.
+            repair: Load a directory whose journal is damaged, which load
+                otherwise refuses naming repair=True. Every whole call
+                before the first call the damage touches is replayed, that
+                call and everything after it in the journal are copied into
+                <path>.zdbjournal/quarantine/ beside a repair.json that
+                describes them, the journal is cut there, and the directory
+                is saved. A journal of format version 1 marks no calls, so it
+                is cut at the damaged record itself, or at its first byte
+                where its header does not read. A stale segment whose header
+                does not read is copied there whole instead, and nothing is
+                cut. A RuntimeWarning names the damage, the records set aside
+                and the folder, and index.recovery reports the same. A
+                directory with nothing damaged and no repair unfinished loads
+                as it would without repair. Where the index opens read only,
+                nothing is set aside or changed. Refused beside
+                checkpoint_only with ValueError.
 
         Returns:
-            HNSWIndex: The loaded index ready for use
+            HNSWIndex: The loaded index ready for use. index.recovery says
+            what the load did, such as the records it replayed and any
+            damage it found.
 
-        A loaded journaled index holds its journal file open until the index
-        is dropped, and a file deleted or moved under a live index is one the
+        A loaded journaled index holds its journal open until the index is
+        dropped, and a segment deleted or moved under a live index is one the
         directory can no longer replay, so drop the index before touching the
-        file.
+        journal.
+
+        A directory below format 5.0.0 whose manifest records created_at as
+        anything but an RFC 3339 time opens with its saved_at in its place,
+        or with the time of the load where that is not one either. A time
+        whose offset's minus is U+2212, or whose second is 60 in any minute,
+        is read as one as well. A RuntimeWarning names both values,
+        index.recovery reports them under "replaced", and the next save
+        writes the value taken.
 
         Example:
             >>> vdb = VectorDatabase()
@@ -553,7 +642,7 @@ class VectorDatabase:
         """
         from ._engine import _load_index  # Direct function import
         return _load_index(path, tokenizer, durability=durability, interval_ms=interval_ms,
-                           checkpoint_only=checkpoint_only)
+                           checkpoint_only=checkpoint_only, repair=repair)
 
 
     def _validate_quantization_config(self, config: Dict[str, Any], dim: int,
@@ -563,20 +652,30 @@ class VectorDatabase:
 
         Args:
             config: Raw quantization configuration
-            dim: Vector dimension for validation
+            dim: Vector dimension for validation. A dim the engine refuses
+                skips every rule that derives from it and leaves the Rust
+                layer to report the real validation error.
             expected_size: The declared record count, used only to decide
                 whether the fixed memory quantization costs can be repaid.
-                None or a non-integer skips that check and leaves the Rust
-                layer to report the real validation error.
+                None, a non-integer or a value the engine refuses skips that
+                check and leaves the Rust layer to report the real validation
+                error.
 
         Returns:
             Validated and normalized configuration
 
         Raises:
+            TypeError: If config is not a dict or holds a key that is not a str.
             ValueError: If configuration is invalid
         """
         if not isinstance(config, dict):
-            raise ValueError("quantization_config must be a dictionary")
+            raise TypeError("quantization_config must be a dictionary")
+        for key in config:
+            if not isinstance(key, str):
+                raise TypeError(
+                    f"quantization_config must have str keys, but it holds the key {key!r}, "
+                    f"of type {type(key).__name__}."
+                )
         
         # Create a copy to avoid modifying the original
         validated_config = config.copy()
@@ -598,6 +697,13 @@ class VectorDatabase:
                 "quantization_config names 'scale' under type 'pq', and 'scale' is read "
                 "under type 'int8' alone. Drop it, or change type."
             )
+        self._refuse_unread_keys(validated_config, 'pq', self._PQ_KEYS, ('scale',))
+
+        # Every rule below derives from dim, and the engine refuses a dim it
+        # does not take before it reads this config, so for such a dim the
+        # rules stand aside and the engine's refusal names dim.
+        if not self._engine_takes(dim, self._ENGINE_MAX_DIM):
+            return validated_config
 
         # Validate subvectors
         #
@@ -623,7 +729,9 @@ class VectorDatabase:
         validated_config['subvectors'] = subvectors
         
         # Validate bits per subvector
-        bits = validated_config.get('bits', 8)
+        bits = validated_config.get('bits')
+        if bits is None:
+            bits = 8
         if not isinstance(bits, int) or bits < 1 or bits > 8:
             raise ValueError(f"bits must be an integer between 1 and 8, got {bits}")
         
@@ -634,7 +742,12 @@ class VectorDatabase:
         if training_size is None:
             training_size = self._calculate_smart_training_size(subvectors, bits)
         else:
-            if not isinstance(training_size, int) or training_size < 1000:
+            if not isinstance(training_size, int):
+                raise ValueError(
+                    f"training_size must be an integer, got {training_size!r}, of type "
+                    f"{type(training_size).__name__}."
+                )
+            if training_size < 1000:
                 raise ValueError(f"training_size must be at least 1000 for stable k-means clustering, got {training_size}")
         
         validated_config['training_size'] = training_size
@@ -642,14 +755,20 @@ class VectorDatabase:
         # Validate max training vectors if provided
         max_training_vectors = validated_config.get('max_training_vectors')
         if max_training_vectors is not None:
-            if not isinstance(max_training_vectors, int) or max_training_vectors < training_size:
+            if not isinstance(max_training_vectors, int):
+                raise ValueError(
+                    f"max_training_vectors must be an integer, got {max_training_vectors!r}, "
+                    f"of type {type(max_training_vectors).__name__}."
+                )
+            if max_training_vectors < training_size:
                 raise ValueError(
                     f"max_training_vectors ({max_training_vectors}) must be >= training_size ({training_size})"
                 )
             validated_config['max_training_vectors'] = max_training_vectors
         
         # Validate storage mode
-        storage_mode = str(validated_config.get('storage_mode', 'quantized_only')).lower()
+        storage_mode = validated_config.get('storage_mode')
+        storage_mode = 'quantized_only' if storage_mode is None else str(storage_mode).lower()
         valid_modes = {'quantized_only', 'quantized_with_raw'}
         if storage_mode not in valid_modes:
             raise ValueError(
@@ -740,6 +859,26 @@ class VectorDatabase:
 
         return validated_config
 
+    # The keys each scheme reads, in the order its refusal names them.
+    _PQ_KEYS = ('type', 'subvectors', 'bits', 'training_size', 'max_training_vectors',
+                'storage_mode')
+    _INT8_KEYS = ('type', 'scale', 'training_size', 'max_training_vectors', 'storage_mode')
+
+    @staticmethod
+    def _refuse_unread_keys(config: Dict[str, Any], qtype: str, reads: tuple,
+                            refused_apart: tuple) -> None:
+        """Raise ValueError naming the first key of `config` that type `qtype`
+        does not read, being one in neither `reads` nor `refused_apart`, the
+        other scheme's keys, which the caller refuses in words of their own
+        where they are not None. The engine reads named keys alone, so a key
+        it does not read would change nothing."""
+        for key in config:
+            if key not in reads and key not in refused_apart:
+                raise ValueError(
+                    f"quantization_config holds the key '{key}', which type '{qtype}' does "
+                    f"not read. Type '{qtype}' reads {', '.join(reads[:-1])} and {reads[-1]}."
+                )
+
     # Records a scalar quantized index collects before it fits its scales.
     #
     # The scales are the largest magnitude a dimension reaches over the
@@ -782,6 +921,7 @@ class VectorDatabase:
                     f"quantization_config names '{key}' under type 'int8', and '{key}' is "
                     f"read under type 'pq' alone. Drop it, or change type."
                 )
+        self._refuse_unread_keys(config, 'int8', self._INT8_KEYS, ('subvectors', 'bits'))
         config['type'] = 'int8'
 
         scale = str(config.get('scale') or 'per_dimension').lower()
@@ -796,21 +936,30 @@ class VectorDatabase:
         training_size = config.get('training_size')
         if training_size is None:
             training_size = self.DEFAULT_INT8_TRAINING_SIZE
-        elif (not isinstance(training_size, int) or isinstance(training_size, bool)
-              or training_size < 1000):
+        elif not isinstance(training_size, int):
+            raise ValueError(
+                f"training_size must be an integer, got {training_size!r}, of type "
+                f"{type(training_size).__name__}."
+            )
+        elif isinstance(training_size, bool) or training_size < 1000:
             raise ValueError(f"training_size must be at least 1000, got {training_size}")
         config['training_size'] = training_size
 
         max_training_vectors = config.get('max_training_vectors')
         if max_training_vectors is not None:
-            if (not isinstance(max_training_vectors, int) or isinstance(max_training_vectors, bool)
-                    or max_training_vectors < training_size):
+            if not isinstance(max_training_vectors, int):
+                raise ValueError(
+                    f"max_training_vectors must be an integer, got {max_training_vectors!r}, "
+                    f"of type {type(max_training_vectors).__name__}."
+                )
+            if isinstance(max_training_vectors, bool) or max_training_vectors < training_size:
                 raise ValueError(
                     f"max_training_vectors ({max_training_vectors}) must be >= training_size ({training_size})"
                 )
             config['max_training_vectors'] = max_training_vectors
 
-        storage_mode = str(config.get('storage_mode', 'quantized_only')).lower()
+        storage_mode = config.get('storage_mode')
+        storage_mode = 'quantized_only' if storage_mode is None else str(storage_mode).lower()
         if storage_mode == 'quantized_with_raw':
             raise ValueError(
                 "storage_mode='quantized_with_raw' is not available under type 'int8'. The "
@@ -831,9 +980,12 @@ class VectorDatabase:
         # its scales, holds every record raw exactly as an unquantized index
         # does, and gains nothing; the same warning the product quantized
         # scheme gives, from the same frame.
+        # A value the engine refuses declares no size, so the warnings that
+        # derive from it stand aside and the engine's refusal names it.
         declared_size = (
             expected_size
             if isinstance(expected_size, int) and not isinstance(expected_size, bool)
+            and self._engine_takes(expected_size, self._ENGINE_MAX_EXPECTED_SIZE)
             else None
         )
         if declared_size is not None and declared_size < training_size:
@@ -1118,9 +1270,12 @@ class VectorDatabase:
         # gains nothing. The memory warnings below describe the trained state,
         # which this configuration never reaches at its declared size, so this
         # one replaces them.
+        # A value the engine refuses declares no size, so the warnings that
+        # derive from it stand aside and the engine's refusal names it.
         declared_size = (
             expected_size
             if isinstance(expected_size, int) and not isinstance(expected_size, bool)
+            and self._engine_takes(expected_size, self._ENGINE_MAX_EXPECTED_SIZE)
             else None
         )
         never_trains = declared_size is not None and declared_size < training_size
@@ -1223,12 +1378,15 @@ class VectorDatabase:
         # subvectors, so only subvectors moves it. bits sets the centroid count
         # and leaves the code at one byte per subvector, so it does not.
         #
-        # A derived subvectors is exempt. This warning tells a caller that the
-        # value they chose looks unbalanced, and the derived value is 128x from
-        # dim 256 upward, which is above the threshold and is the measured
-        # choice. Warning about it would have create() warn about its own
-        # default at every common embedding dimension.
-        if compression_ratio > 50 and not subvectors_was_derived:
+        # A derived subvectors is held to 4 * DEFAULT_SUBVECTOR_WIDTH, the
+        # ratio the default is measured at, rather than to the threshold a
+        # given one is held to, since that threshold would have create() warn
+        # about its own default at every common embedding dimension. Past the
+        # measured ratio the snap to a divisor or the clamp has moved the
+        # default off the measured choice, and the warning holds for it as for
+        # a given value.
+        threshold = 4 * self.DEFAULT_SUBVECTOR_WIDTH if subvectors_was_derived else 50
+        if compression_ratio > threshold:
             warnings.warn(
                 f"Very high compression ratio: {compression_ratio:.1f}x may significantly impact recall quality. "
                 f"Increase subvectors ({subvectors}) to lower it, at the cost of memory and build time.",

@@ -39,6 +39,45 @@ use zeusdb_vector_core::{frame_begin, frame_finish, unframe, Error, FrameEncodin
 /// Bytes a term costs at least, being its length and one byte of text.
 const TERM_MIN_BYTES: usize = 5;
 
+/// The longest term a dictionary holds, in bytes, being what the length
+/// written before each term can name.
+pub const MAX_TERM_BYTES: usize = u32::MAX as usize;
+
+// The longest term this thread's dictionaries take, which a test lowers to
+// reach the refusal without a term of four gibibytes. Nothing outside the
+// tests sees it.
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    pub static TERM_CEILING: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(MAX_TERM_BYTES) };
+}
+
+/// The longest term a dictionary takes.
+#[cfg(any(test, feature = "test-support"))]
+fn term_ceiling() -> usize {
+    TERM_CEILING.with(std::cell::Cell::get)
+}
+
+/// The longest term a dictionary takes.
+#[cfg(not(any(test, feature = "test-support")))]
+fn term_ceiling() -> usize {
+    MAX_TERM_BYTES
+}
+
+/// Refuse a term longer than a dictionary holds, which is what interning it
+/// would refuse. A caller that records an interning before it happens runs
+/// this first.
+pub fn refuse_term(term: &str) -> Result<(), Error> {
+    let ceiling = term_ceiling();
+    if term.len() > ceiling {
+        return Err(Error::TermTooLong {
+            bytes: term.len(),
+            ceiling,
+        });
+    }
+    Ok(())
+}
+
 /// Every distinct term a space has seen, by id.
 #[derive(Clone, Debug, Default)]
 pub struct TermDictionary {
@@ -50,17 +89,25 @@ impl TermDictionary {
         Self::default()
     }
 
-    /// The id of `term`, issued now if the term is new.
+    /// The id of `term`, issued now if the term is new, refused where a new
+    /// term is longer than the dictionary holds.
     pub fn intern(&mut self, term: &str) -> Result<u32, Error> {
         if let Some(&id) = self.ids.get(term) {
             return Ok(id);
         }
-        let id = u32::try_from(self.ids.len()).map_err(|_| Error::TermIdsExhausted)?;
-        if id == u32::MAX {
-            return Err(Error::TermIdsExhausted);
-        }
+        refuse_term(term)?;
+        let id = self.next_id()?;
         self.ids.insert(Box::from(term), id);
         Ok(id)
+    }
+
+    /// The id the next new term takes, refused where the ids are exhausted.
+    /// What a caller that records an interning before it happens names.
+    pub fn next_id(&self) -> Result<u32, Error> {
+        match u32::try_from(self.ids.len()) {
+            Ok(id) if id != u32::MAX => Ok(id),
+            _ => Err(Error::TermIdsExhausted),
+        }
     }
 
     /// The id of `term`, where it has one. A query asks this, so a term no
@@ -103,9 +150,15 @@ impl TermDictionary {
             FrameEncoding::Engine,
             4 + terms.iter().map(|t| 4 + t.len()).sum::<usize>(),
         );
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the term count, below u32::MAX, since intern refuses past it with TermIdsExhausted"
+        )]
         payload.extend((terms.len() as u32).to_le_bytes());
         for term in &terms {
-            payload.extend((term.len() as u32).to_le_bytes());
+            let len = u32::try_from(term.len())
+                .expect("a term is interned within the dictionary's ceiling, which a u32 names");
+            payload.extend(len.to_le_bytes());
             payload.extend_from_slice(term.as_bytes());
         }
         frame_finish(payload, terms.len() as u64)
@@ -160,6 +213,10 @@ impl TermDictionary {
             if dictionary.ids.contains_key(term) {
                 return Err(corrupt(format!("term {} repeats an earlier term", id)));
             }
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a term's id at load, below the term count the payload records as a u32"
+            )]
             dictionary.ids.insert(Box::from(term), id as u32);
         }
         if at != payload.len() {
@@ -173,17 +230,21 @@ impl TermDictionary {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Ids are issued in arrival order, a repeat gets its id back, a lookup
-    /// issues nothing, and the terms come back in id order.
+    /// issues nothing, the next id is the one the next new term takes, and
+    /// the terms come back in id order.
     #[test]
     fn ids_are_issued_in_arrival_order_and_a_lookup_issues_none() {
         let mut d = TermDictionary::new();
+        assert_eq!(d.next_id().unwrap(), 0);
         assert_eq!(d.intern("fox").unwrap(), 0);
         assert_eq!(d.intern("the").unwrap(), 1);
         assert_eq!(d.intern("fox").unwrap(), 0);
+        assert_eq!(d.next_id().unwrap(), 2, "asking issues nothing");
+        assert_eq!(d.next_id().unwrap(), 2);
         assert_eq!(d.id_of("the"), Some(1));
         assert_eq!(d.id_of("dog"), None);
         assert_eq!(d.len(), 2);
@@ -265,12 +326,55 @@ mod tests {
         );
     }
 
+    /// The term ceiling, lowered on this thread for the length of a test and
+    /// put back when dropped.
+    pub(crate) struct Lowered(usize);
+
+    impl Lowered {
+        pub(crate) fn to(ceiling: usize) -> Self {
+            Lowered(TERM_CEILING.with(|held| held.replace(ceiling)))
+        }
+    }
+
+    impl Drop for Lowered {
+        fn drop(&mut self) {
+            TERM_CEILING.with(|held| held.set(self.0));
+        }
+    }
+
+    /// A term as long as the ceiling is interned, and one byte longer is
+    /// refused, naming its length and the ceiling, with no id issued, and
+    /// the next term takes the id the refused one would have taken. A term
+    /// already held is found whatever the ceiling.
+    #[test]
+    fn a_term_past_the_ceiling_is_refused_and_takes_no_id() {
+        let mut d = TermDictionary::new();
+        d.intern("abcdefgh").unwrap();
+        let _lowered = Lowered::to(5);
+        assert_eq!(d.intern("fives").unwrap(), 1);
+        assert!(matches!(
+            d.intern("sixsix"),
+            Err(Error::TermTooLong {
+                bytes: 6,
+                ceiling: 5
+            })
+        ));
+        assert_eq!(d.id_of("sixsix"), None);
+        assert_eq!(d.next_id().unwrap(), 2);
+        assert_eq!(d.intern("abcdefgh").unwrap(), 0, "a held term is found");
+        assert_eq!(
+            refuse_term("sixsix").unwrap_err().to_string(),
+            "A term of 6 bytes is longer than the 5 bytes a text space stores for one term."
+        );
+    }
+
     /// A seeded mutator over a valid artefact never panics the reader. The
     /// frame is repaired around each mutation so the payload's reader sees
     /// it.
     #[test]
     fn no_mutation_of_a_valid_dictionary_panics_the_reader() {
         use zeusdb_vector_core::frame_fuzz;
+        use zeusdb_vector_core::test_support::{bounded, read_bound};
         let mut d = TermDictionary::new();
         for i in 0..200u32 {
             d.intern(&format!("term{}x{}", i, "é".repeat(i as usize % 4)))
@@ -285,7 +389,9 @@ mod tests {
         let mut past_frame = 0usize;
         for _ in 0..cases {
             let blob = frame_fuzz::mutate(&mut rng, &good, FrameKind::TermDictionary);
-            match TermDictionary::decode(&blob, "terms") {
+            match bounded(read_bound(blob.len()), || {
+                TermDictionary::decode(&blob, "terms")
+            }) {
                 Ok(back) => assert!(back.len() <= 200 + 64),
                 Err(Error::DecodeFailed { error, .. }) => {
                     if !error.contains("frame") && !error.contains("file") {

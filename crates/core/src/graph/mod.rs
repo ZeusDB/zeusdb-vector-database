@@ -52,6 +52,7 @@
 use crate::distance::{
     CosineDist, DistPQ, DotDist, Int8Dist, Int8Metric, L1Dist, L2Dist, PqMetric,
 };
+use crate::error::Error;
 use crate::int8::Int8Codec;
 use crate::pq::PQ;
 use crate::space::Position;
@@ -81,8 +82,13 @@ mod mutable;
 mod structure;
 #[cfg(test)]
 pub(crate) mod test_graph;
-// A seeded mutator over a valid dump, driving the reader with generated input
-// rather than with the enumerated damage cases written by hand.
+// The dump fuzzer's mutator, for this crate's fuzzer below and for a fuzzer
+// in another crate that mutates a saved directory's dump. Present under the
+// `test-support` feature and in this crate's own tests.
+#[cfg(any(test, feature = "test-support"))]
+pub mod dump_fuzz;
+// A seeded mutator over valid dumps of both versions, driving the readers with
+// generated input rather than with the damage cases written by hand.
 #[cfg(test)]
 mod fuzz;
 // The graph and ADC guards, which build a graph directly rather than through
@@ -93,12 +99,19 @@ mod guard_tests;
 #[cfg_attr(not(test), allow(dead_code))]
 mod traverse;
 
+pub use dump::{DumpRefusal, DumpRegion};
 use dump::{Expected, GraphKind};
 use levels::LevelGenerator;
 use mutable::MutableGraph;
 /// What phase one of an insertion hands to phase two. Opaque outside the
 /// graph, and nameable so a caller can carry it between the two guards.
 pub use mutable::Planned;
+#[cfg(any(test, feature = "test-support"))]
+pub use mutable::GRAPH_CEILINGS;
+/// The room a graph has for insertions, which a caller admitting records
+/// holds each to before anything is recorded for it, and the ceilings it is
+/// reckoned against.
+pub use mutable::{GraphCeilings, GraphRoom};
 use store::VectorStore;
 use traverse::LAYERS;
 
@@ -118,6 +131,66 @@ use traverse::LAYERS;
 pub trait Distance<T> {
     /// The distance from `va` to `vb`. Both slices are the graph's width.
     fn eval(&self, va: &[T], vb: &[T]) -> f32;
+}
+
+/// A borrowed distance evaluates as the distance it borrows.
+impl<T, D: Distance<T> + ?Sized> Distance<T> for &D {
+    #[inline(always)]
+    fn eval(&self, va: &[T], vb: &[T]) -> f32 {
+        (**self).eval(va, vb)
+    }
+}
+
+/// How a graph of distance `D` evaluates its distances for the length of one
+/// search or one build step.
+///
+/// A caller takes a path once and hands it down, and every distance the
+/// search or the step evaluates then comes from the scorer the path gives.
+/// [`Held`] gives the graph's own distance. A kernel path, which
+/// `distance::resolve` answers, gives a raw distance its kernel of that path,
+/// so the processor is checked once for the search or the step and not once
+/// for each distance.
+pub(crate) trait Path<T, D>: Copy {
+    /// What evaluates the distances.
+    type Scorer<'a>: Distance<T> + Copy
+    where
+        D: 'a;
+
+    /// The scorer for a graph whose distance is `distance`.
+    fn scorer<'a>(self, distance: &'a D) -> Self::Scorer<'a>;
+}
+
+/// The path that evaluates with the distance the graph holds.
+///
+/// What a graph over codes takes, since its distance has one kernel, and
+/// what a caller that evaluates a raw distance through [`Distance::eval`]
+/// takes, which checks the processor in each call.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Held;
+
+impl<T, D: Distance<T>> Path<T, D> for Held {
+    type Scorer<'a>
+        = &'a D
+    where
+        D: 'a;
+
+    #[inline(always)]
+    fn scorer(self, distance: &D) -> &D {
+        distance
+    }
+}
+
+/// Evaluate `$body` with `$path` bound to the kernel path of this processor,
+/// resolved once, here. A search or a build step inside `$body` therefore
+/// checks the processor once.
+macro_rules! on_kernel_path {
+    ($path:ident => $body:expr) => {
+        match crate::distance::resolve() {
+            crate::distance::Resolved::Baseline($path) => $body,
+            #[cfg(target_arch = "x86_64")]
+            crate::distance::Resolved::Avx($path) => $body,
+        }
+    };
 }
 
 /// How far `sum(x * x)` may sit from one before a vector is not unit length.
@@ -232,7 +305,7 @@ pub(crate) struct Backend<T, D> {
 
 impl<T, D> Backend<T, D>
 where
-    T: Clone + Send + Sync,
+    T: Clone + Send + Sync + PartialEq,
     D: Distance<T> + Send + Sync,
 {
     /// An empty graph at the default scale for its degree, with the reservation
@@ -333,15 +406,23 @@ where
     }
 
     /// Phase one at `level`. Decides the insertion, reading only and drawing
-    /// nothing.
-    fn plan_at_level(&self, data: &[T], level: usize) -> Planned {
-        self.graph.plan_insertion(&self.store, data, level)
+    /// nothing, with every distance evaluated on `path`.
+    fn plan_at_level<P: Path<T, D>>(&self, path: P, data: &[T], level: usize) -> Planned {
+        self.graph.plan_insertion_on(path, &self.store, data, level)
     }
 
-    /// Phase two. Writes what phase one decided.
-    fn install(&mut self, data: &[T], origin_id: usize, position: u32, planned: Planned) {
+    /// Phase two. Writes what phase one decided, with every distance
+    /// evaluated on `path`.
+    fn install<P: Path<T, D>>(
+        &mut self,
+        path: P,
+        data: &[T],
+        origin_id: usize,
+        position: u32,
+        planned: Planned,
+    ) {
         self.graph
-            .install_insertion(&mut self.store, data, origin_id, position, planned);
+            .install_insertion_on(path, &mut self.store, data, origin_id, position, planned);
     }
 
     /// Append one raw vector to the side store a `quantized_with_raw` graph
@@ -379,11 +460,16 @@ where
         );
     }
 
-    /// The draw and both phases, for a caller holding the graph outright.
-    fn insert(&mut self, data: &[T], origin_id: usize, position: u32) {
+    /// The draw and both phases, for a caller holding the graph outright,
+    /// refused with nothing installed where the drawn level leaves the graph
+    /// no room for the record. Every distance is evaluated with the distance
+    /// the graph holds, which a graph over codes takes.
+    fn try_insert(&mut self, data: &[T], origin_id: usize, position: u32) -> Result<(), Error> {
         let level = self.draw_level();
-        let planned = self.plan_at_level(data, level);
-        self.install(data, origin_id, position, planned);
+        self.graph.room().take(level)?;
+        let planned = self.plan_at_level(Held, data, level);
+        self.install(Held, data, origin_id, position, planned);
+        Ok(())
     }
 }
 
@@ -426,6 +512,35 @@ pub enum VectorGraph {
     /// which is what makes the memory case: the store holds a quarter of
     /// what a raw store holds and there is no second store beside it.
     Int8(Backend<i8, Int8Dist>),
+}
+
+/// One query's table over a product quantized graph, held on the calling
+/// thread for the length of an exact scan, with the score of each node the
+/// scan asks for.
+///
+/// The table is the one a traversal installs for the query and
+/// [`CodeScores::at`] is the kernel a traversal evaluates, so the scan and
+/// the traversal score a node by one arithmetic. The table leaves the thread
+/// when this value is dropped. The value stays on the thread that made it,
+/// since the table is that thread's.
+#[allow(private_interfaces)]
+pub struct CodeScores<'a> {
+    backend: &'a Backend<u8, DistPQ>,
+    /// The code slice the kernel takes in the query's place, as a traversal
+    /// hands it one.
+    dummy: Vec<u8>,
+    _table: crate::distance::QueryLut,
+    _on_this_thread: std::marker::PhantomData<*const ()>,
+}
+
+impl CodeScores<'_> {
+    /// The score a traversal gives `node` for the query, on the scale the
+    /// kernel returns, or `None` for a node the graph does not hold.
+    #[inline]
+    pub fn at(&self, node: u32) -> Option<f32> {
+        let codes = self.backend.store.try_get(node)?;
+        Some(self.backend.graph.distance().eval(&self.dummy, codes))
+    }
 }
 
 /// One record on its way into the graph, in whichever form that graph holds.
@@ -693,6 +808,10 @@ impl VectorGraph {
     ///
     /// It is taken by generic reference rather than as a trait object so the
     /// closure the caller passes is monomorphised into the traversal.
+    ///
+    /// A search under a predicate runs the traversal with the size test, and
+    /// a search with none runs it without, as `traverse::search_layer` sets
+    /// out. Each is an instance of [`Self::search_with`].
     pub fn search<F>(
         &self,
         query: &[f32],
@@ -703,15 +822,47 @@ impl VectorGraph {
     where
         F: Fn(&usize) -> bool,
     {
+        match filter {
+            None => self.search_with::<fn(&usize) -> bool, false>(query, k, ef, None),
+            Some(admits) => self.search_with::<F, true>(query, k, ef, Some(admits)),
+        }
+    }
+
+    /// The search in the traversal's instance that `UNTIL_FULL` names.
+    ///
+    /// Never inlined, so each instance is compiled alone, and the two share
+    /// no registers and no stack frame.
+    #[inline(never)]
+    fn search_with<F, const UNTIL_FULL: bool>(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        filter: Option<&F>,
+    ) -> Result<Vec<GraphHit>, String>
+    where
+        F: Fn(&usize) -> bool,
+    {
         match self {
-            // Raw vector search
+            // Raw vector search. Each arm resolves the kernel path once, and
+            // the traversal evaluates every distance on it.
             VectorGraph::Cosine(b) => {
                 assert_unit_for_cosine(query, "search");
-                Ok(b.graph.search(&b.store, query, k, ef, filter))
+                Ok(
+                    on_kernel_path!(path => b.graph.search_with::<_, F, UNTIL_FULL>(
+                        path, &b.store, query, k, ef, filter
+                    )),
+                )
             }
-            VectorGraph::L2(b) => Ok(b.graph.search(&b.store, query, k, ef, filter)),
-            VectorGraph::L1(b) => Ok(b.graph.search(&b.store, query, k, ef, filter)),
-            VectorGraph::Dot(b) => Ok(b.graph.search(&b.store, query, k, ef, filter)),
+            VectorGraph::L2(b) => Ok(on_kernel_path!(path => b
+                .graph
+                .search_with::<_, F, UNTIL_FULL>(path, &b.store, query, k, ef, filter))),
+            VectorGraph::L1(b) => Ok(on_kernel_path!(path => b
+                .graph
+                .search_with::<_, F, UNTIL_FULL>(path, &b.store, query, k, ef, filter))),
+            VectorGraph::Dot(b) => Ok(on_kernel_path!(path => b
+                .graph
+                .search_with::<_, F, UNTIL_FULL>(path, &b.store, query, k, ef, filter))),
 
             // PQ-based search with ADC
             VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => {
@@ -724,7 +875,14 @@ impl VectorGraph {
                 // Create dummy query vector for HNSW traversal (flat u8 codes)
                 let dummy_query = vec![0u8; b.graph.distance().subvectors()];
 
-                Ok(b.graph.search(&b.store, &dummy_query, k, ef, filter))
+                Ok(b.graph.search_with::<_, F, UNTIL_FULL>(
+                    Held,
+                    &b.store,
+                    &dummy_query,
+                    k,
+                    ef,
+                    filter,
+                ))
             }
 
             // Scalar codes. The query is installed on this thread at full
@@ -736,7 +894,14 @@ impl VectorGraph {
                 }
                 let _query = b.graph.distance().install_query(query)?;
                 let dummy_query = vec![0i8; b.graph.distance().dim()];
-                Ok(b.graph.search(&b.store, &dummy_query, k, ef, filter))
+                Ok(b.graph.search_with::<_, F, UNTIL_FULL>(
+                    Held,
+                    &b.store,
+                    &dummy_query,
+                    k,
+                    ef,
+                    filter,
+                ))
             }
         }
     }
@@ -1045,6 +1210,32 @@ impl VectorGraph {
         }
     }
 
+    /// The scores a traversal of this graph gives its nodes for `query`, for
+    /// an exact scan over a product quantized graph, whether or not it keeps
+    /// raw vectors beside its codes.
+    ///
+    /// `None` on every other graph, which an exact scan scores from the
+    /// vectors or the scalar rows it holds. The scores come from the kernel
+    /// the traversal evaluates, over the table the traversal installs for
+    /// the same query, so a node scores the same bits on either path. See
+    /// [`CodeScores`].
+    pub fn code_scores(&self, query: &[f32]) -> Option<Result<CodeScores<'_>, String>> {
+        match self {
+            VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => Some(
+                b.graph
+                    .distance()
+                    .install_query_lut(query)
+                    .map(|table| CodeScores {
+                        backend: b,
+                        dummy: vec![0u8; b.graph.distance().subvectors()],
+                        _table: table,
+                        _on_this_thread: std::marker::PhantomData,
+                    }),
+            ),
+            _ => None,
+        }
+    }
+
     /// One node's stored row, being its scalar codes and, on a cosine graph,
     /// the four bytes of its inverse norm after them. What a rebuild re-inserts
     /// without re-encoding.
@@ -1179,6 +1370,10 @@ impl VectorGraph {
                         .wrapping_mul(SCATTER_STRIDE)
                         .wrapping_add(round.wrapping_mul(SCATTER_OFFSET))
                         % n;
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "a node index taken modulo the node count, held below 2^31 by append_node and loading_layout"
+                    )]
                     if admits(i) {
                         acc += dist.eval(query, store.get(i as u32));
                     }
@@ -1190,13 +1385,24 @@ impl VectorGraph {
             samples.sort_by(|a, b| a.total_cmp(b));
             Some(samples[samples.len() / 2])
         }
+        // A raw graph is timed on the kernel path a scan of it runs,
+        // resolved once for the run.
+        macro_rules! timed {
+            ($b:ident) => {
+                on_kernel_path!(path => time(
+                    &path.scorer($b.graph.distance()),
+                    &$b.store,
+                    evaluations,
+                    rounds,
+                    admits
+                ))
+            };
+        }
         match self {
-            VectorGraph::Cosine(b) => {
-                time(b.graph.distance(), &b.store, evaluations, rounds, admits)
-            }
-            VectorGraph::L2(b) => time(b.graph.distance(), &b.store, evaluations, rounds, admits),
-            VectorGraph::L1(b) => time(b.graph.distance(), &b.store, evaluations, rounds, admits),
-            VectorGraph::Dot(b) => time(b.graph.distance(), &b.store, evaluations, rounds, admits),
+            VectorGraph::Cosine(b) => timed!(b),
+            VectorGraph::L2(b) => timed!(b),
+            VectorGraph::L1(b) => timed!(b),
+            VectorGraph::Dot(b) => timed!(b),
             VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => {
                 let query = vec![0f32; b.graph.distance().dim()];
                 let _query_lut = b.graph.distance().install_query_lut(&query).ok()?;
@@ -1214,10 +1420,11 @@ impl VectorGraph {
     }
 
     /// Time one whole search on this graph, in nanoseconds, as the median of
-    /// `rounds` searches at `k` and `ef` under `admits`, each asked with a
-    /// query built from two of the graph's own points. `admits` is asked what
-    /// a search's predicate is asked, being the position each candidate's
-    /// node holds its record at.
+    /// `rounds` searches at `k` and `ef` under `filter`, each asked with a
+    /// query built from two of the graph's own points. `filter` is handed to
+    /// [`VectorGraph::search`] as a search's predicate is, so the traversal
+    /// timed is the one a search under the same predicate runs, and it is
+    /// asked about the position each candidate's node holds its record at.
     ///
     /// What a traversal costs is not what a distance evaluation costs
     /// multiplied by a count. A traversal's time is the memory it touches,
@@ -1232,22 +1439,19 @@ impl VectorGraph {
     /// The query is the midpoint of two points scattered across the store,
     /// normalised on a cosine graph, rather than a stored point itself, so
     /// the search is for a vector the graph does not hold, which is what a
-    /// query is. The predicate is in place because a filtered search and a
-    /// search over a graph holding a removed record's node carry one, and
-    /// the test is paid once per candidate. Measured at width 100 over 50,000
-    /// points, this figure sits within 3 percent of a search the collection
-    /// runs on the same graph; a stored point as the query, with no
-    /// predicate, sat within 10 percent of it, so the two changes are for
-    /// the search's shape rather than for a gap they close. On a quantized
-    /// graph the two points are reconstructed from their codes, so the
-    /// table the query installs is one a real query would.
-    pub fn time_search_ns(
+    /// query is. On a quantized graph the two points are reconstructed from
+    /// their codes, so the table the query installs is one a real query
+    /// would.
+    pub fn time_search_ns<F>(
         &self,
         k: usize,
         ef: usize,
         rounds: usize,
-        admits: &dyn Fn(usize) -> bool,
-    ) -> Option<f64> {
+        filter: Option<&F>,
+    ) -> Option<f64>
+    where
+        F: Fn(&usize) -> bool,
+    {
         let n = self.nb_points();
         if n < 2 || rounds == 0 {
             return None;
@@ -1271,7 +1475,15 @@ impl VectorGraph {
         };
         let mut samples = Vec::with_capacity(rounds);
         for round in 0..rounds {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a node index taken modulo the node count, held below 2^31 by append_node and loading_layout"
+            )]
             let first = (round.wrapping_mul(SCATTER_STRIDE).wrapping_add(1) % n) as u32;
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a node index taken modulo the node count, held below 2^31 by append_node and loading_layout"
+            )]
             let second = (round
                 .wrapping_mul(SCATTER_STRIDE)
                 .wrapping_add(SCATTER_OFFSET)
@@ -1285,9 +1497,8 @@ impl VectorGraph {
                     query.iter_mut().for_each(|v| *v /= norm);
                 }
             }
-            let predicate = |at: &usize| admits(*at);
             let started = std::time::Instant::now();
-            let hits = self.search(&query, k, ef, Some(&predicate)).ok()?;
+            let hits = self.search(&query, k, ef, filter).ok()?;
             let elapsed = started.elapsed();
             std::hint::black_box(hits);
             samples.push(elapsed.as_secs_f64() * 1e9);
@@ -1421,6 +1632,10 @@ impl VectorGraph {
     ) -> Result<usize, String> {
         let nodes = self.nb_points();
         self.open_raw_store(dim, nodes)?;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the node count, held below 2^31 by append_node and loading_layout"
+        )]
         for node in 0..nodes as u32 {
             let position = self.record_of_at(node);
             let vector = source_node_at
@@ -1645,19 +1860,28 @@ impl VectorGraph {
     /// it planned against rather than trusting that.
     pub fn plan_at_level(&self, record: Record<'_>, level: usize) -> Option<Planned> {
         match (self, record) {
+            // A raw graph resolves the kernel path once for the plan.
             (VectorGraph::Cosine(b), Record::Raw(v)) => {
                 assert_unit_for_cosine(v, "insert");
-                Some(b.plan_at_level(v, level))
+                Some(on_kernel_path!(path => b.plan_at_level(path, v, level)))
             }
-            (VectorGraph::L2(b), Record::Raw(v)) => Some(b.plan_at_level(v, level)),
-            (VectorGraph::L1(b), Record::Raw(v)) => Some(b.plan_at_level(v, level)),
-            (VectorGraph::Dot(b), Record::Raw(v)) => Some(b.plan_at_level(v, level)),
+            (VectorGraph::L2(b), Record::Raw(v)) => {
+                Some(on_kernel_path!(path => b.plan_at_level(path, v, level)))
+            }
+            (VectorGraph::L1(b), Record::Raw(v)) => {
+                Some(on_kernel_path!(path => b.plan_at_level(path, v, level)))
+            }
+            (VectorGraph::Dot(b), Record::Raw(v)) => {
+                Some(on_kernel_path!(path => b.plan_at_level(path, v, level)))
+            }
             (VectorGraph::CosinePQ(b), Record::Codes { codes, .. })
             | (VectorGraph::L2PQ(b), Record::Codes { codes, .. })
             | (VectorGraph::L1PQ(b), Record::Codes { codes, .. }) => {
-                Some(b.plan_at_level(codes, level))
+                Some(b.plan_at_level(Held, codes, level))
             }
-            (VectorGraph::Int8(b), Record::Int8(codes)) => Some(b.plan_at_level(codes, level)),
+            (VectorGraph::Int8(b), Record::Int8(codes)) => {
+                Some(b.plan_at_level(Held, codes, level))
+            }
             // A scalar graph handed anything but scalar codes, or scalar
             // codes handed to any other graph, is the same programming error
             // the two arms below name for the other element types.
@@ -1703,17 +1927,28 @@ impl VectorGraph {
     pub fn install(&mut self, record: Record<'_>, id: usize, at: Position, planned: Planned) {
         let position = at.0;
         match (self, record) {
-            (VectorGraph::Cosine(b), Record::Raw(v)) => b.install(v, id, position, planned),
-            (VectorGraph::L2(b), Record::Raw(v)) => b.install(v, id, position, planned),
-            (VectorGraph::L1(b), Record::Raw(v)) => b.install(v, id, position, planned),
-            (VectorGraph::Dot(b), Record::Raw(v)) => b.install(v, id, position, planned),
+            // A raw graph resolves the kernel path once for the install.
+            (VectorGraph::Cosine(b), Record::Raw(v)) => {
+                on_kernel_path!(path => b.install(path, v, id, position, planned))
+            }
+            (VectorGraph::L2(b), Record::Raw(v)) => {
+                on_kernel_path!(path => b.install(path, v, id, position, planned))
+            }
+            (VectorGraph::L1(b), Record::Raw(v)) => {
+                on_kernel_path!(path => b.install(path, v, id, position, planned))
+            }
+            (VectorGraph::Dot(b), Record::Raw(v)) => {
+                on_kernel_path!(path => b.install(path, v, id, position, planned))
+            }
             (VectorGraph::CosinePQ(b), Record::Codes { codes, raw })
             | (VectorGraph::L2PQ(b), Record::Codes { codes, raw })
             | (VectorGraph::L1PQ(b), Record::Codes { codes, raw }) => {
-                b.install(codes, id, position, planned);
+                b.install(Held, codes, id, position, planned);
                 b.push_raw(raw);
             }
-            (VectorGraph::Int8(b), Record::Int8(codes)) => b.install(codes, id, position, planned),
+            (VectorGraph::Int8(b), Record::Int8(codes)) => {
+                b.install(Held, codes, id, position, planned)
+            }
             // Unreachable, because a plan the element type refused is `None`
             // and the caller then installs nothing.
             _ => error!(
@@ -1726,26 +1961,77 @@ impl VectorGraph {
         }
     }
 
+    /// The room this graph has for insertions, with nothing admitted yet.
+    ///
+    /// A caller admitting records takes each one's level from the room before
+    /// anything is recorded for it, so a record the graph cannot be sure to
+    /// place is refused at the door. See [`GraphRoom`].
+    pub fn room(&self) -> GraphRoom {
+        match self {
+            VectorGraph::Cosine(b) => b.graph.room(),
+            VectorGraph::L2(b) => b.graph.room(),
+            VectorGraph::L1(b) => b.graph.room(),
+            VectorGraph::Dot(b) => b.graph.room(),
+            VectorGraph::CosinePQ(b) => b.graph.room(),
+            VectorGraph::L2PQ(b) => b.graph.room(),
+            VectorGraph::L1PQ(b) => b.graph.room(),
+            VectorGraph::Int8(b) => b.graph.room(),
+        }
+    }
+
+    /// Whether the graph holds its own structure, with the first rule it
+    /// breaks where it does not. The rules are `MutableGraph`'s
+    /// `structure_holds`, read against the rows the graph scores. A test
+    /// asks it after a write or a load.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn structure_holds(&self) -> Result<(), String> {
+        match self {
+            VectorGraph::Cosine(b) => b.graph.structure_holds(&b.store),
+            VectorGraph::L2(b) => b.graph.structure_holds(&b.store),
+            VectorGraph::L1(b) => b.graph.structure_holds(&b.store),
+            VectorGraph::Dot(b) => b.graph.structure_holds(&b.store),
+            VectorGraph::CosinePQ(b) => b.graph.structure_holds(&b.store),
+            VectorGraph::L2PQ(b) => b.graph.structure_holds(&b.store),
+            VectorGraph::L1PQ(b) => b.graph.structure_holds(&b.store),
+            VectorGraph::Int8(b) => b.graph.structure_holds(&b.store),
+        }
+    }
+
     /// Insert one raw vector under internal id `id` at position `at`, the
-    /// draw and both phases, for a caller holding the graph outright.
+    /// draw and both phases, for a caller holding the graph outright, or
+    /// refuse it with nothing installed where the drawn level leaves the
+    /// graph no room for it.
     ///
     /// The three rebuild paths, being `compact`, the quantization rebuild and
     /// the persistence rebuild, each build a fresh graph off to the side and
     /// swap it in under one write guard, so the graph they insert into is a
-    /// local nobody else can reach. They need no phase split and no lock.
-    pub fn insert(&mut self, vector: &[f32], id: usize, at: Position) {
+    /// local nobody else can reach. They need no phase split and no lock, and
+    /// a rebuild refused for room drops the graph it was building.
+    pub fn try_insert(&mut self, vector: &[f32], id: usize, at: Position) -> Result<(), Error> {
         let level = self.draw_level();
+        self.room().take(level)?;
         if let Some(planned) = self.plan_at_level(Record::Raw(vector), level) {
             self.install(Record::Raw(vector), id, at, planned);
         }
+        Ok(())
+    }
+
+    /// [`VectorGraph::try_insert`] for a test building a graph well inside
+    /// the ceilings.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn insert(&mut self, vector: &[f32], id: usize, at: Position) {
+        self.try_insert(vector, id, at)
+            .expect("a test graph is built well inside the ceilings");
     }
 
     /// Insertion is sequential whatever the batch size. Every caller is a
     /// one-time structural rebuild, at training completion, in `compact` or in
     /// the persistence loader, and each of them sorts its batch by internal id
     /// so that two rebuilds of the same records wire the same graph. Each entry
-    /// is the codes, the internal id and the record's position.
-    pub fn insert_batch_pq(&mut self, data: &[(&Vec<u8>, usize, Position)]) -> Result<(), String> {
+    /// is the codes, the internal id and the record's position. A record the
+    /// graph has no room for refuses the batch, with the records before it
+    /// installed.
+    pub fn insert_batch_pq(&mut self, data: &[(&Vec<u8>, usize, Position)]) -> Result<(), Error> {
         debug!(
             target: LOG_TARGET,
             operation = "batch_insert_pq",
@@ -1756,12 +2042,14 @@ impl VectorGraph {
         match self {
             VectorGraph::CosinePQ(b) | VectorGraph::L2PQ(b) | VectorGraph::L1PQ(b) => {
                 for (codes, id, at) in data {
-                    b.insert(codes.as_slice(), *id, at.0);
+                    b.try_insert(codes.as_slice(), *id, at.0)?;
                 }
 
                 Ok(())
             }
-            _ => Err("Cannot insert PQ codes into raw HNSW index".to_string()),
+            _ => Err(Error::Engine(
+                "Cannot insert PQ codes into raw HNSW index".to_string(),
+            )),
         }
     }
 
@@ -1770,8 +2058,9 @@ impl VectorGraph {
     /// build a fresh graph off to the side. Every caller sorts its batch by
     /// internal id so that two rebuilds of the same records wire the same
     /// graph, as [`VectorGraph::insert_batch_pq`] requires of its callers.
-    /// Each entry is the row, the internal id and the record's position.
-    pub fn insert_batch_int8(&mut self, data: &[(&[i8], usize, Position)]) -> Result<(), String> {
+    /// Each entry is the row, the internal id and the record's position. A
+    /// record the graph has no room for refuses the batch, as there.
+    pub fn insert_batch_int8(&mut self, data: &[(&[i8], usize, Position)]) -> Result<(), Error> {
         debug!(
             target: LOG_TARGET,
             operation = "batch_insert_int8",
@@ -1781,11 +2070,13 @@ impl VectorGraph {
         match self {
             VectorGraph::Int8(b) => {
                 for (codes, id, at) in data {
-                    b.insert(codes, *id, at.0);
+                    b.try_insert(codes, *id, at.0)?;
                 }
                 Ok(())
             }
-            _ => Err("Cannot insert scalar codes into a graph that does not hold them".to_string()),
+            _ => Err(Error::Engine(
+                "Cannot insert scalar codes into a graph that does not hold them".to_string(),
+            )),
         }
     }
 
@@ -1808,8 +2099,41 @@ impl VectorGraph {
         }
     }
 
-    /// Write the graph in ZeusDB's own format as the artefact `name` in
-    /// `dir`, replacing any artefact of that name.
+    /// Write the graph as a version 1 dump, which a directory saved before
+    /// format 5.0.0 holds, for a test that makes such a directory.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn dump_version_1(&self, dir: &dyn Dir, name: &str) -> Result<(), String> {
+        let kind = self.kind();
+        match self {
+            VectorGraph::Cosine(b) => {
+                dump::v1::write_dump(&b.graph.dump_view(&b.store), kind, dir, name)
+            }
+            VectorGraph::L2(b) => {
+                dump::v1::write_dump(&b.graph.dump_view(&b.store), kind, dir, name)
+            }
+            VectorGraph::L1(b) => {
+                dump::v1::write_dump(&b.graph.dump_view(&b.store), kind, dir, name)
+            }
+            VectorGraph::Dot(b) => {
+                dump::v1::write_dump(&b.graph.dump_view(&b.store), kind, dir, name)
+            }
+            VectorGraph::CosinePQ(b) => {
+                dump::v1::write_dump(&b.graph.dump_view(&b.store), kind, dir, name)
+            }
+            VectorGraph::L2PQ(b) => {
+                dump::v1::write_dump(&b.graph.dump_view(&b.store), kind, dir, name)
+            }
+            VectorGraph::L1PQ(b) => {
+                dump::v1::write_dump(&b.graph.dump_view(&b.store), kind, dir, name)
+            }
+            VectorGraph::Int8(b) => {
+                dump::v1::write_dump(&b.graph.dump_view(&b.store), kind, dir, name)
+            }
+        }
+    }
+
+    /// Write the graph in ZeusDB's own format, at version 2, as the artefact
+    /// `name` in `dir`, replacing any artefact of that name.
     pub fn dump(&self, dir: &dyn Dir, name: &str) -> Result<(), String> {
         let kind = self.kind();
         trace!(
@@ -1839,13 +2163,12 @@ impl VectorGraph {
 // RESTORING THE SAVED GRAPH
 // ============================================================================
 
-/// What the directory says the dump has to sit within, and the records its
-/// nodes are filed for.
+/// What the directory says the dump has to sit within, the records its nodes
+/// are filed for, and how it is to be read.
 ///
-/// Two numbers, both read from the directory rather than from the dump, and
-/// both checked before the reader allocates from anything the file declares.
-/// They travel together because they are the same kind of claim. Beside them
-/// is the list of records the mappings hold, which numbers the nodes.
+/// The two bounds are read from the directory rather than from the dump, and
+/// both are checked before the reader allocates from anything the file
+/// declares.
 #[derive(Clone, Copy)]
 pub struct DumpBounds<'a> {
     /// The live record count. The graph holds at least this many nodes and
@@ -1864,48 +2187,108 @@ pub struct DumpBounds<'a> {
     /// at the rank of its origin id, which is the graph whose every node
     /// holds a record.
     pub positions: Option<&'a [u32]>,
+    /// The dump version the directory's format requires: 1 below format
+    /// 5.0.0 and 2 from it.
+    pub version: u32,
+    /// At version 2, read and verify the identity and the rows and hand the
+    /// rows back without building a graph, for a rebuild the caller asked
+    /// for. Version 1 reads the whole dump whatever this says.
+    pub rows_only: bool,
 }
 
-/// Restore the saved graph for one index configuration
+/// What restoring a graph from its dump gave.
+#[allow(private_interfaces)]
+pub enum Restored {
+    /// The graph the dump holds, boxed so the restore moves a pointer to it.
+    Graph(Box<VectorGraph>),
+    /// The rows of a version 2 dump, each region verified, where no graph was
+    /// built from it: its topology fails, which `reason` names, or the caller
+    /// asked for the rows alone.
+    Rows { rows: DumpRows, reason: String },
+}
+
+/// The rows of a version 2 dump, in the dump's node order, with what each
+/// node is filed by.
+pub struct DumpRows {
+    /// Each node's origin id, being the internal id it was inserted under.
+    pub origin_ids: Vec<usize>,
+    /// Each node's position among the records the mappings hold, or
+    /// `Position::NONE` for a stranded node.
+    pub positions: Vec<u32>,
+    /// Values in one row.
+    pub width: usize,
+    /// Every node's row, end to end.
+    pub values: RowValues,
+}
+
+/// The values of every row a dump holds, in the element type its graph
+/// stores.
+pub enum RowValues {
+    /// A raw graph's vectors.
+    Raw(Vec<f32>),
+    /// A product quantized graph's codes, one byte a subvector.
+    Codes(Vec<u8>),
+    /// A scalar quantized graph's rows, one signed byte a value.
+    Int8(Vec<i8>),
+}
+
+/// The rows of `read` as the type a caller rebuilds from.
+fn erased_rows<T: dump::DumpElement>(read: dump::ReadRows<T>) -> DumpRows {
+    let width = read.store.dim();
+    DumpRows {
+        origin_ids: read.origin_ids,
+        positions: read.record_of,
+        width,
+        values: T::into_row_values(read.store.into_values()),
+    }
+}
+
+/// Read a dump of element type `T` and hand back what it gave, the graph
+/// wrapped by `wrap` where it gave one.
+fn restore_with<T, D>(
+    dir: &dyn Dir,
+    name: &str,
+    expected: &Expected,
+    dist: D,
+    bounds: &DumpBounds<'_>,
+    wrap: impl FnOnce(Backend<T, D>) -> VectorGraph,
+) -> Result<Restored, DumpRefusal>
+where
+    T: dump::DumpElement,
+    D: Distance<T> + Send + Sync,
+{
+    match dump::read_dump_at::<T, D>(
+        dir,
+        name,
+        expected,
+        dist,
+        bounds.positions,
+        bounds.rows_only,
+    )? {
+        dump::DumpRead::Graph(graph, store) => Ok(Restored::Graph(Box::new(wrap(
+            Backend::restored((*graph, store)),
+        )))),
+        dump::DumpRead::Rows { rows, reason } => Ok(Restored::Rows {
+            rows: erased_rows(rows),
+            reason,
+        }),
+    }
+}
+
+/// Restore the saved graph for one index configuration.
 ///
-/// `pq` present means the saved graph was a quantized one, which is exactly the
-/// condition the loader branches on, since training is what replaces the raw
-/// graph with a PQ graph. A directory whose dump disagrees is caught by the
-/// element type and the distance discriminant in the header and falls back.
+/// `pq` present means the saved graph was a product quantized one, which is
+/// the condition the loader branches on, since training is what replaces the
+/// raw graph with a quantized one. A dump whose element type or kind
+/// disagrees with that is refused on its header.
 ///
-/// Every reason this returns an error is a reason to rebuild rather than a
-/// reason to fail, and the caller treats it that way. A dump written by 0.6.0
-/// or earlier is one of them: it carries the vendored magic, this reader does
-/// not recognise it, and the index rebuilds its graph once and writes the new
-/// format on the next save. There is deliberately no reader for the old format.
+/// A refusal names its region. Below format 5.0.0 the caller rebuilds the
+/// graph from the directory's separate row stores on any refusal. At 5.0.0 a
+/// refusal refuses the load, and the rows handed back where the topology
+/// fails are what the caller rebuilds from.
 ///
-/// # What this no longer does
-///
-/// It used to inspect the dump's header, compare the data file's length against
-/// what the point count implied, and only then enter the vendored reload inside
-/// a `catch_unwind`, because that reload panics on a malformed header and calls
-/// `std::process::exit(1)` on a short data file. It also leaked the vendored
-/// loader, because the returned graph borrowed it. [`dump::read_dump`] returns
-/// an error on every malformed input and owns nothing borrowed, so all four are
-/// gone.
-///
-/// It also used to reset `extend_candidates`, which the vendored reload set
-/// true where `Hnsw::new` sets it false. Neither construction path here has such
-/// a flag, since the branches those two parameters guarded are absent rather
-/// than present behind a setter nothing calls.
-///
-/// # The bounds
-///
-/// [`DumpBounds`] carries the two numbers the directory declares that the dump
-/// has to sit within. Both are checked before anything is built.
-///
-/// # The level scale comes from the dump
-///
-/// A restored graph keeps drawing levels if the index goes on inserting, and it
-/// draws at the scale the dump recorded rather than at the default for its
-/// degree. That is what the vendored reload did through
-/// `new_with_absolute_scale`, so it is a match rather than a change. See
-/// [`Backend::restored`].
+/// A restored graph draws levels at the scale the dump recorded, if the index
+/// goes on inserting. See [`Backend::restored`].
 ///
 /// The dump is the artefact `name` in `dir`.
 #[allow(clippy::too_many_arguments)]
@@ -1918,13 +2301,14 @@ pub fn restore_graph(
     dim: usize,
     pq: Option<Arc<PQ>>,
     bounds: DumpBounds<'_>,
-) -> Result<(VectorGraph, usize), String> {
+) -> Result<Restored, DumpRefusal> {
     let DumpBounds {
         min_nodes,
         max_origin_id,
-        positions,
+        version,
+        ..
     } = bounds;
-    let graph = match pq {
+    match pq {
         Some(pq) => {
             let kind = match space {
                 "l2" => GraphKind::L2Pq,
@@ -1940,6 +2324,7 @@ pub fn restore_graph(
                 ef_construction,
                 min_nodes,
                 max_origin_id,
+                version,
             };
             // The metric follows the discriminant the dump carries, so a
             // directory scores the way the graph inside it was wired.
@@ -1947,18 +2332,18 @@ pub fn restore_graph(
                 GraphKind::CosinePq => PqMetric::Cosine,
                 _ => PqMetric::SquaredL2,
             };
-            let restored = Backend::restored(dump::read_dump_at::<u8, DistPQ>(
+            restore_with::<u8, DistPQ>(
                 dir,
                 name,
                 &expected,
                 DistPQ::new(pq, metric),
-                positions,
-            )?);
-            match kind {
-                GraphKind::L2Pq => VectorGraph::L2PQ(restored),
-                GraphKind::L1Pq => VectorGraph::L1PQ(restored),
-                _ => VectorGraph::CosinePQ(restored),
-            }
+                &bounds,
+                |restored| match kind {
+                    GraphKind::L2Pq => VectorGraph::L2PQ(restored),
+                    GraphKind::L1Pq => VectorGraph::L1PQ(restored),
+                    _ => VectorGraph::CosinePQ(restored),
+                },
+            )
         }
         None => {
             // The raw graphs differ only in their distance type, so each arm
@@ -1973,10 +2358,16 @@ pub fn restore_graph(
                         ef_construction,
                         min_nodes,
                         max_origin_id,
+                        version,
                     };
-                    VectorGraph::$variant(Backend::restored(dump::read_dump_at::<f32, $dist>(
-                        dir, name, &expected, $value, positions,
-                    )?))
+                    restore_with::<f32, $dist>(
+                        dir,
+                        name,
+                        &expected,
+                        $value,
+                        &bounds,
+                        VectorGraph::$variant,
+                    )
                 }};
             }
             match space {
@@ -1988,10 +2379,7 @@ pub fn restore_graph(
                 _ => raw!(GraphKind::Cosine, CosineDist, CosineDist {}, Cosine),
             }
         }
-    };
-
-    let nodes = graph.nb_points();
-    Ok((graph, nodes))
+    }
 }
 
 /// The scalar quantized kind a space name maps to, which is the kind a dump
@@ -2009,12 +2397,10 @@ fn int8_kind(space: &str) -> GraphKind {
 ///
 /// The counterpart of [`restore_graph`] for a graph holding one `i8` a
 /// value. The codec and the space together decide the row width the dump
-/// must carry, being the codec's width plus the norm tail on a cosine
-/// graph, and the space decides the kind the header must carry. A dump of
-/// any other element type or kind is refused on its header, and every
-/// refusal is a reason to rebuild rather than to fail, exactly as it is for
-/// the other graphs. The bounds are checked the same way, before anything
-/// is allocated from a field. The dump is the artefact `name` in `dir`.
+/// must carry, being the codec's width plus the norm tail on a cosine graph,
+/// and the space decides the kind the header must carry. A refusal and the
+/// rows handed back mean what they mean for [`restore_graph`]. The dump is
+/// the artefact `name` in `dir`.
 pub fn restore_int8_graph(
     dir: &dyn Dir,
     name: &str,
@@ -2023,7 +2409,7 @@ pub fn restore_int8_graph(
     ef_construction: usize,
     codec: Arc<Int8Codec>,
     bounds: DumpBounds<'_>,
-) -> Result<(VectorGraph, usize), String> {
+) -> Result<Restored, DumpRefusal> {
     let kind = int8_kind(space);
     let dist = Int8Dist::new(codec, Int8Metric::from_space(space));
     let expected = Expected {
@@ -2033,15 +2419,15 @@ pub fn restore_int8_graph(
         ef_construction,
         min_nodes: bounds.min_nodes,
         max_origin_id: bounds.max_origin_id,
+        version: bounds.version,
     };
-    let restored = Backend::restored(dump::read_dump_at::<i8, Int8Dist>(
-        dir,
-        name,
-        &expected,
-        dist,
-        bounds.positions,
-    )?);
-    let graph = VectorGraph::Int8(restored);
-    let nodes = graph.nb_points();
-    Ok((graph, nodes))
+    restore_with::<i8, Int8Dist>(dir, name, &expected, dist, &bounds, VectorGraph::Int8)
 }
+
+// The graph's creation budget, for a fuzzer in another crate that bounds a
+// load by what it may reserve. An item of its own, since the budget is
+// visible to `graph` alone and a re-export cannot widen it, and present only
+// in the builds that export it, so no other build holds a public item it
+// cannot reach.
+#[cfg(any(test, feature = "test-support"))]
+pub const RESERVE_BYTES: usize = mutable::RESERVE_BYTES;

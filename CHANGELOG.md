@@ -7,6 +7,160 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.14.0] - 2026-11-28
+
+### Added
+
+- **A load that replays the journal of a directory whose medium or permissions refuse its first write opens the index read only**, with a `RuntimeWarning`.
+
+- **`journal_segments`**, the number of segments the journal holds, in `get_stats()` on a journaled index.
+
+- **`backup(path)`** writes a copy of the index into another directory while searches run, and returns the copy's identity.
+
+- **`load(path, repair=True)`** opens a directory whose journal a plain `load()` refuses as damaged, keeps every whole call before the damage, and sets the rest aside in the journal's `quarantine` folder where it opens the index writable.
+
+- **`recovery`** reports what the load that built the index did, among it the records it replayed, the damage it found and whether it opened the index read only.
+
+- **`identity` holds `saved_at` and `sequence`**, the save time that the manifest of the directory `snapshot` names records, and the journal sequence it records under `identity`.
+
+- **A directory that holds an unknown feature marked `read_only` opens read only**, with a `RuntimeWarning` naming the feature, where no other feature or journal record refuses it.
+
+- **The package supports CPython 3.15**, and its metadata names each supported version from 3.10 to 3.15.
+
+### Changed
+
+- **A journaled index holds `<path>.zdblock` for its whole life and a save holds it while it writes**, so another index that opens, saves or journals the directory by that path meanwhile raises `RuntimeError`.
+
+- **The graph and the sparse and text spaces refuse what passes their ceilings.** `add()` names in `errors` a record the graph or a sparse space has no room for, or that carries a text term too long to store, `compact()`, `rebuild()` and `rebuild_with_quantization()` raise `RuntimeError` where the rebuilt graph has no room and keep the graph and every record, and `load()` raises `RuntimeError` for a directory whose records the graph has no room for, or whose sparse space passes its ceilings.
+
+- **The journal is a directory of segments, `<path>.zdbjournal`**, and a checkpoint that succeeds deletes the segments it supersedes where the system lets it.
+
+- **A recovery replays a call only where its commit record is in the journal, from a journal this release writes.**
+
+- **The records of a commit that fails to sync are not applied, and after a crash they come back only where the journal could neither withdraw nor cut them.** The journaled index then refuses every change until a checkpoint commits.
+
+- **A load that replays a journaled directory 0.13.0 or earlier saved, and opens it writable, writes it again at 5.0.0**, with a journal of segments in place of its `<path>.zdbwal`.
+
+- **A child forked from the process that journals an index, while no call on that index runs, refuses every mutation of that index**, and leaves the parent's journal and lock as they are.
+
+- **A recovery of a journal this release writes installs each committed training as it was trained.**
+
+- **`save()` and `journal_to()` refuse a path that holds a file or a folder of other files, before they write anything.**
+
+- **A load refused for journal damage that a repair handles names `repair=True`.**
+
+- **A save writes each record's vector, codes or scalar row once**, in a graph dump whose regions carry checksums, with the raw vectors a product quantized index keeps in `vectors.bin`.
+
+- **`ZEUSDB_LOAD_REBUILD_GRAPH=1` rebuilds a 5.0.0 directory's graph from the rows its dump holds.**
+
+- **`metadata.json` is compact JSON that lists only the records that hold a field.**
+
+- **`load()` opens a directory below format 4.0.0 whose id counter passes the last internal id**, and `add()` then refuses every record.
+
+- **A panic inside the engine stops the index**, and that call and every later call on the index raise `RuntimeError`.
+
+- **Metadata comes back with its keys in code point order** from every call that returns it.
+
+- **`create()` raises the engine's refusal of an argument unchanged, and an unsupported `space` raises `ValueError` from `create()` and `load()`.**
+
+- **A negative count or size that reaches the engine raises `ValueError` naming the argument.**
+
+- **`add()` raises `TypeError` or `ValueError` before it inserts anything for an input of none of its shapes or a malformed list or batch**, and names in `errors` each record it cannot read.
+
+- **`add()` raises `TypeError` for a batch whose `ids`, metadata, `sparse` or `texts` is anything but a list, `None` among them.**
+
+- **A record's metadata holds only JSON values, and every shape of `add()` reads it the same way.** A `dict` is the metadata, a string is kept under `text`, another JSON value under `value`, and `None` is none. A float of another type, such as a `numpy.longdouble`, is held only where a `float64` holds it exactly. `add()` names in `errors` a record whose metadata it cannot hold, and `update_metadata()` and a filter raise `TypeError` or `ValueError` for such a value.
+
+- **`create()` raises `TypeError` for an `index_type`, an `indexed_fields`, a field name or a `quantization_config` key of the wrong type**, and for a `quantization_config` that is not a `dict`.
+
+- **`create()` raises `ValueError` for a `quantization_config` key its type does not read**, unless the key belongs to the other type and is `None`.
+
+- **`add()` names in `errors` a record whose id is not a string or holds a lone surrogate, and a record whose id is `None` takes a generated id.**
+
+- **An unfiltered `search()` scores every record where the index holds a stranded node and fewer records than the larger of its `ef_search` and its `top_k`.**
+
+- **Neighbour selection keeps a candidate that lies exactly as far from a kept neighbour as from the new record and is not a copy of the new record's vector or codes**, which changes the graph and the pages of vectors whose distances tie.
+
+- **`add()`, `search()` and `query()` refuse a vector of an `l2`, `dot` or `l1` index whose Euclidean norm passes 2^62.**
+
+- **`add()` and `query()` refuse a sparse value whose magnitude passes 2^40, and `create()` refuses a term weighting `k1` past 2^40.**
+
+- **A load that restores a value past one of these bounds opens the index read only, and the index refuses a save into any directory.**
+
+- **The README** gives the reranked search times and calibrated fetches that this release measures, the fetch that each measured dataset needs to reach the calibration's recall target and where the rerank ceiling binds, and states the default `ef_search` of every metric, what `count()` and `get_records(strict=True)` do, which index carries each key of `get_stats()`, every key of `identity`, the shapes of a query plan and how the logging setup reads its variables.
+
+- **`save()`, `checkpoint()`, `backup()` and `journal_to()` sync the directories they write, on Windows as on Linux and macOS, and raise `RuntimeError` where that sync fails.**
+
+- **A journal record that panics as it is applied makes `load()` raise `RuntimeError`**, and `load(repair=True)` opens the index without that record or any after it.
+
+- **`init_logging()` needs no argument and `init_file_logging()` needs only the folder.** Where `RUST_LOG` is unset, a `level` it cannot read as a level name or a filter, a misspelt level name among them, raises `ValueError`, before logging is set up `init_file_logging()` raises `OSError` for a folder it cannot make or a log file it cannot open, and a refused call leaves logging as it was.
+
+- **`ZEUSDB_LOG_LEVEL=off`, `none` or `silent` runs the engine at the default level.**
+
+- **`ZEUSDB_LOG_FILE` set to a path that names a folder, such as `.` or `logs/`, writes no file**, and the `file` target falls back to stderr, as for a log file it cannot open.
+
+- **`add()` reads a `float64` two dimensional array by rows, and `add()`, `search()`, `query()` and `explain()` read a Fortran-ordered, strided or reversed array as NumPy defines it.**
+
+### Fixed
+
+- **A generated id never names a record the index holds.**
+
+- **A record's metadata comes back as `add()` kept it after a save, a load and a journal replay**, its floats bit for bit and its values nested as deep as `add()` takes.
+
+- **The `"interval"` policy's thread syncs once an interval however the system wakes it.**
+
+- **A scalar quantizer gives a dimension whose scale rounds to zero a usable scale**, so the directory a save writes loads.
+
+- **A refused record of a batch of parallel lists leaves the other records to go in.**
+
+- **`AddResult.vector_shape` is the number of records the input holds and the index's dimension.**
+
+- **The engine reads `err` in `ZEUSDB_LOG_LEVEL` as `error` and `init_logging(level="warning")` as `warn`**, and the automatic setup gives it the Python default in place of an unrecognised `ZEUSDB_LOG_LEVEL` or `ZEUSDB_LOG_FORMAT`.
+
+- **A call that waits for a writer lets other Python threads run.**
+
+- **A search under a filter returns `top_k` records wherever the graph reaches as many that the filter admits.**
+
+- **A record that duplicates another record's vector or codes keeps the neighbours the selection picks past that copy.**
+
+- **`query()` and `explain()` price a dense arm by the search it runs.**
+
+- **Under `cosine`, a nonzero vector whose squares overflow or underflow a `float32` is stored at unit length, and a query is normalized the same way.**
+
+- **A refusal of a vector, a query, a sparse value or a fusion's `k` holding a finite `float64` that a `float32` holds as an infinity names that value.**
+
+- **Product quantizer training seeds all centroids also when the sum of the squared seeding distances is not finite.**
+
+- **On a product quantized index, the exact scan and the traversal give a record the same score on the page, reranked or not.**
+
+- **On a `cosine` index that keeps raw vectors, the rerank calibration ranks its sample's codes as the traversal ranks them.**
+
+- **`get_stats()` prices each dictionary column's value lookup and the product quantized codes at the hash table each one holds.**
+
+- **A `bm25` arm under `idf="corpus"` counts rarity over the records its filter admits, whether or not the filter's fields are declared.**
+
+- **`import zeusdb_vector_database` succeeds where the engine cannot open its log file**, and the engine's records go to stderr.
+
+- **`import zeusdb_vector_database` succeeds where the working folder has been removed and `ZEUSDB_LOG_FILE` is a relative path.**
+
+- **Every call that reads the clock works on a system clock set before 1970, and records that clock's time**, the import under `ZEUSDB_LOG_ROTATION=daily` among them, and the Python layer writes each log record whose time is before 1970 in either format.
+
+- **The Python layer writes its JSON log records where deprecation warnings are errors.**
+
+- **`bits=None` and `storage_mode=None` take their defaults**, as `None` does for every other key of a quantization config but `type`.
+
+### Internal
+
+- **Every tool the release workflow installs has an exact version and is checked against a published hash.**
+
+- **The release workflow runs the Python suite on each wheel, all but the two modules that need the `test-support` build, and publishes only after every run passes.**
+
+- **The engine reads the clock for the times an index's files record, and writes and reads those times, with a module of its own that uses only the Rust standard library.** A save writes every timestamp as before, and a load accepts and refuses the same texts.
+
+### Format
+
+Every directory this release saves declares format version 5.0.0, with its journal as a directory of segments and its graph dump at version 2. This release reads 1.x to 5.x, and 0.5.0 to 0.13.0 refuse a 5.0.0 directory at the version check.
+
 ## [0.13.0] - 2026-10-17
 
 ### Changed
@@ -55,7 +209,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Unchanged, and verified
 
-The format is unchanged at 4.0.0, and a save writes the same bytes for the same records. Across the change, 43,200 result pages over 24 index configurations are identical, and the crash tests give the same result at all 171 of their points.
+The format is unchanged at 4.0.0, and a save writes the same bytes for the same records. Across the change, 43,200 result pages over 16 index configurations are identical, and the crash tests give the same result at all 171 of their points.
 
 ## [0.12.0] - 2026-10-03
 
@@ -99,7 +253,7 @@ The format is unchanged at 4.0.0, and a save writes the same bytes for the same 
 
 ### Format
 
-Every directory this release saves declares format version 4.0.0 and lists its features. This release reads 1.x, 2.x, 3.x and 4.x, so a directory an earlier release saved opens here as it opens on 0.11.0, and saving it again writes 4.0.0. 0.5.0 to 0.11.0 refuse a 4.0.0 directory at the version check with a message naming the newer release, and 0.3.0 to 0.4.1, which read no format version, refuse it when they decode its `mappings.bin`.
+Every directory this release saves declares format version 4.0.0 and lists its features. This release reads 1.x, 2.x, 3.x and 4.x, so a directory an earlier release saved opens here as it opens on 0.11.0, and saving it again writes 4.0.0. 0.5.0 to 0.11.0 refuse a 4.0.0 directory at the version check, and 0.3.0 to 0.4.1, which read no format version, refuse it when they decode its `mappings.bin`.
 
 ## [0.11.0] - 2026-09-08
 
@@ -391,7 +545,7 @@ This release repairs the index graph. Search results change on upgrade for every
 
 - Quantized search returned meaningless results in every release that offered it. The graph of a quantized index was built on distances that all evaluated as infinite, so its structure carried no information about the data. Measured at 10,000 records of dimension 768 at `top_k` 10, recall against exact search was 0.0035 where an unquantized index reached 0.9995, and a large result request returned 34 results out of 1,000 asked for. The graph is now built on real distances between codes and reranked against raw vectors where they are stored. Upgrading fixes this. A quantized directory saved by an earlier release is rebuilt on load with the corrected construction, so loading it once and saving it again persists the repaired graph.
 - Between 1 and 2 percent of records were unreachable by any query, including a search for the record's own vector, measured at 1,000 and 10,000 points. Two graph construction defects caused this, one assigning reverse links to the wrong layers and one evicting a point's last inbound link. Both are fixed. Newly built graphs no longer strand records, and a directory saved by an earlier release gets the corrected construction when its graph is rebuilt on load.
-- A deleted or overwritten record kept its node in the graph, where it consumed result slots and degraded search results as churn accumulated. Removed records are now excluded from traversal, and `compact()` rebuilds the graph to reclaim the stranded nodes when their memory matters.
+- A deleted or overwritten record kept its node in the graph, where it consumed result slots and degraded search results as churn accumulated. Removed records are now excluded from results, and `compact()` rebuilds the graph to reclaim the stranded nodes when their memory matters.
 - Loading a `quantized_only` directory dropped every record added after training, and restored the codebook as all zeroes, so quantized distances after a reload were meaningless. Both are fixed. A directory saved once by an earlier release recovers in full when loaded under this release. A directory that an earlier release loaded and then saved again lost those records permanently, and no upgrade can recover them.
 - A quantized index came back from `load()` in a degraded state that kept full-width vectors in memory. It now loads back as quantized and the memory saving survives the reload.
 - Creating an index reserved graph capacity for hundreds of neighbours per expected record. It now reserves one slot per record, and memory at creation drops accordingly.
@@ -760,7 +914,6 @@ were actually validating that cosine normalization was properly implemented.
   - Self-updating error messages showing all available index types
   - Supports case-insensitive index types (e.g. "HNSW" and "hnsw")
 - **`available_index_types()`** class method for programmatic type discovery
-- Future-ready architecture for IVF, LSH, Annoy, and Flat index types
 
 ### Changed
 - ⚠️ **Breaking Change**: Replaced index-specific factory methods with generic `create()`
@@ -779,7 +932,7 @@ were actually validating that cosine normalization was properly implemented.
 ## [0.0.9] - 2025-07-10
 
 ### Added
-- `search()` is a more accurate and industry-standard term for vector similarity retrieval.
+- `search()` for vector similarity retrieval.
 
 ### Changed
 - ⚠️ Breaking Changes - Renamed `HNSWIndex.query()` → `HNSWIndex.search()` to better reflect its role as a k-nearest neighbor (KNN) similarity search method.

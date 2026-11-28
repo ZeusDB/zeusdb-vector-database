@@ -9,39 +9,42 @@
 //! ├── manifest.json           # Index metadata and file list
 //! ├── config.json             # Index configuration
 //! ├── mappings.bin            # ID mappings (binary)
-//! ├── metadata.json           # Vector metadata (JSON)
-//! ├── vectors.bin             # Raw vectors (storage mode dependent)
+//! ├── metadata.json           # the fields of every record that holds one (JSON)
+//! ├── vectors.bin             # raw vectors beside a trained PQ graph under quantized_with_raw
 //! ├── quantization.json       # quantization configuration and training state (if enabled)
-//! ├── pq_codes.bin            # Quantized codes (if PQ enabled)
 //! ├── pq_centroids.bin        # PQ centroids (if trained)
 //! ├── int8_scales.zdbint8     # the scales of a scalar quantized index, one a dimension (if trained)
-//! ├── int8_rows.zdbint8       # every record's scalar row (if trained and not empty)
-//! ├── hnsw_index.zdbgraph     # HNSW graph topology and the point each node holds
+//! ├── hnsw_index.zdbgraph     # the graph and the stored vector, code or row of every record
 //! └── spaces/                 # one directory per sparse space, where one is declared
 //!     └── <name>/
 //!         ├── postings.zdbsparse  # every live record's term ids and weights
 //!         └── terms.zdbdict       # the term dictionary, where the space takes text
 //!
-//! my_index.zdb.zdbwal         # the journal, where the collection held one
+//! my_index.zdb.zdbjournal/    # the journal's segments, where the collection holds one
+//! my_index.zdb.zdblock        # the lock, created by the first lock taken on the directory
 //! ```
 //!
 //! ## The format version and the features
 //!
-//! Every directory this build saves declares `4.0.0` and lists the features
+//! Every directory this build saves declares `5.0.0` and lists the features
 //! it holds under `features`, each with the mark a build that does not know
 //! it reads. See `features` for what a feature is and what each mark means.
 //!
-//! The version is a major for the base every 4.x directory shares and for the
+//! The version is a major for the base every 5.x directory shares and for the
 //! manifest's own shape, `features` included, which a reader must know before
-//! it can read a feature. It is a major because the four binary artefacts,
-//! `mappings.bin`, `vectors.bin`, `pq_codes.bin` and `pq_centroids.bin`, are
-//! written inside the frame `zeusdb_vector_core::frame` describes, where every
-//! earlier release wrote them in bincode's wire and reads nothing else. A
-//! release reading 1.x to 3.x alone refuses such a directory at its version
-//! check, with a message naming the newer release. `framed` holds the four
-//! payloads. A feature does not move the version. A later feature is a name
-//! in `features`, and a build that does not know it refuses the directory by
-//! that name unless the directory marks it compatible.
+//! it can read a feature. 5.0.0 is a major because its journal is a directory
+//! of segments, each naming the checkpoint its records follow, and every
+//! call's records are closed by a commit record, which a release reading 4.x
+//! alone cannot read, and because its graph dump is version 2 and holds the
+//! only copy of each record's row. A 5.x directory holds no `pq_codes.bin`
+//! and no `int8_rows.zdbint8`, and holds `vectors.bin` only beside a trained
+//! product quantized graph under `quantized_with_raw`. A release reading 1.x
+//! to 4.x alone refuses such a directory at its version check. A load holds
+//! a 5.x manifest's fields to the rules `check_manifest_fields` and
+//! `check_quantization_fields` state, and `metadata.json` names only the
+//! records that hold a field, in increasing internal id.
+//! A 5.x manifest lists its features and records its identity with the
+//! journal sequence its state holds, and one missing either is refused.
 //!
 //! This build reads every major an earlier release wrote. A directory holding
 //! a dense space alone was written at `1.1.0`, one holding a sparse space at
@@ -52,8 +55,19 @@
 //! word. A dense space declared with scalar quantization moved each to its
 //! next minor, `1.2.0`, `2.1.0` or `3.1.0`, since a reader that knows the
 //! product quantized fields alone refuses such a directory on the first one
-//! its `quantization.json` lacks. No directory below 4.0.0 lists features,
-//! and what one holds is read from its version and its files, as it was.
+//! its `quantization.json` lacks. `4.0.0` framed the four binary artefacts,
+//! `mappings.bin`, `vectors.bin`, `pq_codes.bin` and `pq_centroids.bin`,
+//! inside the frame `zeusdb_vector_core::frame` describes, where every
+//! earlier release wrote them in bincode's wire, and listed features for the
+//! first time. `framed` holds the four payloads. No directory below 4.0.0
+//! lists features, and what one holds is read from its version and its
+//! files, as it was.
+//!
+//! A journaled directory below 5.0.0 has its journal in one file,
+//! `<name>.zdbwal`, at journal format version 1. A load replays it and then
+//! upgrades the directory: a checkpoint at 5.0.0 with a journal of segments,
+//! after which the file goes. Releases before 0.14.0 do not open the
+//! directory afterwards.
 //!
 //! The four binary artefacts of a directory are read in one layout, decided
 //! from `mappings.bin`, which every directory holds. At 4.x it is the frame.
@@ -63,13 +77,14 @@
 //!
 //! ## The journal
 //!
-//! A journaled collection records every mutation to `<name>.zdbwal`, a
-//! sibling of the directory rather than a file inside it, and a save is the
-//! checkpoint that journal replays onto. `manifest.json` names the file, the
-//! collection id both carry and the sequence the checkpoint holds, so the two
-//! are paired by content. A load replays every record above that sequence
-//! before it hands the collection back. See `crate::journal` for where the
-//! file lives and why, and for what is refused.
+//! A journaled collection records every mutation to `<name>.zdbjournal`, a
+//! directory of segments beside the directory rather than inside it, and a
+//! save is the checkpoint that journal replays onto. `manifest.json` names
+//! the journal, the collection id both carry and the sequence the checkpoint
+//! holds, and every segment names the checkpoint it follows, so the two are
+//! paired by content. A load replays every committed record above that
+//! sequence before it hands the collection back. See `crate::journal` for
+//! where the journal lives and why, for the lock, and for what is refused.
 //!
 //! ## Identity
 //!
@@ -92,7 +107,7 @@
 //! declaration is validated on load under the rules `Declaration` applies.
 //! A tokenizer the engine cannot write down is recorded as `external`, and
 //! a directory recording one opens only through `Collection::load_with`
-//! with the same implementation handed to it.
+//! with an implementation handed to it.
 //!
 //! ## How a save lands
 //!
@@ -116,7 +131,12 @@
 //!
 //! The graph file is ZeusDB's own format, written and read by `graph::dump`,
 //! and the loader restores the graph from it rather than rebuilding it by
-//! re-inserting every record. See `Collection::restore_graph_from_dump`.
+//! re-inserting every record. See `Collection::restore_graph_from_dump`. At
+//! 5.x the dump is version 2. A failure of its header, its identity region
+//! or its rows region refuses the load with `Error::GraphDumpInvalid`, and a
+//! failure of its topology rebuilds the graph from the rows it holds. Below
+//! 5.x it is version 1, beside the separate row stores, and any failure
+//! rebuilds the graph from those.
 //!
 //! This module and `collection::persist` call each other: `save` and `load`
 //! on the collection reach `save_index`, `save_manifest` and `load_index`
@@ -130,26 +150,33 @@
 //! 0.6.0 or earlier still holds those two, and opening it rebuilds the graph
 //! once and writes the new file on the next save. Nothing reads the old format.
 
+use crate::collection::BoundSources;
 use crate::collection::{
-    read_internal_id, shifted_internal_id, validate_index_parameters,
-    validate_space_supports_quantization, Collection, PositionReader, QuantizationConfig,
-    QuantizationScheme, SparseDeclaration, StorageMode, DEFAULT_SPACE,
+    panic_words, validate_index_parameters, validate_space_supports_quantization, Collection,
+    DumpOutcome, IdentityRecord, QuantizationConfig, QuantizationScheme, SparseDeclaration,
+    StorageMode, DEFAULT_SPACE,
 };
-use crate::journal::{JournalPolicy, Recovery};
+use crate::journal::{
+    CheckpointTaken, Damage, Durability, JournalPolicy, JournalSink, Note, PastBound,
+    ReadOnlyCause, ReadOnlySink, Recovery, Replaced,
+};
 use crate::RerankCalibration;
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{debug, warn};
 use zeusdb_vector_core::{
-    checksum_of, frame, frame_begin, frame_finish, refuse_unnamable, unframe,
-    validate_indexed_fields, ArtefactRecord, Bounds, Dir, Error, FrameEncoding, FrameKind,
-    FsStorage, IdStore, Int8Codec, Inventory, Position, PositionWalk, RecordFields, Restore,
-    SpaceName, Storage, VectorIndex, DUMP_FILENAME as GRAPH_DUMP_FILENAME, FRAME_OVERHEAD_BYTES,
-    LEGACY_DUMP_FILENAMES, MAX_INTERNAL_ID, PQ,
+    checksum_of, frame, read_legacy_journal, read_segments, read_segments_for_repair,
+    refuse_unnamable, refuses_writes, unframe, unknown_kind_at, validate_indexed_fields,
+    ArtefactRecord, Bounds, Cut, Dir, DumpRows, Error, Expected, FrameEncoding, FrameKind,
+    FsStorage, IdStore, Int8Codec, Inventory, JournalDamage, JournalRecord, JournalWriter,
+    LiveRecord, LockFailure, LockGuard, LockMode, Locked, MetadataStore, MetadataValue, Operation,
+    Position, PositionWalk, RecordFields, RecordState, Restore, RowValues, SegmentBase,
+    SegmentBytes, SpaceName, Storage, VectorIndex, DUMP_FILENAME as GRAPH_DUMP_FILENAME,
+    FRAME_OVERHEAD_BYTES, LEGACY_DUMP_FILENAMES, MAX_INTERNAL_ID, PQ,
 };
 use zeusdb_vector_sparse::{PostingsIndex, SparseConfig};
 use zeusdb_vector_text::{SimpleTokenizer, TermDictionary, Tokenizer, TokenizerConfig};
@@ -157,6 +184,9 @@ use zeusdb_vector_text::{SimpleTokenizer, TermDictionary, Tokenizer, TokenizerCo
 mod features;
 mod framed;
 mod legacy;
+#[cfg(test)]
+pub(crate) mod older;
+mod repair;
 
 /// The target every record this file emits carries. It is the module path
 /// this file had in the binding, so a filter directive naming it still
@@ -169,11 +199,11 @@ const LOG_TARGET: &str = "zeusdb_vector_database::persistence";
 
 /// Version written into manifest.json by every save.
 ///
-/// A major, because the four binary artefacts are framed; see the module
-/// documentation. A sparse space, a journal and scalar quantization each
-/// moved the version an earlier release wrote, and none moves this one,
-/// since a directory lists what it holds under `features`.
-const FORMAT_VERSION: &str = "4.0.0";
+/// A major, because the journal is a directory of segments closed by commit
+/// records and the graph dump holds the only copy of each record's row; see
+/// the module documentation. A feature does not move it, since a directory
+/// lists what it holds under `features`.
+const FORMAT_VERSION: &str = "5.0.0";
 
 /// The first major whose four binary artefacts are framed.
 const FRAMED_FORMAT_MAJOR: u32 = 4;
@@ -182,8 +212,33 @@ const FRAMED_FORMAT_MAJOR: u32 = 4;
 /// listed them, and the version decides what a directory holds.
 const FEATURES_FORMAT_MAJOR: u32 = 4;
 
+/// The first major whose journal is a directory of segments, and whose
+/// manifest must list its features and record its identity with the
+/// journal sequence its state holds. Below it a journal is one file at
+/// journal format version 1, which a load replays and upgrades.
+const SEGMENTED_FORMAT_MAJOR: u32 = 5;
+
+/// The first major whose graph dump is version 2 and holds the only copy of
+/// each record's row, whose manifest's fields a load holds to the rules of
+/// `check_manifest_fields` and `check_quantization_fields`, and whose
+/// `metadata.json` is compact.
+const DUMP_V2_FORMAT_MAJOR: u32 = 5;
+
+/// Bytes in a mebibyte, which `total_size_mb` counts in.
+const MEBIBYTE: f64 = 1024.0 * 1024.0;
+
+/// The storage modes a manifest records, being every value
+/// `Collection::storage_mode` gives.
+const STORAGE_MODES: [&str; 5] = [
+    "raw_only",
+    "raw_collecting_for_training",
+    "raw_ready_for_training",
+    "quantized_active",
+    "raw_trained_not_rebuilt",
+];
+
 /// The two artefacts of a trained scalar quantized index.
-const INT8_SCALES_FILENAME: &str = "int8_scales.zdbint8";
+pub(crate) const INT8_SCALES_FILENAME: &str = "int8_scales.zdbint8";
 const INT8_ROWS_FILENAME: &str = "int8_rows.zdbint8";
 const INT8_SCALES_CONTENTS: &str =
     "the scales of a scalar quantized index, one a dimension, which every stored row decodes through";
@@ -191,17 +246,23 @@ const INT8_ROWS_CONTENTS: &str = "the scalar row of every record";
 
 /// The majors this build reads.
 ///
-/// A minor bump is additive by construction, so any 1.x, any 2.x, any 3.x
-/// and any 4.x is read. A different major means the layout changed in a way
-/// this build cannot reason about, and guessing at it would be the silent
-/// truncation this format has already suffered once.
-const SUPPORTED_FORMAT_MAJORS: [u32; 4] = [1, 2, 3, 4];
+/// A minor bump is additive by construction, so any 1.x, any 2.x, any 3.x,
+/// any 4.x and any 5.x is read. A different major means the layout changed
+/// in a way this build cannot reason about, and guessing at it would be the
+/// silent truncation this format has already suffered once.
+const SUPPORTED_FORMAT_MAJORS: [u32; 5] = [1, 2, 3, 4, 5];
 
 /// The majors this build reads, as a refusal spells them.
-const SUPPORTED_FORMAT_LABEL: &str = "1.x, 2.x, 3.x and 4.x";
+const SUPPORTED_FORMAT_LABEL: &str = "1.x, 2.x, 3.x, 4.x and 5.x";
 
 /// The first major whose manifest may name a journal.
 const JOURNAL_FORMAT_MAJOR: u32 = 3;
+
+/// The first major whose releases refuse an internal id before they issue
+/// it. Below it a release issued an id first, so one whose id store was full
+/// issued ids past the store's last slot, refused each at install, and moved
+/// its counter on with each.
+const ID_CEILING_FORMAT_MAJOR: u32 = 4;
 
 // ============================================================================
 // THE FOUR BINARY ARTEFACTS
@@ -271,11 +332,11 @@ fn write_framed(
 /// dump is written by `graph::dump::write_dump`, which streams it and then
 /// seeks back to fill the header in, so there is no single buffer to hash and
 /// a digest would mean reading the largest artefact in the directory back off
-/// the disk. It carries a checksum over its own header and another over its
-/// own payload, both verified by `parse_dump` on every load, and a frame
-/// carries the same two, verified by `unframe` on every load, so a manifest
-/// digest would duplicate a check the loader already makes. Their lengths are
-/// recorded and checked.
+/// the disk. It carries a checksum over its own header and one over each of
+/// its regions, verified on every load, and a frame carries one over its
+/// header and one over its payload, verified by `unframe` on every load, so a
+/// manifest digest would duplicate a check the loader already makes. Their
+/// lengths are recorded and checked.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ArtefactDigest {
     pub(crate) bytes: u64,
@@ -399,9 +460,9 @@ fn read_artefact_string(
 
 /// The length manifest.json records for the graph dump, where it records one
 ///
-/// The dump is read by `graph::dump::parse_dump` rather than through
-/// `read_artefact`, because it is streamed rather than held whole in memory.
-/// This is the part of the digest check that still applies to it.
+/// The dump is read by `graph::dump` as a stream rather than through
+/// `read_artefact`, because it is not held whole in memory. This is the part
+/// of the digest check that still applies to it.
 pub(crate) fn recorded_dump_length(manifest: &IndexManifest, name: &str) -> Option<u64> {
     manifest.file_digests.get(name).map(|entry| entry.bytes)
 }
@@ -450,23 +511,22 @@ fn is_version_part(part: &str) -> bool {
 // DIRECTORY COMPLETENESS
 // ============================================================================
 
-/// Whether an artefact is one the loader can produce again rather than read
+/// Whether an artefact is one the loader can produce again rather than read,
+/// in a directory declaring `major`
 ///
-/// The graph is the only one. Every record carries what the graph is built
-/// from, so a directory that lost its dump is rebuilt rather than refused, and
-/// that has always been the behaviour. The list holds the name this build
+/// Below 5.x the graph is the only one. Every record carries what the graph
+/// is built from in the separate row stores, so a directory that lost its
+/// dump is rebuilt rather than refused. The list holds the name this build
 /// writes and the pair 0.6.0 and earlier wrote, because a directory saved by
 /// one of those names both of them under `files_included` and neither is
-/// needed to reopen it.
+/// needed to reopen it, and a directory saved before the manifest was
+/// written last can name a dump that was never written.
 ///
-/// A save now writes the dump before the manifest and moves the whole
-/// directory into place afterwards, so a directory this build wrote and a
-/// reader can see always holds the dump its manifest names. The exemption
-/// stays for the directories that came before it, where the manifest was
-/// written first and a save interrupted between the two left a manifest naming
-/// a dump that was never written.
-fn is_derived_artefact(name: &str) -> bool {
-    name == GRAPH_DUMP_FILENAME || LEGACY_DUMP_FILENAMES.contains(&name)
+/// At 5.x nothing is: the dump holds the only copy of each record's row, so
+/// a directory that lost it lost its records.
+fn is_derived_artefact(name: &str, major: u32) -> bool {
+    major < DUMP_V2_FORMAT_MAJOR
+        && (name == GRAPH_DUMP_FILENAME || LEGACY_DUMP_FILENAMES.contains(&name))
 }
 
 /// What an artefact holds, for the message its absence produces
@@ -488,6 +548,7 @@ fn artefact_contents(name: &str) -> &'static str {
         "pq_codes.bin" => "the quantized code of every record",
         INT8_SCALES_FILENAME => INT8_SCALES_CONTENTS,
         INT8_ROWS_FILENAME => INT8_ROWS_CONTENTS,
+        GRAPH_DUMP_FILENAME => "the graph and the stored vector, code or row of every record",
         _ if name.ends_with("/postings.zdbsparse") => {
             "the postings of a sparse space, being every record's term ids and weights"
         }
@@ -525,12 +586,12 @@ const DICTIONARY_CONTENTS: &str =
 /// opened as a complete index built entirely from PQ reconstructions, and one
 /// that lost `quantization.json` opened as an unquantized index. Both were
 /// silent.
-fn check_files_present(dir: &dyn Dir, manifest: &IndexManifest) -> Result<(), Error> {
+fn check_files_present(dir: &dyn Dir, manifest: &IndexManifest, major: u32) -> Result<(), Error> {
     let missing: Vec<&str> = manifest
         .files_included
         .iter()
         .map(String::as_str)
-        .filter(|name| !is_derived_artefact(name))
+        .filter(|name| !is_derived_artefact(name, major))
         .filter(|name| !dir.exists(name))
         .collect();
 
@@ -558,9 +619,9 @@ fn check_files_present(dir: &dyn Dir, manifest: &IndexManifest) -> Result<(), Er
 /// exclude. It stays because a directory written by an earlier release can
 /// still hold those files.
 ///
-/// The graph dump is not gated this way. It is derived, it carries its own
-/// checks on node count, distance kind and `m`, and it already falls back to
-/// the rebuild when any of them disagree.
+/// The graph dump is not gated this way. It is read wherever the collection
+/// holds a record, and its own checks hold it to `config.json` and the
+/// mappings.
 fn manifest_names(manifest: &IndexManifest, name: &str) -> bool {
     manifest.files_included.iter().any(|entry| entry == name)
 }
@@ -623,15 +684,10 @@ pub(crate) struct IndexManifest {
     #[serde(default)]
     pub(crate) file_digests: HashMap<String, ArtefactDigest>,
 
-    /// Every byte the directory holds except `manifest.json` itself
-    ///
-    /// The manifest is now the last file a save writes, so it does not exist
-    /// when the figure is taken and cannot count itself. It used to be written
-    /// before the graph dump and then rewritten through a temporary file to
-    /// record a total it had missed the largest artefact of, which is a second
-    /// write this ordering removes.
+    /// The lengths `file_digests` records, added and divided by a mebibyte,
+    /// being every artefact the save wrote. `manifest.json` itself is the
+    /// last file a save writes and counts in none.
     pub(crate) total_size_mb: f64,
-    pub(crate) compression_info: Option<CompressionInfo>,
 
     /// The journal beside the directory, where the collection that saved it
     /// held one.
@@ -648,15 +704,17 @@ pub(crate) struct IndexManifest {
 
 /// How `manifest.json` names the journal beside the directory.
 ///
-/// The three values are what pair a directory with a file that is not in it.
-/// `collection_id` is drawn when a collection is built and is in the
-/// journal's own header too, so a journal from another index is refused by
-/// content. `sequence` is what the journal had reached when this checkpoint
-/// was taken, so a recovery replays every record above it and skips every
-/// record at or below it. `file` is the sibling's name as the checkpoint
-/// wrote it, which a refusal quotes; the file a load actually opens is
-/// derived from the directory it was handed, so a directory renamed together
-/// with its journal opens under the new name.
+/// The three values are what pair a directory with a journal that is not in
+/// it, under the names and types every release from 0.11.0 parses before its
+/// version check. `collection_id` is drawn when a collection is built and is
+/// in every segment's header too, so a journal from another index is refused
+/// by content. `sequence` is what the journal had reached when this
+/// checkpoint was taken, so a recovery replays every record above it and
+/// skips every record at or below it, and at 5.x it equals the identity's
+/// sequence. `file` is the journal's name as the checkpoint wrote it, which
+/// a refusal quotes; the journal a load actually opens is derived from the
+/// directory it was handed, so a directory renamed together with its journal
+/// opens under the new name.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct JournalManifest {
     pub(crate) file: String,
@@ -669,7 +727,9 @@ pub(crate) struct JournalManifest {
 /// Every id is 32 hexadecimal digits, the spelling `journal::id_hex`
 /// writes. `generation` is 1 or more, since a collection's first save
 /// writes 1. `parent` is absent from the file where the collection was
-/// saved from no recorded snapshot.
+/// saved from no recorded snapshot. `sequence` is the journal sequence the
+/// directory's state holds, 0 where the collection was never journaled,
+/// which every 5.x manifest records and no earlier one does.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct IdentityManifest {
     pub(crate) collection_id: String,
@@ -677,12 +737,14 @@ pub(crate) struct IdentityManifest {
     pub(crate) snapshot: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) parent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) sequence: Option<u64>,
 }
 
 impl IdentityManifest {
     /// The record a save writes for `identity`, which carries the snapshot
-    /// the save drew.
-    fn of(identity: &crate::Identity) -> Self {
+    /// the save drew, with the journal sequence the saved state holds.
+    fn of(identity: &crate::Identity, sequence: u64) -> Self {
         IdentityManifest {
             collection_id: crate::journal::id_hex(identity.collection_id),
             generation: identity.generation,
@@ -692,6 +754,7 @@ impl IdentityManifest {
                     .expect("the identity a save records carries the snapshot it drew"),
             ),
             parent: identity.parent.map(crate::journal::id_hex),
+            sequence: Some(sequence),
         }
     }
 
@@ -744,14 +807,6 @@ impl Inventory for IndexManifest {
                 .and_then(|hex| u64::from_str_radix(hex, 16).ok()),
         })
     }
-}
-
-/// Compression statistics for quantized indexes
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct CompressionInfo {
-    pub(crate) original_size_mb: f64,
-    pub(crate) compressed_size_mb: f64,
-    pub(crate) compression_ratio: f64,
 }
 
 /// Index configuration for reconstruction
@@ -914,8 +969,6 @@ pub(crate) struct QuantizationPersistence {
     pub(crate) storage_mode: String,
     pub(crate) is_trained: bool,
     pub(crate) training_completed_at: Option<String>,
-    pub(crate) memory_stats: Option<MemoryStats>,
-    pub(crate) pq_config: PQConfig,
     #[serde(default)]
     pub(crate) training_ids: Vec<String>,
     #[serde(default)]
@@ -927,23 +980,6 @@ pub(crate) struct QuantizationPersistence {
     /// they were built against. See `RerankCalibration`.
     #[serde(default)]
     pub(crate) rerank_calibration: Option<RerankCalibration>,
-}
-
-/// Memory usage statistics for quantization
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct MemoryStats {
-    pub(crate) centroid_storage_mb: f64,
-    pub(crate) compression_ratio: f64,
-    pub(crate) centroids_per_subvector: usize,
-    pub(crate) total_centroids: usize,
-}
-
-/// Product Quantization configuration details
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct PQConfig {
-    pub(crate) dim: usize,
-    pub(crate) sub_dim: usize,
-    pub(crate) num_centroids: usize,
 }
 
 /// quantization.json under `type: int8`: the scalar declaration and the
@@ -1022,6 +1058,11 @@ impl Int8Rows {
     fn push(&mut self, id: u32, row: &[u8]) {
         self.ids.push(id);
         self.data.extend(row.iter().map(|&b| b as i8));
+    }
+
+    fn push_row(&mut self, id: u32, row: &[i8]) {
+        self.ids.push(id);
+        self.data.extend_from_slice(row);
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -1104,14 +1145,15 @@ impl TrainingState {
 // INDIVIDUAL COMPONENT LOADERS
 // ============================================================================
 
-/// Load index configuration from config.json
-fn load_config(dir: &dyn Dir, manifest: &IndexManifest) -> Result<IndexConfig, Error> {
+/// Load index configuration from config.json, written at the format whose
+/// major is `major`
+fn load_config(dir: &dyn Dir, manifest: &IndexManifest, major: u32) -> Result<IndexConfig, Error> {
     debug!(target: LOG_TARGET, "Loading config.json...");
 
     let config_path = dir.locate("config.json");
     let config_data = read_artefact_string(dir, "config.json", manifest)?;
 
-    let config: IndexConfig =
+    let mut config: IndexConfig =
         serde_json::from_str(&config_data).map_err(|e| Error::ArtefactParseFailed {
             name: "config.json",
             error: e.to_string(),
@@ -1146,11 +1188,23 @@ fn load_config(dir: &dyn Dir, manifest: &IndexManifest) -> Result<IndexConfig, E
     // is sized by it, since every per-record structure sits at the positions
     // the records hold.
     //
-    // The ceiling is `u32::MAX` because a node index is a `u32` and both graph
-    // constructors refuse a graph holding more points than that. Every id was
-    // issued to a record the graph then held a node for, so an index that
-    // issued more ids than a node index can name has a graph it could not have
-    // built. The check refuses nothing that can exist.
+    // A release before 0.12.0, which wrote a format below 4.0.0, issued an id
+    // before its id store refused it, so one whose store was full issued
+    // `u32::MAX` and larger ids, refused each at install and moved the counter
+    // on with each. Below that format a counter past the last id a collection
+    // issues is one such a release left, and it is held to that id. The ids
+    // the mappings name are refused past it as they are read, as every
+    // directory's are, and the collection refuses every add, as one at its
+    // last id does.
+    //
+    // From that format a release refuses an id before issuing it, so a
+    // counter past `u32::MAX` was written by no release, and it is refused.
+    if major < ID_CEILING_FORMAT_MAJOR && config.id_counter > MAX_INTERNAL_ID {
+        debug!(target: LOG_TARGET, "config.json records id_counter {}, past the last internal id a collection issues, which a release before 0.12.0 left; held to {}",
+            config.id_counter, MAX_INTERNAL_ID
+        );
+        config.id_counter = MAX_INTERNAL_ID;
+    }
     if config.id_counter > u32::MAX as usize {
         return Err(Error::IdCounterTooLarge {
             file: config_path.clone(),
@@ -1207,15 +1261,10 @@ fn restore_spaces(
     };
     // The space files each record at the position the mappings give its
     // internal id, and refuses one they do not hold once its payload has
-    // been read whole, which is named here with the space.
+    // been read whole, or one its forward arena cannot take, each named here
+    // with the space.
     let restored = PostingsIndex::restore(space.config(), &prefix, dir, manifest, &bounds)
-        .map_err(|error| match error {
-            Error::SparseRecordUnmapped { id, .. } => Error::SparseRecordUnmapped {
-                space: name.as_str().to_string(),
-                id,
-            },
-            other => other,
-        })?;
+        .map_err(|error| index.sparse_refusal_named(error))?;
     if space.text.is_some() {
         let dictionary_name = Collection::dictionary_name(&prefix);
         let bytes = zeusdb_vector_core::read_artefact(
@@ -1395,6 +1444,10 @@ fn framed_ids(bytes: &[u8], config: &IndexConfig) -> Result<MappedIds, Error> {
         refuse_past_last_id(at)?;
         refuse_unnamable(id, store.arena_len())?;
         store.insert_admitted(at, id);
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "an internal id, held below MAX_INTERNAL_ID by refuse_past_last_id above"
+        )]
         internal.push(internal_id as u32);
     }
     if store.len() != records.len() {
@@ -1409,8 +1462,7 @@ fn framed_ids(bytes: &[u8], config: &IndexConfig) -> Result<MappedIds, Error> {
 
 /// Refuse an internal id past the last one a collection issues, which no
 /// save writes, in the words the id store refused it in while an entry was
-/// an internal id. The rebuild fallback holds the ids it hands to records
-/// the mappings lack to the same ceiling.
+/// an internal id.
 pub(crate) fn refuse_past_last_id(internal_id: usize) -> Result<(), Error> {
     if internal_id > MAX_INTERNAL_ID {
         return Err(Error::Engine(format!(
@@ -1477,6 +1529,10 @@ fn bincode_ids(bytes: &[u8], config: &IndexConfig) -> Result<MappedIds, Error> {
         refuse_past_last_id(at)?;
         refuse_unnamable(id, store.arena_len())?;
         store.insert_admitted(at, id);
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "an internal id, held below MAX_INTERNAL_ID by refuse_past_last_id above"
+        )]
         internal.push(internal_id as u32);
     }
     let mapped = MappedIds { store, internal };
@@ -1499,23 +1555,246 @@ fn bincode_ids(bytes: &[u8], config: &IndexConfig) -> Result<MappedIds, Error> {
     Ok(mapped)
 }
 
-/// Load vector metadata from metadata.json
+/// Load vector metadata from metadata.json straight into the store the
+/// collection takes, each record's fields at the position the mappings give
+/// its id
+///
+/// At 5.x the file names only the records that hold a field, and each
+/// record it names must be one the mappings hold, named once. A record it
+/// leaves out takes an empty entry, as a record with no field holds in
+/// memory, since a filter judges an empty entry and never an absent one.
+/// Below 5.x the file names every record, an entry for an id the mappings do
+/// not hold is dropped and counted, and a record named twice keeps its last
+/// entry.
+///
+/// The file is read once, with nothing between its text and the store. Each
+/// id is resolved through the mappings as its key is read, borrowed from the
+/// text, each field name is interned with no copy where the store holds it
+/// already, and each record's fields take one block. The entry vector is
+/// sized once, to the records the mappings hold or the reservation for
+/// `expected_size`, whichever is more, whatever order the file names them
+/// in. Text that is not the shape a metadata file takes is refused before
+/// any record the file names.
+///
+/// `serde_json`'s own nesting limit is off for this read, and every field's
+/// value, kept or let go, is read through [`MetadataValue`], which holds it
+/// to the depth the binding takes. The file's object and a record's
+/// mapping are read by the two visitors below, and nothing else of the
+/// file nests.
 fn load_metadata(
     dir: &dyn Dir,
     manifest: &IndexManifest,
-) -> Result<HashMap<String, HashMap<String, Value>>, Error> {
+    major: u32,
+    ids: Mapped<'_>,
+    expected_size: usize,
+) -> Result<MetadataStore, Error> {
     debug!(target: LOG_TARGET, "Loading metadata.json...");
 
     let metadata_data = read_artefact_string(dir, "metadata.json", manifest)?;
-
-    let metadata: HashMap<String, HashMap<String, Value>> = serde_json::from_str(&metadata_data)
+    let compact = major >= DUMP_V2_FORMAT_MAJOR;
+    let extent = ids.store.extent();
+    let mut reader = MetadataReader {
+        store: MetadataStore::with_records(extent, expected_size),
+        ids,
+        compact,
+        named: if compact {
+            vec![false; extent]
+        } else {
+            Vec::new()
+        },
+        refused: None,
+        unmapped: 0,
+    };
+    let mut deserializer = serde_json::Deserializer::from_str(&metadata_data);
+    deserializer.disable_recursion_limit();
+    serde::de::DeserializeSeed::deserialize(&mut reader, &mut deserializer)
+        .and_then(|()| deserializer.end())
         .map_err(|e| Error::ArtefactParseFailed {
             name: "metadata.json",
             error: e.to_string(),
         })?;
+    let MetadataReader {
+        mut store,
+        refused,
+        unmapped,
+        ..
+    } = reader;
+    if let Some(refused) = refused {
+        return Err(Error::DecodeFailed {
+            file: "metadata.json".to_string(),
+            error: match refused {
+                MetadataRefused::Unmapped(id) => {
+                    format!("names record '{}', which mappings.bin does not hold", id)
+                }
+                MetadataRefused::Twice(id) => format!("names record '{}' twice", id),
+            },
+        });
+    }
+    if compact {
+        store.fill_empty(ids.store.slots());
+        debug!(target: LOG_TARGET, "metadata.json loaded (compact)");
+    } else {
+        if unmapped > 0 {
+            debug!(target: LOG_TARGET, operation = "restore_metadata",
+                unmapped = unmapped,
+                "metadata.json names records the mappings do not hold, and their entries were dropped"
+            );
+        }
+        debug!(target: LOG_TARGET, "metadata.json loaded");
+    }
+    Ok(store)
+}
 
-    debug!(target: LOG_TARGET, "metadata.json loaded");
-    Ok(metadata)
+/// Why a metadata.json whose text parses is refused: the first record it
+/// names that the load cannot place, in the order the file names them.
+enum MetadataRefused {
+    /// A record the mappings do not hold.
+    Unmapped(String),
+    /// A record the file names a second time.
+    Twice(String),
+}
+
+/// The reader [`load_metadata`] runs over the file's text, filling `store`.
+///
+/// A record the load refuses is noted rather than raised, and the rest of
+/// the file is still read, keeping nothing, so that text which does not
+/// parse is refused before any record the file names.
+struct MetadataReader<'m> {
+    store: MetadataStore,
+    ids: Mapped<'m>,
+    /// Whether the file is the compact one of 5.x.
+    compact: bool,
+    /// At 5.x, which positions the file has named.
+    named: Vec<bool>,
+    /// The first record the load refuses.
+    refused: Option<MetadataRefused>,
+    /// Below 5.x, the entries naming an id the mappings do not hold.
+    unmapped: usize,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for &mut MetadataReader<'_> {
+    type Value = ();
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_map(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for &mut MetadataReader<'_> {
+    type Value = ();
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The words the parse each layout was read with gave.
+        f.write_str(if self.compact {
+            "an object of records"
+        } else {
+            "a map"
+        })
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        // One record's fields as they are read, kept from one record to the
+        // next, so the record's block is the only thing allocated for it.
+        let mut pairs: Vec<(Cow<'de, str>, Value)> = Vec::new();
+        while let Some(JsonKey(id)) = map.next_key::<JsonKey<'de>>()? {
+            let at = self.ids.store.slot_of(&id);
+            let placed = match at {
+                None if self.compact => {
+                    self.refused
+                        .get_or_insert(MetadataRefused::Unmapped(id.into_owned()));
+                    false
+                }
+                None => {
+                    self.unmapped += 1;
+                    false
+                }
+                Some(at) if self.compact && std::mem::replace(&mut self.named[at], true) => {
+                    self.refused
+                        .get_or_insert(MetadataRefused::Twice(id.into_owned()));
+                    false
+                }
+                Some(_) => true,
+            };
+            let keep = placed && self.refused.is_none();
+            map.next_value_seed(RecordFieldsSeed {
+                pairs: &mut pairs,
+                keep,
+            })?;
+            if let (true, Some(at)) = (keep, at) {
+                self.store.insert_pairs(at, pairs.drain(..));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One record's fields, read into `pairs` where `keep` is set and read and
+/// let go otherwise, each value through [`MetadataValue`] either way.
+struct RecordFieldsSeed<'p, 'de> {
+    pairs: &'p mut Vec<(Cow<'de, str>, Value)>,
+    keep: bool,
+}
+
+impl<'de> serde::de::DeserializeSeed<'de> for RecordFieldsSeed<'_, 'de> {
+    type Value = ();
+
+    fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+        deserializer.deserialize_map(self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for RecordFieldsSeed<'_, 'de> {
+    type Value = ();
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The words the parse of a record's fields as a map gave.
+        f.write_str("a map")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+        while let Some(JsonKey(name)) = map.next_key::<JsonKey<'de>>()? {
+            let value = map.next_value_seed(MetadataValue::field(self.keep))?;
+            if self.keep {
+                self.pairs.push((name, value));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A key of a JSON object, borrowed from the text wherever it holds no
+/// escape, which is every id and field name a save writes.
+struct JsonKey<'de>(Cow<'de, str>);
+
+impl<'de> Deserialize<'de> for JsonKey<'de> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Key;
+
+        impl<'de> serde::de::Visitor<'de> for Key {
+            type Value = JsonKey<'de>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a string")
+            }
+
+            fn visit_borrowed_str<E: serde::de::Error>(
+                self,
+                key: &'de str,
+            ) -> Result<JsonKey<'de>, E> {
+                Ok(JsonKey(Cow::Borrowed(key)))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, key: &str) -> Result<JsonKey<'de>, E> {
+                Ok(JsonKey(Cow::Owned(key.to_string())))
+            }
+
+            fn visit_string<E: serde::de::Error>(self, key: String) -> Result<JsonKey<'de>, E> {
+                Ok(JsonKey(Cow::Owned(key)))
+            }
+        }
+
+        deserializer.deserialize_str(Key)
+    }
 }
 
 /// Load raw vectors from vectors.bin, keyed by external id
@@ -1560,6 +1839,11 @@ fn load_vectors(
         }
         Layout::Bincode => {
             let vectors = legacy::read_vectors(&vectors_data, "vectors.bin", ids.len())?;
+            let mut hold = LegacyHold::new(dim);
+            for (id, vector) in &vectors {
+                hold.see(id, vector.len(), ids);
+            }
+            hold.refusal("vectors.bin", |width| vectors_mismatch(width, dim))?;
             check_vectors_are_finite(&vectors)?;
             vectors
         }
@@ -1680,7 +1964,12 @@ fn count_vectors(
     let count = match layout {
         Layout::Framed => framed_vectors(&vectors_data, ids, dim)?.len(),
         Layout::Bincode => {
-            let (count, offenders) = legacy::walk_vectors(&vectors_data, "vectors.bin", ids.len())?;
+            let mut hold = LegacyHold::new(dim);
+            let (count, offenders) =
+                legacy::walk_vectors(&vectors_data, "vectors.bin", ids.len(), &mut |id, width| {
+                    hold.see(id, width, ids)
+                })?;
+            hold.refusal("vectors.bin", |width| vectors_mismatch(width, dim))?;
             if !offenders.is_empty() {
                 return Err(Error::VectorsNotFinite {
                     offenders,
@@ -1693,6 +1982,145 @@ fn count_vectors(
 
     debug!(target: LOG_TARGET, "vectors.bin walked ({} vectors, none kept)", count);
     Ok(count)
+}
+
+/// The refusal of a record a store names by its id and mappings.bin does not
+/// hold, in the words a framed store's reader refuses one it names by
+/// internal id in.
+pub(crate) fn unmapped_record(file: &str, id: &str) -> Error {
+    Error::DecodeFailed {
+        file: file.to_string(),
+        error: format!("names record '{}', which mappings.bin does not hold", id),
+    }
+}
+
+/// What vectors.bin holds where its vectors are `width` values wide and
+/// config.json declares `dim`.
+fn vectors_mismatch(width: usize, dim: usize) -> String {
+    format!(
+        "holds vectors of {} values and config.json declares dim {}",
+        width, dim
+    )
+}
+
+/// What pq_codes.bin holds where its codes are `width` bytes wide and
+/// quantization.json declares `subvectors`.
+fn codes_mismatch(width: usize, subvectors: usize) -> String {
+    format!(
+        "holds codes of {} bytes and quantization.json declares {} subvectors",
+        width, subvectors
+    )
+}
+
+/// A store of bincode's wire, which names each record by its id, held to the
+/// mappings and to its width entry by entry, with the rules a framed store's
+/// reader holds a framed one to: every entry is `width` wide and names a
+/// record the mappings hold. An id the store holds twice is judged by its
+/// last copy, which is the copy its map keeps.
+struct LegacyHold<'s> {
+    width: usize,
+    /// The ids whose last copy is not `width` wide, with that copy's width.
+    wrong: BTreeMap<&'s str, usize>,
+    /// The least id the mappings do not hold.
+    foreign: Option<&'s str>,
+}
+
+impl<'s> LegacyHold<'s> {
+    fn new(width: usize) -> Self {
+        LegacyHold {
+            width,
+            wrong: BTreeMap::new(),
+            foreign: None,
+        }
+    }
+
+    /// One entry of the store, holding `held` values.
+    fn see(&mut self, id: &'s str, held: usize, ids: Mapped<'_>) {
+        if held == self.width {
+            self.wrong.remove(id);
+        } else {
+            self.wrong.insert(id, held);
+        }
+        if ids.store.slot_of(id).is_none() && self.foreign.is_none_or(|least| id < least) {
+            self.foreign = Some(id);
+        }
+    }
+
+    /// The refusal a framed reader gives the store, in its order: a width
+    /// that is not the declared one, in `mismatch`'s words for the least id
+    /// holding one, and then the least id the mappings do not hold.
+    fn refusal(self, file: &str, mismatch: impl FnOnce(usize) -> String) -> Result<(), Error> {
+        if let Some(&held) = self.wrong.values().next() {
+            return Err(Error::DecodeFailed {
+                file: file.to_string(),
+                error: mismatch(held),
+            });
+        }
+        if let Some(id) = self.foreign {
+            return Err(unmapped_record(file, id));
+        }
+        Ok(())
+    }
+}
+
+/// Whether a directory keeps every record's raw vector in vectors.bin, being
+/// one with no quantization, one not yet trained, or a trained one under
+/// `quantized_with_raw`.
+fn keeps_every_raw(quantization: Option<&QuantizationArtefacts>) -> bool {
+    match quantization.map(|quant| &quant.config) {
+        None => true,
+        Some(QuantizationFile::Pq(config)) => {
+            !config.is_trained || config.storage_mode == StorageMode::QuantizedWithRaw.to_string()
+        }
+        Some(QuantizationFile::Int8(config)) => !config.is_trained,
+    }
+}
+
+/// Refuse a vectors.bin of bincode's wire that holds no vector for a record
+/// the mappings hold, in the words a framed one is refused in, naming the
+/// least such id.
+///
+/// `vectors` is what the load kept of the file, which was held to the
+/// mappings as it was read, so it holds every record where it holds as many
+/// as the mappings do. Where the load kept the count alone, the file is read
+/// again for its ids, which only a directory short of a vector reaches.
+fn refuse_missing_vectors(
+    dir: &dyn Dir,
+    manifest: &IndexManifest,
+    ids: Mapped<'_>,
+    vectors: &RawVectors,
+) -> Result<(), Error> {
+    if vectors.len() == ids.len() {
+        return Ok(());
+    }
+    let least_without = |held: &dyn Fn(&str) -> bool| {
+        ids.iter()
+            .map(|(_, id)| id)
+            .filter(|id| !held(id))
+            .min()
+            .unwrap_or("")
+            .to_string()
+    };
+    let without = match vectors {
+        RawVectors::Held(map) => least_without(&|id| map.contains_key(id)),
+        RawVectors::Counted(_) => {
+            let bytes = read_artefact(dir, "vectors.bin", manifest)?;
+            let mut held: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            legacy::walk_vectors(&bytes, "vectors.bin", ids.len(), &mut |id, _| {
+                held.insert(id);
+            })?;
+            least_without(&|id| held.contains(id))
+        }
+    };
+    Err(Error::DecodeFailed {
+        file: "vectors.bin".to_string(),
+        error: format!(
+            "holds {} vectors and mappings.bin holds {} records; record '{}' has no vector",
+            vectors.len(),
+            ids.len(),
+            without
+        ),
+    })
 }
 
 /// A framed vectors.bin, held to the mappings
@@ -1713,12 +2141,7 @@ fn framed_vectors<'a>(
         "vectors.bin",
         4,
         dim,
-        |width| {
-            format!(
-                "holds vectors of {} values and config.json declares dim {}",
-                width, dim
-            )
-        },
+        |width| vectors_mismatch(width, dim),
     )?;
     let corrupt = |error: String| Error::DecodeFailed {
         file: "vectors.bin".to_string(),
@@ -1855,12 +2278,7 @@ fn load_pq_codes(
                 "pq_codes.bin",
                 1,
                 subvectors,
-                |width| {
-                    format!(
-                        "holds codes of {} bytes and quantization.json declares {} subvectors",
-                        width, subvectors
-                    )
-                },
+                |width| codes_mismatch(width, subvectors),
             )?;
             let mut codes = HashMap::with_capacity(rows.len());
             let mut walk = ids.walk();
@@ -1881,7 +2299,15 @@ fn load_pq_codes(
             }
             codes
         }
-        Layout::Bincode => legacy::read_codes(&codes_data, "pq_codes.bin", ids.len())?,
+        Layout::Bincode => {
+            let codes = legacy::read_codes(&codes_data, "pq_codes.bin", ids.len())?;
+            let mut hold = LegacyHold::new(subvectors);
+            for (id, code) in &codes {
+                hold.see(id, code.len(), ids);
+            }
+            hold.refusal("pq_codes.bin", |width| codes_mismatch(width, subvectors))?;
+            codes
+        }
     };
 
     debug!(target: LOG_TARGET, "pq_codes.bin loaded ({} records)", codes.len());
@@ -1899,7 +2325,9 @@ fn load_pq_codes(
 /// the configurations `create()` refuses and no more. `bits` is 1 to 8 because
 /// a code is one byte a subvector. `subvectors` must be positive, must divide
 /// `dim` and must not exceed it, because `sub_dim` is `dim / subvectors` and a
-/// subvector of no values encodes nothing.
+/// subvector of no values encodes nothing. `training_size` is at least 1,000
+/// and `max_training_vectors`, where given, at or above it, and
+/// `storage_mode` is one `create()` takes, at every format version.
 fn validate_quantization_fields(
     file: &str,
     config: &QuantizationPersistence,
@@ -1922,6 +2350,31 @@ fn validate_quantization_fields(
             subvectors: config.subvectors,
             dim,
         });
+    }
+    let invalid = |detail: String| Error::QuantizationFieldInvalidInFile {
+        file: file.to_string(),
+        detail,
+    };
+    if config.training_size < 1000 {
+        return Err(invalid(format!(
+            "training_size is {}, and create() requires at least 1000",
+            config.training_size
+        )));
+    }
+    if let Some(max_training) = config.max_training_vectors {
+        if max_training < config.training_size {
+            return Err(invalid(format!(
+                "max_training_vectors is {} and training_size is {}, and create() requires the \
+                 first to be at or above the second",
+                max_training, config.training_size
+            )));
+        }
+    }
+    if StorageMode::from_string(&config.storage_mode).is_err() {
+        return Err(invalid(format!(
+            "storage_mode is '{}', and create() takes quantized_only or quantized_with_raw",
+            config.storage_mode
+        )));
     }
     Ok(())
 }
@@ -2002,6 +2455,13 @@ fn load_quantization(
     let centroids = load_pq_centroids(dir, manifest, layout, shape)?;
     let codes = load_pq_codes(dir, manifest, ids, layout, quant_config.subvectors)?;
 
+    // A code is what a trained codebook encodes a record as, so a directory
+    // whose quantization.json records no training holds no code, and one
+    // that does holds codes nothing it carries can decode.
+    if !quant_config.is_trained && !codes.is_empty() {
+        return Err(Error::CodesWithoutCodebook { count: codes.len() });
+    }
+
     Ok(Some(QuantizationArtefacts {
         config: QuantizationFile::Pq(quant_config),
         centroids,
@@ -2020,8 +2480,9 @@ fn load_quantization(
 /// bytes, every scale finite and positive, and the rows artefact carries
 /// `entries` records of a `u32` internal id and a row of the codec's width,
 /// ids strictly increasing and none above the saved id counter, in exactly
-/// `entries * (4 + width)` bytes. Every bound is checked before anything is
-/// allocated from a field.
+/// `entries * (4 + width)` bytes, and under cosine every row's inverse norm
+/// finite. Every bound is checked before anything is allocated from a
+/// field.
 fn load_int8_quantization(
     dir: &dyn Dir,
     manifest: &IndexManifest,
@@ -2062,7 +2523,12 @@ fn load_int8_quantization(
             )));
         }
     }
-    let storage_mode = StorageMode::from_string(&config.storage_mode).map_err(Error::Engine)?;
+    let storage_mode = StorageMode::from_string(&config.storage_mode).map_err(|_| {
+        invalid(format!(
+            "storage_mode is '{}', and a scalar quantized index takes quantized_only alone",
+            config.storage_mode
+        ))
+    })?;
     if storage_mode == StorageMode::QuantizedWithRaw {
         return Err(invalid(
             "storage_mode is 'quantized_with_raw', which a scalar quantized index never takes"
@@ -2082,8 +2548,7 @@ fn load_int8_quantization(
     }
 
     let codec = load_int8_scales(dir, manifest, dim)?;
-    let tail = if space == "cosine" { 4 } else { 0 };
-    let rows = load_int8_rows(dir, manifest, codec.dim() + tail)?;
+    let rows = load_int8_rows(dir, manifest, codec.dim(), space == "cosine")?;
     Ok(QuantizationArtefacts {
         config: QuantizationFile::Int8(config),
         centroids: None,
@@ -2147,10 +2612,15 @@ fn load_int8_scales(
 /// The rows artefact, held to its bounds, as (internal id, row) ascending.
 /// Empty where the manifest names none, which is what a trained index
 /// holding no record writes.
+///
+/// A row is `dim` codes, and where `norm` is set, as on a cosine index, the
+/// four bytes of the record's inverse norm after them, which is refused
+/// where it is not finite, since it scales every distance to the record.
 fn load_int8_rows(
     dir: &dyn Dir,
     manifest: &IndexManifest,
-    row_width: usize,
+    dim: usize,
+    norm: bool,
 ) -> Result<Int8Rows, Error> {
     if !manifest_names(manifest, INT8_ROWS_FILENAME) {
         return Ok(Int8Rows::default());
@@ -2160,6 +2630,7 @@ fn load_int8_rows(
         file: INT8_ROWS_FILENAME.to_string(),
         detail,
     };
+    let row_width = if norm { dim + 4 } else { dim };
     let stride = 4 + row_width;
     // The bound is the id ceiling's worth of rows, since an internal id is
     // a `u32` and every row below is held to that ceiling.
@@ -2207,6 +2678,17 @@ fn load_int8_rows(
             )));
         }
         previous = Some(id);
+        if norm {
+            let tail = &chunk[stride - 4..];
+            let value = f32::from_le_bytes([tail[0], tail[1], tail[2], tail[3]]);
+            if !value.is_finite() {
+                return Err(invalid(format!(
+                    "the row of internal id {} holds {} as its inverse norm, and every inverse \
+                     norm is finite",
+                    id, value
+                )));
+            }
+        }
         rows.push(id, &chunk[4..]);
     }
     debug!(target: LOG_TARGET, "{} loaded ({} rows)", INT8_ROWS_FILENAME, rows.len());
@@ -2237,22 +2719,21 @@ pub(crate) fn save_index(index: &Collection, dir: &dyn Dir) -> Result<SaveLedger
     save_mappings(index, dir, &mut ledger)?;
     save_metadata(index, dir, &mut ledger)?;
 
-    // Save quantization components if enabled
+    // Save quantization components if enabled. Every record's code or row
+    // is in the graph dump, which holds the only copy of each.
     if index.has_quantization() {
         save_quantization_config(index, dir, &mut ledger)?;
 
         if index.can_use_quantization() {
             if index.declares_int8() {
                 save_int8_scales(index, dir, &mut ledger)?;
-                save_int8_rows(index, dir, &mut ledger)?;
             } else {
                 save_pq_centroids(index, dir, &mut ledger)?;
-                save_pq_codes(index, dir, &mut ledger)?;
             }
         }
     }
 
-    // Save vectors based on storage mode
+    // The raw vectors a product quantized graph keeps beside its codes.
     save_vectors(index, dir, &mut ledger)?;
 
     // The sparse space, where one is declared, under `spaces/<name>/`.
@@ -2282,6 +2763,10 @@ fn save_spaces(index: &Collection, dir: &dyn Dir, ledger: &mut SaveLedger) -> Re
     {
         let dense = index.dense_index();
         let internal = dense.ids_by_position();
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "an internal id, below MAX_INTERNAL_ID, held at admit and at load"
+        )]
         let id_of = |at: usize| internal.get(at).map_or(Position::NONE, |id| id as u32);
         space
             .index
@@ -2310,10 +2795,11 @@ fn save_spaces(index: &Collection, dir: &dyn Dir, ledger: &mut SaveLedger) -> Re
 fn reconstruct_index_simple(
     dir: &dyn Dir,
     manifest: &IndexManifest,
+    major: u32,
     config: IndexConfig,
     ids: MappedIds,
     layout: Layout,
-    metadata: HashMap<String, HashMap<String, Value>>,
+    metadata: MetadataStore,
     mut vectors: RawVectors,
     quantization: Option<QuantizationArtefacts>,
     sparse: Option<SparseDeclaration>,
@@ -2336,8 +2822,9 @@ fn reconstruct_index_simple(
 
     // The codes are needed twice, once to rebuild the graph for records that
     // have no raw vector and once to restore the stored codes afterwards.
+    // At 5.x they come from the graph once it is back, below.
     let mut quantization = quantization;
-    let pq_codes = quantization
+    let mut pq_codes = quantization
         .as_ref()
         .map(|q| q.codes.clone())
         .unwrap_or_default();
@@ -2358,7 +2845,7 @@ fn reconstruct_index_simple(
     // still to be read name records by it.
     let MappedIds {
         store,
-        internal: mut positions,
+        internal: positions,
     } = ids;
     restore_data_fields(&mut index, store, &config, quantization)?;
 
@@ -2366,30 +2853,77 @@ fn reconstruct_index_simple(
     // graph, for the reasons `restore_spaces` gives.
     restore_spaces(&index, dir, manifest, config.id_counter, &positions)?;
 
-    // The rows of a trained scalar directory, held to the mappings both
-    // ways before anything is built from either: every row names a record
-    // the mappings hold, and every record the mappings hold has a row. A
-    // directory whose rows and mappings disagree describes two indexes.
-    if int8_trained {
+    // The rows of a trained scalar directory below 5.x, held to the mappings
+    // both ways before anything is built from either: every row names a
+    // record the mappings hold, and every record the mappings hold has a
+    // row. A directory whose rows and mappings disagree describes two
+    // indexes. At 5.x the rows are in the graph dump, whose identity region
+    // is held to the mappings.
+    if int8_trained && major < DUMP_V2_FORMAT_MAJOR {
         check_int8_rows_against_mappings(&index, &int8_rows, &positions)?;
     }
 
     // Step 3: Restore the graph the save wrote. Every save dumps the graph, so
-    // the ordinary path is a read. A dump that is absent, damaged, or written
-    // by a release this build cannot interpret falls back to the rebuild, which
-    // is the path that also upgrades a graph carrying a defect the vendored
-    // patches have since fixed. See `restore_graph_from_dump`.
-    let graph_rebuilt = match index.restore_graph_from_dump(
+    // the ordinary path is a read. At 5.x the dump holds the only copy of each
+    // record's row: a dump refused on its header, its identity or its rows
+    // refuses the load, and one whose topology fails gives its rows back to
+    // rebuild from. Below 5.x a dump that is absent, damaged, or written by a
+    // release this build cannot interpret falls back to the rebuild from the
+    // separate stores, which is the path that also upgrades a graph carrying
+    // a defect the vendored patches have since fixed. See
+    // `restore_graph_from_dump`.
+    //
+    // Each arm also says where the records came from, which the count check
+    // of step 6 names if the count is not the one config.json records.
+    let version = if major >= DUMP_V2_FORMAT_MAJOR { 2 } else { 1 };
+    let (graph_rebuilt, source) = match index.restore_graph_from_dump(
         dir,
         config.id_counter,
         dump_bytes,
         &positions,
-    ) {
-        Ok(nodes) => {
+        version,
+    )? {
+        DumpOutcome::Read(nodes) => {
             debug!(target: LOG_TARGET, "HNSW graph restored from the saved dump ({} nodes)", nodes);
-            false
+            // Below 5.x the codes come from pq_codes.bin and not from the
+            // dump, and the count of step 6 reads them too.
+            let source = if major < DUMP_V2_FORMAT_MAJOR && !pq_codes.is_empty() {
+                format!(
+                    "The graph came from the graph dump, and the records were counted from it \
+                     and from the {} codes pq_codes.bin holds.",
+                    pq_codes.len()
+                )
+            } else {
+                "Every record came from the graph dump.".to_string()
+            };
+            (false, source)
         }
-        Err(reason) => {
+        DumpOutcome::Rows {
+            rows,
+            reason,
+            asked,
+        } => {
+            if asked {
+                debug!(target: LOG_TARGET, "Rebuilding the HNSW graph from the dump's rows, because {}", reason);
+            } else {
+                warn!(target: LOG_TARGET, operation = "load_graph_rebuilt",
+                    directory = %dir.locate(""),
+                    dump = GRAPH_DUMP_FILENAME,
+                    reason = reason.as_str(),
+                    "The graph dump's topology could not be used, so the graph was rebuilt from \
+                     the rows the dump holds, each region of which was verified; every record \
+                     and every internal id is the saved one, and the graph's topology is not"
+                );
+            }
+            let inserted = rebuild_graph_from_rows(&mut index, rows, &positions)?;
+            debug!(target: LOG_TARGET, "Graph rebuilt from the dump's rows ({} records inserted)", inserted);
+            let source = format!(
+                "The graph was rebuilt from the {} rows the graph dump holds, because {}.",
+                inserted, reason
+            );
+            (true, source)
+        }
+        DumpOutcome::Rebuild(reason) => {
             debug!(target: LOG_TARGET, "Rebuilding the HNSW graph, because {}", reason);
             // Both rebuilds below replay the raw vectors, so a directory
             // whose vectors were counted and not kept reads them now.
@@ -2403,20 +2937,48 @@ fn reconstruct_index_simple(
             }
             let empty = HashMap::new();
             let held = vectors.held().unwrap_or(&empty);
+            // The stores the rebuild below reads, each with what it holds.
+            let mut stores: Vec<String> = Vec::new();
             if int8_trained {
                 debug!(target: LOG_TARGET, "Rebuilding scalar quantized HNSW graph from the stored rows...");
-                let inserted = index
-                    .rebuild_graph_from_int8_rows(&int8_rows, &positions)
-                    .map_err(Error::Engine)?;
+                let inserted = index.rebuild_graph_from_int8_rows(&int8_rows, &positions)?;
                 debug!(target: LOG_TARGET, "Scalar quantized graph rebuilt ({} rows inserted)", inserted);
-            } else if index.can_use_quantization() {
-                debug!(target: LOG_TARGET, "Rebuilding quantized HNSW graph from stored PQ codes...");
-                rebuild_graph_from_codes(&mut index, &pq_codes, held, &mut positions)?;
+                if int8_rows.len() > 0 {
+                    stores.push(format!(
+                        "the {} rows {} holds",
+                        int8_rows.len(),
+                        INT8_ROWS_FILENAME
+                    ));
+                }
             } else {
-                debug!(target: LOG_TARGET, "Rebuilding HNSW graph from vectors...");
-                rebuild_graph_from_data(&mut index, held, &pq_codes, &mut positions)?;
+                if index.can_use_quantization() {
+                    debug!(target: LOG_TARGET, "Rebuilding quantized HNSW graph from stored PQ codes...");
+                    rebuild_graph_from_codes(&mut index, &pq_codes, held, &positions)?;
+                } else {
+                    debug!(target: LOG_TARGET, "Rebuilding HNSW graph from vectors...");
+                    rebuild_graph_from_data(&mut index, held, &pq_codes, &positions)?;
+                }
+                if !pq_codes.is_empty() {
+                    stores.push(format!("the {} codes pq_codes.bin holds", pq_codes.len()));
+                }
+                if !held.is_empty() {
+                    stores.push(format!("the {} vectors vectors.bin holds", held.len()));
+                }
             }
-            true
+            let source = if stores.is_empty() {
+                format!(
+                    "The graph dump was not read, because {}, and the directory holds no vector, \
+                     code or row to rebuild the graph from.",
+                    reason
+                )
+            } else {
+                format!(
+                    "The graph dump was not read, because {}, and the graph was rebuilt from {}.",
+                    reason,
+                    stores.join(" and ")
+                )
+            };
+            (true, source)
         }
     };
     // An empty directory holds no dump to read, since a save of an empty
@@ -2424,12 +2986,17 @@ fn reconstruct_index_simple(
     // ordinary path rather than a graph that could not be read.
     let graph_rebuilt = graph_rebuilt && index.vector_count() > 0;
 
+    // At 5.x the codes map of a product quantized graph is every live
+    // record's codes, read off the graph's own store, which the dump's rows
+    // filled. It holds nothing for any other graph.
+    if major >= DUMP_V2_FORMAT_MAJOR {
+        pq_codes = index.codes_from_graph();
+    }
+
     // Step 4: The stored record data, exactly as it was written, once the
     // graph is back. Neither rebuild touches the storage maps, and the
-    // columns are built over the id store, which either rebuild may have added
-    // an id to for a record the mappings did not name.
-    let raw_count = vectors.len();
-    let code_count = pq_codes.len();
+    // columns are built over the id store, which holds the records the
+    // mappings name and no other.
 
     // A trained quantized_only index holds no raw vectors, but a directory
     // written before that was true carries its training records in
@@ -2496,7 +3063,7 @@ fn reconstruct_index_simple(
     }
 
     // Step 6: Check the saved count against the index that was actually built
-    check_restored_count(&mut index, &config, raw_count, code_count)?;
+    check_restored_count(&mut index, &config, source)?;
 
     // Every structure is now at the positions the mappings gave, and the
     // internal ids by position are let go.
@@ -2510,14 +3077,6 @@ fn reconstruct_index_simple(
     Ok((index, graph_rebuilt))
 }
 
-/// Reconcile the stored vector count with the records that were restored
-///
-/// `vector_count` is written to config.json and was previously restored
-/// verbatim, so it could report records the directory no longer contains. The
-/// count is derived here from the restored data and asserted against the saved
-/// value. They agree for every directory whose files are intact, so a
-/// disagreement means a file is missing or truncated and the load fails rather
-/// than producing an index that misreports what it holds.
 /// Hold the rows artefact to the mappings in both directions.
 fn check_int8_rows_against_mappings(
     index: &Collection,
@@ -2559,11 +3118,19 @@ fn check_int8_rows_against_mappings(
     Ok(())
 }
 
+/// Reconcile the stored vector count with the records that were restored
+///
+/// `vector_count` is written to config.json, and a load holds it to the
+/// records it restored, so the index never reports a record the directory
+/// does not hold. The count is derived here from the restored data and
+/// asserted against the saved value. They agree for every directory whose
+/// files are intact, so where they disagree the load fails, naming in
+/// `source` where the records it counted came from, rather than producing
+/// an index that misreports what it holds.
 fn check_restored_count(
     index: &mut Collection,
     config: &IndexConfig,
-    raw_count: usize,
-    code_count: usize,
+    source: String,
 ) -> Result<(), Error> {
     let restored = index.count_stored_records();
 
@@ -2571,8 +3138,7 @@ fn check_restored_count(
         return Err(Error::RestoredCountMismatch {
             restored,
             expected: config.vector_count,
-            raw_count,
-            code_count,
+            source,
         });
     }
 
@@ -2669,8 +3235,14 @@ fn install_centroids(pq: &PQ, centroids: Centroids) -> Result<(), Error> {
     // Going through set_centroids rather than writing the field rebuilds the
     // symmetric distance table from the codebook that has just been read, so a
     // loaded index can build a graph on real distances exactly as a freshly
-    // trained one does.
-    pq.set_centroids(centroids).map_err(Error::Engine)
+    // trained one does. The shape is held above, so its one refusal left is a
+    // squared norm or a squared distance between two centroids that is not
+    // finite, which names the place in pq_centroids.bin.
+    pq.set_centroids(centroids)
+        .map_err(|error| Error::DecodeFailed {
+            file: "pq_centroids.bin".to_string(),
+            error,
+        })
 }
 
 /// Restore quantization state (simplified for reconstruction)
@@ -2789,6 +3361,80 @@ fn restore_int8_state(
     Ok(())
 }
 
+/// Rebuild the graph from the rows a version 2 dump holds, each region of it
+/// verified, where its topology could not be used or the rebuild was asked
+/// for
+///
+/// Every live record's row is re-inserted in increasing internal id, filed
+/// at the position the mappings give its origin id, which is the order every
+/// other rebuild takes, and a stranded node's row is dropped. A raw graph
+/// rebuilds from the vectors through the path a raw rebuild always took, a
+/// product quantized one from the codes and a scalar one from the rows,
+/// under the quantizer or the codec the loader installed. The raw vectors a
+/// `quantized_with_raw` graph keeps go beside the codes afterwards, as on
+/// every load.
+fn rebuild_graph_from_rows(
+    index: &mut Collection,
+    rows: DumpRows,
+    positions: &[u32],
+) -> Result<usize, Error> {
+    let DumpRows {
+        positions: record_of,
+        width,
+        values,
+        ..
+    } = rows;
+    // Each live node, by the position its record holds, in increasing
+    // position, which is increasing internal id.
+    let mut live: Vec<(usize, usize)> = record_of
+        .iter()
+        .enumerate()
+        .filter(|&(_, &at)| at != Position::NONE)
+        .map(|(node, &at)| (at as usize, node))
+        .collect();
+    live.sort_unstable();
+    let row = |node: usize| node * width..(node + 1) * width;
+    let named = |at: usize, store: &IdStore| -> Result<String, Error> {
+        store.name(at).map(str::to_string).ok_or_else(|| {
+            Error::Engine(format!(
+                "the dump files a node at position {}, which mappings.bin does not hold",
+                at
+            ))
+        })
+    };
+    match values {
+        RowValues::Raw(values) => {
+            let records = {
+                let ids = index.ids();
+                live.iter()
+                    .map(|&(at, node)| Ok((named(at, &ids)?, values[row(node)].to_vec())))
+                    .collect::<Result<Vec<_>, Error>>()?
+            };
+            index.rebuild_from_records(records, positions)
+        }
+        RowValues::Codes(values) => {
+            let codes = {
+                let ids = index.ids();
+                let mut codes = HashMap::with_capacity(live.len());
+                for &(at, node) in &live {
+                    codes.insert(named(at, &ids)?, values[row(node)].to_vec());
+                }
+                codes
+            };
+            let (inserted, _) =
+                index.rebuild_graph_from_codes(&codes, &HashMap::new(), positions)?;
+            Ok(inserted)
+        }
+        RowValues::Int8(values) => {
+            let mut held = Int8Rows::with_capacity(live.len(), width);
+            for &(at, node) in &live {
+                held.push_row(positions[at], &values[row(node)]);
+            }
+            index.rebuild_graph_from_int8_rows(&held, positions)
+        }
+    }
+}
+
 /// Rebuild the graph for a trained quantized index from its stored codes
 ///
 /// The saved graph was a PQ graph over the codes, so the rebuild inserts those
@@ -2802,22 +3448,15 @@ fn rebuild_graph_from_codes(
     index: &mut Collection,
     pq_codes: &HashMap<String, Vec<u8>>,
     vectors: &HashMap<String, Vec<f32>>,
-    positions: &mut Vec<u32>,
+    positions: &[u32],
 ) -> Result<(), Error> {
-    let (inserted, quantized_from_raw, remapped) = index
-        .rebuild_graph_from_codes(pq_codes, vectors, positions)
-        .map_err(Error::Engine)?;
+    let (inserted, quantized_from_raw) =
+        index.rebuild_graph_from_codes(pq_codes, vectors, positions)?;
 
     if quantized_from_raw > 0 {
         debug!(target: LOG_TARGET, "{} records had a raw vector and no stored PQ codes and were quantized \
              through the loaded codebook",
             quantized_from_raw
-        );
-    }
-    if remapped > 0 {
-        debug!(target: LOG_TARGET, "{} records were missing from mappings.bin and were assigned fresh \
-             internal ids",
-            remapped
         );
     }
     debug!(target: LOG_TARGET, "Quantized graph rebuilt ({} records inserted from stored PQ codes)",
@@ -2832,19 +3471,25 @@ fn rebuild_graph_from_codes(
 /// This is the path for an index that is not trained, meaning one saved with no
 /// quantization at all or one saved while still collecting training vectors.
 /// A record that has a raw vector is replayed from it. A record that has only
-/// PQ codes is reconstructed through the codebook, which is what `get_records`
-/// already does for the same record while the index is live, so the graph is
-/// built at the fidelity the storage mode already delivers rather than losing
-/// the record. The codes themselves are restored as stored and are never
-/// recomputed from a reconstruction. The metadata is not carried here; step 4
-/// of the reconstruction writes it back from the file under the same ids.
+/// PQ codes is refused, since no trained codebook can decode them here, which
+/// the read of pq_codes.bin refuses first. The metadata is not carried here;
+/// step 4 of the reconstruction writes it back from the file under the same
+/// ids.
 fn rebuild_graph_from_data(
     index: &mut Collection,
     vectors: &HashMap<String, Vec<f32>>,
     pq_codes: &HashMap<String, Vec<u8>>,
-    positions: &mut Vec<u32>,
+    positions: &[u32],
 ) -> Result<(), Error> {
-    if vectors.is_empty() && pq_codes.is_empty() {
+    let code_only = pq_codes
+        .keys()
+        .filter(|id| !vectors.contains_key(*id))
+        .count();
+    if code_only > 0 {
+        return Err(Error::CodesWithoutCodebook { count: code_only });
+    }
+
+    if vectors.is_empty() {
         debug!(target: LOG_TARGET, "No records to rebuild (empty index)");
         // The collection keeps the graph it was built with, which reserves
         // nothing until it is given the declared reservation here.
@@ -2852,43 +3497,14 @@ fn rebuild_graph_from_data(
         return Ok(());
     }
 
-    let mut records: Vec<(String, Vec<f32>)> = Vec::with_capacity(vectors.len() + pq_codes.len());
-    let mut reconstructed = 0usize;
-
     // Every record with a raw vector, replayed from it
-    for (ext_id, vector) in vectors.iter() {
-        records.push((ext_id.clone(), vector.clone()));
-    }
-
-    // Every record that has codes and no raw vector, reconstructed
-    let code_only: Vec<&String> = pq_codes
-        .keys()
-        .filter(|id| !vectors.contains_key(*id))
+    let records: Vec<(String, Vec<f32>)> = vectors
+        .iter()
+        .map(|(ext_id, vector)| (ext_id.clone(), vector.clone()))
         .collect();
 
-    if !code_only.is_empty() {
-        let pq = index.pq().cloned().ok_or(Error::CodesWithoutCodebook {
-            count: code_only.len(),
-        })?;
-
-        for ext_id in code_only {
-            let codes = &pq_codes[ext_id];
-            let vector = pq
-                .reconstruct(codes)
-                .map_err(|e| Error::ReconstructFailed {
-                    id: ext_id.clone(),
-                    codes: codes.len(),
-                    error: e,
-                })?;
-            records.push((ext_id.clone(), vector));
-            reconstructed += 1;
-        }
-    }
-
-    debug!(target: LOG_TARGET, "Prepared {} records for the graph rebuild ({} replayed from raw vectors, {} reconstructed from PQ codes)",
-        records.len(),
-        records.len() - reconstructed,
-        reconstructed
+    debug!(target: LOG_TARGET, "Prepared {} records for the graph rebuild, each replayed from its raw vector",
+        records.len()
     );
     debug!(target: LOG_TARGET, "Rebuilding the graph from the restored records...");
 
@@ -2924,19 +3540,122 @@ pub(crate) fn load_index(
     load_from(&storage, path, tokenizer, policy)
 }
 
+/// The lock a load holds, and why the load may not write, where it may not.
+struct LoadLock {
+    guard: Option<Box<dyn LockGuard>>,
+    read_only: Option<String>,
+}
+
+impl LoadLock {
+    /// Take the directory's lock in `mode`. A holder that excludes it
+    /// refuses the load. A lock file the medium will not open for writing
+    /// gives a shared lock, or none where the file does not exist, and a
+    /// load that may not write. A filesystem that cannot lock gives no lock
+    /// and the same, since a read corrupts nothing and a journal could not
+    /// be kept safe there. A lock file that will not open for any other
+    /// reason refuses the load.
+    fn take(storage: &dyn Storage, mode: LockMode, path: &str) -> Result<Self, Error> {
+        match storage.lock(mode, &crate::journal::holder_record(mode)) {
+            Ok(Locked::Writable(guard)) => Ok(LoadLock {
+                guard: Some(guard),
+                read_only: None,
+            }),
+            Ok(Locked::ReadOnly { guard, reason }) => Ok(LoadLock {
+                guard,
+                read_only: Some(reason.to_string()),
+            }),
+            Err(LockFailure::Held { holder }) => Err(Error::CollectionLocked {
+                path: path.to_string(),
+                holder,
+            }),
+            Err(LockFailure::Failed(error)) => Err(Error::LockUnavailable {
+                path: storage.lock_path().display().to_string(),
+                error: error.to_string(),
+            }),
+            Err(LockFailure::Unavailable(error)) => {
+                let lock = storage.lock_path().display().to_string();
+                warn!(target: LOG_TARGET, operation = "load_unlocked",
+                    directory = path,
+                    lock = lock.as_str(),
+                    error = %error,
+                    "The lock file cannot be locked, so the load goes on without the lock and \
+                     opens a journaled directory read only"
+                );
+                Ok(LoadLock {
+                    guard: None,
+                    read_only: Some(format!(
+                        "its lock file {} cannot be locked ({})",
+                        lock, error
+                    )),
+                })
+            }
+        }
+    }
+}
+
 /// The load, from the storage the directory `path` names. `path` is the
-/// caller's own words for it, which the refusals and the log quote.
-fn load_from(
+/// caller's own words for it, which the refusals and the log quote. The
+/// tests reach it with a storage of their own, whose medium refuses writes
+/// or whose journal fails on purpose.
+///
+/// The lock comes first, shared, so no save in another process is between
+/// its two renames while this one reads. A load that will replay a journal,
+/// to repair it or not, holds the lock exclusive and its sink keeps it, so
+/// it reads the manifest under the shared lock, lets that go and takes the
+/// exclusive lock before it reads anything else, and the load proper reads
+/// the manifest again.
+pub(crate) fn load_from(
     storage: &dyn Storage,
     path: &str,
     tokenizer: Option<Arc<dyn Tokenizer>>,
     policy: JournalPolicy,
 ) -> Result<(Collection, Recovery), Error> {
+    // Nothing to open, refused before the lock file is created beside a
+    // directory that is not there.
+    if !storage.exists() && !storage.aside_exists() {
+        return Err(Error::IndexDirectoryNotFound {
+            path: path.to_string(),
+        });
+    }
+    let mut lock = LoadLock::take(storage, LockMode::Shared, path)?;
+    let mut restored_from_aside = false;
+    if matches!(policy, JournalPolicy::Replay(_) | JournalPolicy::Repair(_))
+        && lock.read_only.is_none()
+    {
+        restored_from_aside = storage.recover()?;
+        // A directory holding a feature this build does not know, marked
+        // read_only, is read under the shared lock, since its load writes
+        // nothing.
+        if storage.exists() {
+            let manifest = load_manifest(storage.dir())?;
+            let read_only = manifest
+                .features
+                .as_ref()
+                .is_some_and(features::lists_read_only);
+            if manifest.journal.is_some() && !read_only {
+                drop(lock);
+                lock = LoadLock::take(storage, LockMode::Exclusive, path)?;
+            }
+        }
+    }
+    load_locked(storage, path, tokenizer, policy, lock, restored_from_aside)
+}
+
+/// The load under `lock`. `restored_before` says whether the look at the
+/// manifest before it put a directory back from `<name>.zdbold`.
+fn load_locked(
+    storage: &dyn Storage,
+    path: &str,
+    tokenizer: Option<Arc<dyn Tokenizer>>,
+    policy: JournalPolicy,
+    lock: LoadLock,
+    restored_before: bool,
+) -> Result<(Collection, Recovery), Error> {
     // A save killed between its two renames left the whole index beside the
     // target and nothing at it. Recovery from a killed process is a load, so
     // it is put back here, before the directory is looked for. See
     // `Storage::recover`.
-    let restored_from_aside = storage.recover()?;
+    let restored_from_aside = storage.recover()? || restored_before;
 
     // Validate directory exists
     if !storage.exists() {
@@ -2945,6 +3664,203 @@ fn load_from(
         });
     }
 
+    // The load's own time, taken once, so a repair that reads the checkpoint
+    // again takes the same value wherever the load takes it.
+    let loaded_at = zeusdb_vector_core::Timestamp::now().to_rfc3339();
+    let Checkpoint {
+        index: mut restored_index,
+        manifest,
+        major,
+        identity,
+        graph_rebuilt,
+        read_only_features,
+        replaced,
+    } = read_checkpoint(storage, tokenizer.clone(), &loaded_at)?;
+
+    // Phase 3: The journal beside the directory, where the manifest names
+    // one. Nothing below runs for a directory saved without one, so such a
+    // directory loads exactly as it did.
+    let format_version = manifest.format_version.clone();
+    // What the load says it did, from the checkpoint, before any journal.
+    let checkpoint_recovery = || {
+        let mut recovery =
+            Recovery::unjournaled(format_version.clone(), restored_from_aside, graph_rebuilt);
+        recovery
+            .notes
+            .extend(replaced.iter().cloned().map(Note::Replaced));
+        recovery
+    };
+    let identity_sequence = manifest
+        .identity
+        .as_ref()
+        .and_then(|record| record.sequence)
+        .filter(|_| major >= SEGMENTED_FORMAT_MAJOR);
+    let raw_file = raw_vectors_file(&restored_index, graph_rebuilt);
+    // The first value past what the bound on a vector's norm or on a sparse
+    // value allows, for a load that replays no journal. See
+    // `Collection::first_past_bound`.
+    let past_bound = |index: &Collection| {
+        index.first_past_bound(&BoundSources {
+            raw: raw_file,
+            journal: None,
+            counter: 0,
+            fitted: true,
+        })
+    };
+    let Some(record) = manifest.journal else {
+        // The journal sequence the directory's state holds, which a save of
+        // it records again.
+        if let Some(sequence) = identity_sequence {
+            restored_index.set_journal_sequence(sequence);
+        }
+        if major >= SEGMENTED_FORMAT_MAJOR
+            && (storage.journal_exists() || storage.legacy_journal_exists())
+        {
+            warn!(target: LOG_TARGET, operation = "load_journal_left",
+                directory = path,
+                "A journal sits beside a directory whose manifest names none; it was left where \
+                 it is and not read"
+            );
+        }
+        let recovery = checkpoint_recovery();
+        if !read_only_features.is_empty() {
+            let reached = identity_sequence.unwrap_or(0);
+            let cause = ReadOnlyCause::Features(read_only_features);
+            return Ok(read_only(restored_index, path, cause, reached, recovery));
+        }
+        if let Some(past) = past_bound(&restored_index) {
+            let reached = identity_sequence.unwrap_or(0);
+            let cause = ReadOnlyCause::Bound(past);
+            return Ok(read_only(restored_index, path, cause, reached, recovery));
+        }
+        recovery.report(path);
+        return Ok((restored_index, recovery));
+    };
+
+    let Some(journal_id) = crate::journal::id_from_hex(&record.collection_id) else {
+        return Err(Error::JournalManifestInvalid {
+            detail: format!(
+                "its collection_id is '{}', which is not 32 hexadecimal digits",
+                record.collection_id
+            ),
+        });
+    };
+    // The collection the journal must belong to is the identity's where the
+    // manifest records one, and the journal record's where only that does.
+    let directory_id = match identity {
+        Some(identity) => identity.collection_id,
+        None => {
+            restored_index.set_collection_id(journal_id);
+            journal_id
+        }
+    };
+    // No save writes the identity and the journal record apart, so a 5.x
+    // manifest whose two name two sequences was assembled by hand.
+    if major >= SEGMENTED_FORMAT_MAJOR && identity_sequence != Some(record.sequence) {
+        return Err(Error::JournalManifestInvalid {
+            detail: format!(
+                "its sequence is {} and the directory's identity records {}",
+                record.sequence,
+                identity_sequence.map_or_else(|| "none".to_string(), |s| s.to_string())
+            ),
+        });
+    }
+    restored_index.set_journal_sequence(record.sequence);
+
+    let (durability, repairing) = match policy {
+        JournalPolicy::CheckpointOnly => {
+            warn!(target: LOG_TARGET, operation = "load_checkpoint_only",
+                directory = path,
+                journal = %record.file,
+                sequence = record.sequence,
+                "Opened the checkpoint alone; every mutation after the sequence it holds is in \
+                 the journal beside it and was not applied"
+            );
+            let mut recovery = checkpoint_recovery();
+            recovery.checkpoint_sequence = record.sequence;
+            if !read_only_features.is_empty() {
+                let cause = ReadOnlyCause::Features(read_only_features);
+                return Ok(read_only(
+                    restored_index,
+                    path,
+                    cause,
+                    record.sequence,
+                    recovery,
+                ));
+            }
+            if let Some(past) = past_bound(&restored_index) {
+                let cause = ReadOnlyCause::Bound(past);
+                return Ok(read_only(
+                    restored_index,
+                    path,
+                    cause,
+                    record.sequence,
+                    recovery,
+                ));
+            }
+            recovery.report(path);
+            return Ok((restored_index, recovery));
+        }
+        JournalPolicy::Replay(durability) => (durability, false),
+        JournalPolicy::Repair(durability) => (durability, true),
+    };
+
+    let mut recovery = checkpoint_recovery();
+    recovery.journaled = true;
+    recovery.checkpoint_sequence = record.sequence;
+    let opened = Opened {
+        storage,
+        path,
+        tokenizer,
+        record: &record,
+        journal_id,
+        directory_id,
+        snapshot: identity.and_then(|identity| identity.snapshot),
+        durability,
+        repairing,
+        lock,
+        read_only_features,
+        loaded_at: &loaded_at,
+        raw_file,
+        counter: restored_index.id_counter(),
+        fitted: restored_index.can_use_quantization(),
+    };
+    if major >= SEGMENTED_FORMAT_MAJOR {
+        let identity = identity.expect("a 5.x manifest was held to record an identity");
+        opened.replay_segments(restored_index, &identity, recovery)
+    } else {
+        opened.replay_legacy(restored_index, recovery)
+    }
+}
+
+/// The checkpoint a directory holds, read and built into a collection,
+/// before any journal is read.
+struct Checkpoint {
+    index: Collection,
+    manifest: IndexManifest,
+    major: u32,
+    identity: Option<crate::Identity>,
+    graph_rebuilt: bool,
+    /// The features the directory holds that this build does not know and
+    /// its manifest marks `read_only`, in name order, which make the load
+    /// read only.
+    read_only_features: Vec<String>,
+    /// The values the directory records that a load of 5.0.0 refuses, each
+    /// with the value the load took in its place.
+    replaced: Vec<Replaced>,
+}
+
+/// Phases 1 and 2 of a load: every artefact of the directory `storage`
+/// keeps read and held to its manifest, and the collection built from them
+/// at the identity the manifest records. A repair reads the checkpoint again
+/// where a record it replayed would not apply, so the call that record began
+/// is applied whole or not at all. `loaded_at` is the load's own time, which
+/// [`restored_created_at`] takes where the manifest holds no other.
+fn read_checkpoint(
+    storage: &dyn Storage,
+    tokenizer: Option<Arc<dyn Tokenizer>>,
+    loaded_at: &str,
+) -> Result<Checkpoint, Error> {
     // Phase 1: Load all ZeusDB components
     debug!(target: LOG_TARGET, "Phase 1: Loading ZeusDB components...");
 
@@ -2954,9 +3870,37 @@ fn load_from(
 
     // The features the directory lists, before any artefact is read, so a
     // directory holding one this build does not know is refused by its name
-    // rather than read without it. See `features`.
-    if let Some(record) = manifest.features.as_ref() {
-        features::read(record)?;
+    // rather than read without it, or read only where its manifest marks it
+    // so. See `features`. Every 5.x manifest lists them, possibly none, so
+    // one listing nothing at all was not written by a save.
+    let reading = match manifest.features.as_ref() {
+        Some(record) => features::read(record, &features::THIS_BUILD)?,
+        None if major >= SEGMENTED_FORMAT_MAJOR => return Err(features::missing()),
+        None => features::Reading::default(),
+    };
+
+    // Every 5.x manifest records its identity with the journal sequence its
+    // state holds. Below 5.x the sequence is not read, as no release reading
+    // those formats reads it.
+    match manifest.identity.as_ref() {
+        None if major >= SEGMENTED_FORMAT_MAJOR => {
+            return Err(Error::IdentityInvalid {
+                detail: format!(
+                    "the manifest records none, and every manifest at format {}.x records one",
+                    SEGMENTED_FORMAT_MAJOR
+                ),
+            })
+        }
+        Some(record) if major >= SEGMENTED_FORMAT_MAJOR && record.sequence.is_none() => {
+            return Err(Error::IdentityInvalid {
+                detail: format!(
+                    "it records no sequence, and every identity at format {}.x records the \
+                     journal sequence its state holds",
+                    SEGMENTED_FORMAT_MAJOR
+                ),
+            })
+        }
+        _ => {}
     }
 
     // A manifest below the major that names a journal is a directory
@@ -2976,15 +3920,29 @@ fn load_from(
         .map(IdentityManifest::read)
         .transpose()?;
 
+    // Every field of a 5.x manifest a save writes from the directory, held to
+    // it before any artefact is read.
+    if major >= DUMP_V2_FORMAT_MAJOR {
+        check_manifest_fields(dir, &manifest)?;
+    }
+
     // Before any artefact is read, so a directory missing two files names the
     // first rather than failing on whichever one a partial load reaches.
-    check_files_present(dir, &manifest)?;
+    check_files_present(dir, &manifest, major)?;
     debug!(target: LOG_TARGET, "Manifest loaded: {} vectors, format v{}",
         manifest.total_vectors, manifest.format_version
     );
 
-    let config = load_config(dir, &manifest)?;
+    let config = load_config(dir, &manifest, major)?;
     debug!(target: LOG_TARGET, "Config loaded: dim={}, space={}", config.dim, config.space);
+    if major >= DUMP_V2_FORMAT_MAJOR && manifest.total_vectors != config.vector_count {
+        return Err(Error::ManifestFieldInvalid {
+            detail: format!(
+                "records total_vectors as {}, and config.json records vector_count {}",
+                manifest.total_vectors, config.vector_count
+            ),
+        });
+    }
 
     // A 1.x directory declares no space, since no release writing 1.x held
     // one, and a 1.x manifest over a config that declares one is a
@@ -3009,7 +3967,7 @@ fn load_from(
     let (ids, layout) = load_ids(dir, &manifest, major, &config)?;
     debug!(target: LOG_TARGET, "Mappings loaded: {} ID mappings", ids.len());
 
-    let metadata = load_metadata(dir, &manifest)?;
+    let metadata = load_metadata(dir, &manifest, major, ids.view(), config.expected_size)?;
     debug!(target: LOG_TARGET, "Metadata loaded: {} records", metadata.len());
 
     // A raw index takes its vectors back from the graph dump, so its
@@ -3070,10 +4028,27 @@ fn load_from(
         }
     }
 
-    // At 4.x the features a manifest lists are the ones the directory holds,
-    // held now that every part they name has been read and before anything
-    // is built from them. Below 4.x no release listed features, and the
-    // version decides what a directory holds.
+    // Below 4.0.0 vectors.bin was held to the mappings and to its width as it
+    // was read. Where the directory keeps every record's raw vector, it holds
+    // one for every record the mappings hold as well, as a framed vectors.bin
+    // is held to at 4.0.0. A trained `quantized_only` index keeps no raw
+    // vector but the training records' some releases left there, so its file
+    // is not held to the mappings that way.
+    if matches!(layout, Layout::Bincode)
+        && manifest_names(&manifest, "vectors.bin")
+        && keeps_every_raw(quantization.as_ref())
+    {
+        refuse_missing_vectors(dir, &manifest, ids.view(), &vectors)?;
+    }
+
+    if major >= DUMP_V2_FORMAT_MAJOR {
+        check_quantization_fields(&manifest, quantization.as_ref())?;
+    }
+
+    // From 4.x on the features a manifest lists are the ones the directory
+    // holds, held now that every part they name has been read and before
+    // anything is built from them. Below 4.x no release listed features, and
+    // the version decides what a directory holds.
     if let Some(record) = manifest
         .features
         .as_ref()
@@ -3081,7 +4056,8 @@ fn load_from(
     {
         let quantizer = quantization.as_ref().map(|quant| &quant.config);
         let held = features::Held {
-            identity: manifest.identity.is_some(),
+            // Listed at 4.x where recorded, and part of the base at 5.x.
+            identity: manifest.identity.is_some() && major < SEGMENTED_FORMAT_MAJOR,
             int8: matches!(quantizer, Some(QuantizationFile::Int8(_))),
             journal: manifest.journal.is_some(),
             pq: matches!(quantizer, Some(QuantizationFile::Pq(_))),
@@ -3099,6 +4075,7 @@ fn load_from(
     let (mut restored_index, graph_rebuilt) = reconstruct_index_simple(
         dir,
         &manifest,
+        major,
         config,
         ids,
         layout,
@@ -3113,140 +4090,1258 @@ fn load_from(
     // from. Until this ran, a save of a loaded index wrote that load time to
     // manifest.json as the creation, so a directory that had been through one
     // load and save claimed to have been created then.
-    restored_index.set_created_at(manifest.created_at);
+    let (created_at, replaced) = restored_created_at(&manifest, loaded_at);
+    restored_index.set_created_at(created_at);
 
     // The collection the directory names, at the generation and snapshot it
-    // records, so its next save is the next generation of the same
-    // collection. A directory recording none keeps the id drawn at
-    // assembly, or takes its journal record's below, and its lineage stays
-    // at a collection never saved.
+    // records, with the time and the sequence its manifest records, so its
+    // next save is the next generation of the same collection. A directory
+    // recording none keeps the id drawn at assembly, or takes its journal
+    // record's after this, and its lineage stays at a collection never saved.
     if let Some(identity) = identity {
         restored_index.set_collection_id(identity.collection_id);
-        restored_index.set_lineage(&identity);
+        let sequence = manifest
+            .identity
+            .as_ref()
+            .and_then(|record| record.sequence)
+            .filter(|_| major >= SEGMENTED_FORMAT_MAJOR)
+            .unwrap_or(0);
+        // A save records an RFC 3339 time and a 5.x manifest is held to one
+        // that `Timestamp::parse_rfc3339` reads, so a value below 5.x that it
+        // does not read is no save time.
+        restored_index.set_lineage(&IdentityRecord {
+            identity,
+            saved_at: Some(manifest.saved_at.clone())
+                .filter(|value| zeusdb_vector_core::Timestamp::parse_rfc3339(value).is_some()),
+            sequence,
+        });
     }
 
     debug!(target: LOG_TARGET, "Index reconstruction completed successfully!");
+    Ok(Checkpoint {
+        index: restored_index,
+        manifest,
+        major,
+        identity,
+        graph_rebuilt,
+        read_only_features: reading.read_only,
+        replaced: replaced.into_iter().collect(),
+    })
+}
 
-    // Phase 3: The journal beside the directory, where the manifest names
-    // one. Nothing below runs for a directory saved without one, so such a
-    // directory loads exactly as it did.
-    let Some(record) = manifest.journal else {
-        let recovery = Recovery::unjournaled(restored_from_aside, graph_rebuilt);
-        recovery.report(path);
-        return Ok((restored_index, recovery));
+/// The creation time a load restores from `manifest`, and what it replaced,
+/// where it replaced anything.
+///
+/// A save writes the creation time the collection holds, and a load of 5.x
+/// refuses a manifest whose `created_at` is not an RFC 3339 time, which
+/// [`check_manifest_fields`] has already held a 5.x manifest to. So a
+/// `created_at` below 5.x that is not one is replaced, by the manifest's
+/// `saved_at` where that is an RFC 3339 time and by `loaded_at` otherwise,
+/// and the save after the load writes a manifest its own load reads. An RFC
+/// 3339 time here is one `Timestamp::parse_rfc3339` reads, which reads
+/// U+2212 as an offset's minus and a second of 60 in any minute as well.
+fn restored_created_at(manifest: &IndexManifest, loaded_at: &str) -> (String, Option<Replaced>) {
+    let is_time = |value: &str| zeusdb_vector_core::Timestamp::parse_rfc3339(value).is_some();
+    if is_time(&manifest.created_at) {
+        return (manifest.created_at.clone(), None);
+    }
+    let (taken, source) = if is_time(&manifest.saved_at) {
+        (manifest.saved_at.clone(), "its saved_at".to_string())
+    } else {
+        (
+            loaded_at.to_string(),
+            format!(
+                "the time of this load, since its saved_at, '{}', is not one either",
+                manifest.saved_at
+            ),
+        )
     };
+    let detail = format!(
+        "manifest.json records created_at as '{}', which is not an RFC 3339 time and which a \
+         load of format 5.0.0 refuses, so the load took '{}', {}, in its place",
+        manifest.created_at, taken, source
+    );
+    let replaced = Replaced {
+        file: "manifest.json".to_string(),
+        field: "created_at".to_string(),
+        recorded: manifest.created_at.clone(),
+        taken: taken.clone(),
+        detail,
+    };
+    (taken, Some(replaced))
+}
 
-    let Some(journal_id) = crate::journal::id_from_hex(&record.collection_id) else {
-        return Err(Error::JournalManifestInvalid {
+/// Hold a 5.x manifest's fields to what a save writes, before any artefact
+/// is read
+///
+/// `zeusdb_version` is not empty, `created_at` and `saved_at` are RFC 3339
+/// times as `Timestamp::parse_rfc3339` reads them, `index_type` is `HNSW`,
+/// and `storage_mode` is one a save records.
+/// `has_quantization` says whether `files_included` names
+/// `quantization.json`. `files_included` and `file_digests` name the same
+/// files, none of them one no 5.0.0 save writes. `files_excluded` names
+/// nothing `files_included` names and nothing the directory holds. And
+/// `total_size_mb`, in whole bytes, is the lengths `file_digests` records,
+/// added.
+fn check_manifest_fields(dir: &dyn Dir, manifest: &IndexManifest) -> Result<(), Error> {
+    let invalid = |detail: String| Err(Error::ManifestFieldInvalid { detail });
+    if manifest.zeusdb_version.is_empty() {
+        return invalid(
+            "records zeusdb_version as an empty string, and a save records the release that \
+             wrote it"
+                .to_string(),
+        );
+    }
+    for (field, value) in [
+        ("created_at", &manifest.created_at),
+        ("saved_at", &manifest.saved_at),
+    ] {
+        if zeusdb_vector_core::Timestamp::parse_rfc3339(value).is_none() {
+            return invalid(format!(
+                "records {} as '{}', which is not an RFC 3339 time",
+                field, value
+            ));
+        }
+    }
+    if manifest.index_type != "HNSW" {
+        return invalid(format!(
+            "records index_type as '{}', and a save records HNSW",
+            manifest.index_type
+        ));
+    }
+    if !STORAGE_MODES.contains(&manifest.storage_mode.as_str()) {
+        return invalid(format!(
+            "records storage_mode as '{}', which is not one a save records",
+            manifest.storage_mode
+        ));
+    }
+    let names_quantization = manifest_names(manifest, "quantization.json");
+    if manifest.has_quantization != names_quantization {
+        return invalid(format!(
+            "records has_quantization as {}, and files_included {} quantization.json",
+            manifest.has_quantization,
+            if names_quantization {
+                "names"
+            } else {
+                "does not name"
+            }
+        ));
+    }
+    for name in &manifest.files_included {
+        if !manifest.file_digests.contains_key(name) {
+            return invalid(format!(
+                "names {} under files_included, and file_digests records no length for it",
+                name
+            ));
+        }
+        if name == "pq_codes.bin"
+            || name == INT8_ROWS_FILENAME
+            || LEGACY_DUMP_FILENAMES.contains(&name.as_str())
+        {
+            return invalid(format!(
+                "names {} under files_included, which no save at format 5.0.0 writes",
+                name
+            ));
+        }
+    }
+    let mut recorded: Vec<&String> = manifest.file_digests.keys().collect();
+    recorded.sort_unstable();
+    if let Some(name) = recorded.iter().find(|name| !manifest_names(manifest, name)) {
+        return invalid(format!(
+            "records a length for {} under file_digests, and files_included does not name it",
+            name
+        ));
+    }
+    for name in &manifest.files_excluded {
+        if manifest_names(manifest, name) {
+            return invalid(format!(
+                "names {} under both files_included and files_excluded",
+                name
+            ));
+        }
+        if dir.exists(name) {
+            return invalid(format!(
+                "names {} under files_excluded, and the directory holds it",
+                name
+            ));
+        }
+    }
+    // A length in bytes divided by a power of two is exact, and a JSON
+    // reader may take the decimal it reads back one unit in the last place
+    // away, so the field is held to the lengths in whole bytes.
+    let total = manifest
+        .file_digests
+        .values()
+        .fold(0u64, |total, digest| total.saturating_add(digest.bytes));
+    if (manifest.total_size_mb * MEBIBYTE).round() != total as f64 {
+        return invalid(format!(
+            "records total_size_mb as {}, and the lengths file_digests records add up to {} MiB",
+            manifest.total_size_mb,
+            total as f64 / MEBIBYTE
+        ));
+    }
+    Ok(())
+}
+
+/// Hold a 5.x manifest's two quantization fields to `quantization.json`, once
+/// it has been read: `quantization_trained` is its `is_trained`, false where
+/// there is none, and `files_included` names `vectors.bin` only beside a
+/// trained product quantized graph under `quantized_with_raw`, which is the
+/// one graph whose raw vectors are not its rows.
+fn check_quantization_fields(
+    manifest: &IndexManifest,
+    quantization: Option<&QuantizationArtefacts>,
+) -> Result<(), Error> {
+    let (trained, keeps_raw) = match quantization.map(|quant| &quant.config) {
+        Some(QuantizationFile::Pq(config)) => (
+            config.is_trained,
+            config.is_trained && config.storage_mode == StorageMode::QuantizedWithRaw.to_string(),
+        ),
+        Some(QuantizationFile::Int8(config)) => (config.is_trained, false),
+        None => (false, false),
+    };
+    if manifest.quantization_trained != trained {
+        return Err(Error::ManifestFieldInvalid {
             detail: format!(
-                "its collection_id is '{}', which is not 32 hexadecimal digits",
-                record.collection_id
+                "records quantization_trained as {}, and {}",
+                manifest.quantization_trained,
+                match quantization {
+                    Some(_) => format!("quantization.json records is_trained {}", trained),
+                    None => "files_included names no quantization.json".to_string(),
+                }
             ),
         });
-    };
-    // The collection the journal must belong to is the identity's where the
-    // manifest records one, and the journal record's where only that does.
-    let directory_id = match identity {
-        Some(identity) => identity.collection_id,
-        None => {
-            restored_index.set_collection_id(journal_id);
-            journal_id
-        }
-    };
-    restored_index.set_journal_sequence(record.sequence);
-
-    let durability = match policy {
-        JournalPolicy::CheckpointOnly => {
-            warn!(target: LOG_TARGET, operation = "load_checkpoint_only",
-                directory = path,
-                journal = %record.file,
-                sequence = record.sequence,
-                "Opened the checkpoint alone; every mutation after the sequence it holds is in \
-                 the journal beside it and was not applied"
-            );
-            let mut recovery = Recovery::unjournaled(restored_from_aside, graph_rebuilt);
-            recovery.checkpoint_sequence = record.sequence;
-            recovery.report(path);
-            return Ok((restored_index, recovery));
-        }
-        JournalPolicy::Replay(durability) => durability,
-    };
-
-    let wal = storage.journal_path();
-    if !storage.journal_exists() {
-        return Err(Error::JournalMissing {
-            directory: path.to_string(),
-            file: wal.display().to_string(),
-            recorded: record.file.clone(),
-            sequence: record.sequence,
+    }
+    if manifest_names(manifest, "vectors.bin") && !keeps_raw {
+        return Err(Error::ManifestFieldInvalid {
+            detail: "names vectors.bin under files_included, and the graph keeps no raw vectors \
+                     beside its rows"
+                .to_string(),
         });
     }
-    let file = wal.display().to_string();
-    let bytes = crate::journal::read_journal_bytes(storage)?;
-    let contents = zeusdb_vector_core::read_journal(&bytes, &file)?;
-    crate::journal::check_contents(&contents, &file, directory_id, record.sequence)?;
-    // No save writes the identity and the journal record apart, so a
-    // manifest whose two name two collections was assembled by hand, and
-    // replaying would be choosing one of them.
-    if journal_id != directory_id {
-        return Err(Error::JournalManifestInvalid {
+    Ok(())
+}
+
+/// What a load of a journaled directory carries into the replay.
+struct Opened<'a> {
+    storage: &'a dyn Storage,
+    path: &'a str,
+    /// The tokenizer the load was handed, which a repair hands again where
+    /// it reads the checkpoint again.
+    tokenizer: Option<Arc<dyn Tokenizer>>,
+    record: &'a JournalManifest,
+    journal_id: u128,
+    directory_id: u128,
+    /// The directory's snapshot, where its manifest records one, which an
+    /// unfinished repair names when its checkpoint has not landed.
+    snapshot: Option<u128>,
+    durability: Durability,
+    /// The load was asked to repair a damaged journal.
+    repairing: bool,
+    lock: LoadLock,
+    /// The features the directory holds that this build does not know and
+    /// its manifest marks `read_only`, which make the load read only
+    /// whatever the medium.
+    read_only_features: Vec<String>,
+    /// The load's own time, which a checkpoint read again takes as the
+    /// first read took it.
+    loaded_at: &'a str,
+    /// The file the checkpoint's raw vectors were read from, the internal
+    /// id counter it held and whether it held a fitted quantizer, which name
+    /// the file a value past the bound on a vector's norm or on a sparse
+    /// value came from.
+    raw_file: &'static str,
+    counter: usize,
+    fitted: bool,
+}
+
+impl Opened<'_> {
+    /// The first value the replayed collection holds past what the bound on
+    /// a vector's norm allows, with a replayed record's file named as
+    /// `journal`. See [`Collection::first_past_bound`].
+    fn past_bound(&self, index: &Collection, journal: &str) -> Option<PastBound> {
+        index.first_past_bound(&BoundSources {
+            raw: self.raw_file,
+            journal: Some(journal),
+            counter: self.counter,
+            fitted: self.fitted,
+        })
+    }
+
+    /// The checkpoint read again into a collection of its own, at the
+    /// collection and the sequence the load holds the journal to, for a
+    /// repair whose replay met a record that would not apply.
+    fn reopened(&self) -> Result<Collection, Error> {
+        let mut index =
+            read_checkpoint(self.storage, self.tokenizer.clone(), self.loaded_at)?.index;
+        index.set_collection_id(self.directory_id);
+        index.set_journal_sequence(self.record.sequence);
+        Ok(index)
+    }
+
+    /// Refuse a journal whose damage is a whole record of a kind this build
+    /// does not know, in a directory holding features this build does not
+    /// know and its manifest marks `read_only`, since the record is the
+    /// feature's and not damage. `file`, `at` and `sequence` name the
+    /// record, and `bytes` is the file it is in. Nothing is refused where
+    /// the directory holds no such feature.
+    fn refuse_feature_record(
+        &self,
+        bytes: &[u8],
+        at: u64,
+        sequence: u64,
+        framing: bool,
+    ) -> Result<(), Error> {
+        if self.read_only_features.is_empty() {
+            return Ok(());
+        }
+        match unknown_kind_at(bytes, at, sequence, framing) {
+            Some(kind) => Err(Error::FeatureJournalUnreadable {
+                path: self.path.to_string(),
+                features: self.read_only_features.clone(),
+                kind,
+                sequence,
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// The cause of a load read only, where it is: features the directory
+    /// holds before the medium, and the medium where the lock found it
+    /// cannot be written.
+    fn read_only_cause(&self) -> Option<ReadOnlyCause> {
+        if !self.read_only_features.is_empty() {
+            return Some(ReadOnlyCause::Features(self.read_only_features.clone()));
+        }
+        self.lock.read_only.clone().map(ReadOnlyCause::Medium)
+    }
+
+    /// [`Opened::read_only_cause`] for the collection `index` the replay
+    /// built, where a value past a bound takes the medium's place. A value
+    /// past a bound refuses a save into every directory, and the medium a
+    /// save into its own alone, so the collection opens read only for the
+    /// value. A `read_only` feature keeps its place, since it refuses every
+    /// save already.
+    fn read_only_cause_of(&self, index: &Collection, journal: &str) -> Option<ReadOnlyCause> {
+        match self.read_only_cause()? {
+            ReadOnlyCause::Medium(reason) => Some(
+                self.past_bound(index, journal)
+                    .map_or(ReadOnlyCause::Medium(reason), ReadOnlyCause::Bound),
+            ),
+            cause => Some(cause),
+        }
+    }
+
+    /// No save writes the identity and the journal record apart, so a
+    /// manifest whose two name two collections was assembled by hand, and
+    /// replaying would be choosing one of them. Held once the journal itself
+    /// is held to the identity, so a journal of another collection is
+    /// refused as that first.
+    fn journal_record_names_the_directory(&self) -> Result<(), Error> {
+        if self.journal_id == self.directory_id {
+            return Ok(());
+        }
+        Err(Error::JournalManifestInvalid {
             detail: format!(
                 "its collection_id is '{}' and the directory's identity names collection '{}'",
-                record.collection_id,
-                crate::journal::id_hex(directory_id)
+                self.record.collection_id,
+                crate::journal::id_hex(self.directory_id)
             ),
-        });
+        })
     }
 
-    // Every record above the sequence the checkpoint holds, applied at the
-    // values it names. `apply` refuses to run with a sink attached, which is
-    // why the sink goes on after this loop and not before it.
-    let dim = restored_index.dim();
-    let mut replayed = 0usize;
-    let mut skipped = 0usize;
-    for journal_record in &contents.records {
-        if journal_record.sequence <= record.sequence {
-            skipped += 1;
+    /// Replay the journal of segments beside a 5.x directory onto the
+    /// checkpoint `index` holds, then carry the journal on, or hand the
+    /// collection back read only where the medium refuses the first write.
+    ///
+    /// Every segment is read in name order and held to the checkpoint the
+    /// directory is. Each record above it is applied in order: a committed
+    /// one at the values it names, a withdrawn one as the live collection
+    /// left it. Then the writer resumes, its first write deciding whether
+    /// the load may write: it cuts a torn tail and completes a roll a crash
+    /// interrupted. Stale segments and a covered journal of format version 1
+    /// are deleted. A journal that held an abort is checkpointed before it
+    /// takes another record.
+    ///
+    /// A repair reads the journal for a repair, which cuts at the first call
+    /// any break of the journal's history touches and sets aside whole a
+    /// stale segment whose header cannot be used, and cuts the same way at
+    /// the call of a record that would not decode or apply, reading the
+    /// checkpoint again and replaying the calls before it. What it sets
+    /// aside is copied into the quarantine, which is its first write, then
+    /// the journal is cut where it cuts and the stale segments set aside go,
+    /// the writer resumes on the journal as it now is, and a checkpoint seals
+    /// it, which the other stale segments go with. A repair that finds an unfinished one naming the directory's
+    /// own snapshot takes the checkpoint that one did not, and every marker
+    /// goes once the checkpoint has landed.
+    fn replay_segments(
+        self,
+        index: Collection,
+        identity: &crate::Identity,
+        mut recovery: Recovery,
+    ) -> Result<(Collection, Recovery), Error> {
+        let storage = self.storage;
+        let journal = storage.journal_path();
+        let journal_name = journal.display().to_string();
+        if !storage.journal_exists() {
+            return Err(Error::JournalMissing {
+                directory: self.path.to_string(),
+                file: journal_name,
+                recorded: self.record.file.clone(),
+                sequence: self.record.sequence,
+            });
+        }
+        let base = SegmentBase {
+            snapshot: identity
+                .snapshot
+                .expect("an identity read from a manifest names its snapshot"),
+            sequence: self.record.sequence,
+            generation: identity.generation,
+            parent: identity.parent.unwrap_or(0),
+        };
+        let expected = Expected {
+            collection_id: self.directory_id,
+            base,
+        };
+        let io = |what: &'static str| {
+            let journal = journal.to_path_buf();
+            move |error: std::io::Error| Error::JournalIoFailed {
+                path: journal.clone(),
+                what,
+                error: error.to_string(),
+            }
+        };
+        let dir = storage.journal_dir();
+        let (numbers, files, bytes) = read_segment_files(&*dir)?;
+        let segments = segment_bytes(&numbers, &files, &bytes);
+        let contents = if self.repairing {
+            read_segments_for_repair(&segments, &expected, &journal_name)?
+        } else {
+            read_segments(&segments, &expected, &journal_name).map_err(|refusal| {
+                repairable_segments(refusal, &segments, &expected, &journal_name)
+            })?
+        };
+        // A record of a read-only feature is the feature's, so it is named
+        // as that before it is taken for damage.
+        let damage = match (&contents.damage, &contents.cut) {
+            (Some(JournalDamage::Corrupt { at, sequence, .. }), _)
+            | (Some(JournalDamage::TornTail { at, sequence }), _) => contents
+                .damage_file
+                .as_deref()
+                .and_then(|file| segments.iter().find(|segment| segment.file == file))
+                .map(|segment| (segment.bytes, *at, *sequence)),
+            (None, Some(cut)) => segments
+                .iter()
+                .find(|segment| segment.number == cut.damage_segment)
+                .map(|segment| (segment.bytes, cut.damage_at, cut.damage_sequence)),
+            (None, None) => None,
+        };
+        if let Some((bytes, at, sequence)) = damage {
+            self.refuse_feature_record(bytes, at, sequence, true)?;
+        }
+        if !self.repairing {
+            if let Some(refusal) = contents.refusal() {
+                return Err(refusal);
+            }
+        }
+        self.journal_record_names_the_directory()?;
+
+        // `apply` refuses to run with a sink attached, which is why the sink
+        // goes on after this loop and not before it.
+        let mut index = index;
+        let mut cut = contents.cut.clone();
+        let mut kept = contents.records.len();
+        if let Err((place, unapplied)) = replay_live(&index, &contents.records, &numbers, &files) {
+            let start = contents.calls[contents.calls.partition_point(|&c| c <= place) - 1];
+            let made = unapplied.cut_before(&contents.records, start, place, &numbers);
+            if !self.repairing {
+                return Err(Error::repairable(unapplied.error, made.sequence, made.at));
+            }
+            cut = Some(made);
+            kept = start;
+            index = self.reopened()?;
+            replay_live(&index, &contents.records[..kept], &numbers, &files)
+                .map_err(|(_, unapplied)| unapplied.error)?;
+        }
+        let records = &contents.records[..kept];
+        recovery.replayed = records
+            .iter()
+            .filter(|live| live.state == RecordState::Committed)
+            .count();
+        recovery.withdrawn = records.len() - recovery.replayed;
+        recovery.first_sequence = contents
+            .live()
+            .next()
+            .map_or(self.record.sequence.saturating_add(1), |segment| {
+                segment.number
+            });
+        recovery.records_in_journal = kept;
+        recovery.skipped = contents.skipped;
+        recovery.damage = contents
+            .damage
+            .as_ref()
+            .map(|damage| Damage::of(damage, contents.damage_file.as_deref().unwrap_or_default()));
+        recovery.good_bytes = contents.good_bytes;
+        recovery.segments = numbers.len();
+        let mut reached = contents.next_sequence.saturating_sub(1);
+
+        let plan = if self.repairing {
+            repair::plan_segments(
+                cut.as_ref(),
+                &contents.stale_set_aside,
+                &repair::JournalFiles {
+                    numbers: &numbers,
+                    files: &files,
+                    bytes: &bytes,
+                },
+                self.snapshot,
+                self.record.sequence,
+                reached,
+            )
+        } else {
+            None
+        };
+        if let Some(plan) = &plan {
+            recovery.damage = Some(plan.damage.clone());
+            if let Some(at) = plan.cut_at() {
+                recovery.good_bytes = at;
+            }
+            reached = plan.kept_through;
+        }
+        let unfinished = if self.repairing {
+            repair::unfinished(&*dir)
+        } else {
+            Vec::new()
+        };
+
+        if let Some(cause) = self.read_only_cause_of(&index, &file_name_of(journal)) {
+            recovery.repair = plan.as_ref().map(|plan| plan.report(None));
+            return Ok(read_only(index, self.path, cause, reached, recovery));
+        }
+        // A collection holding a value past the bound on a vector's norm or
+        // on a sparse value opens read only before anything is written, as
+        // one on a medium that refuses writes does, since this build writes
+        // no such value.
+        if let Some(past) = self.past_bound(&index, &file_name_of(journal)) {
+            recovery.repair = plan.as_ref().map(|plan| plan.report(None));
+            let cause = ReadOnlyCause::Bound(past);
+            return Ok(read_only(index, self.path, cause, reached, recovery));
+        }
+        // The stale segments this load deletes and the records it takes rest
+        // on the directory it read, which a save in an earlier process may
+        // have moved into place without its sync landing, so the directory
+        // is made durable before the journal changes. A medium that refuses
+        // the sync as it refuses a write opens read only, as the load's
+        // first write does, since nothing is then written that rests on it.
+        if let Err(error) = storage.sync_in_place() {
+            if refuses_writes(&error) {
+                recovery.repair = plan.as_ref().map(|plan| plan.report(None));
+                let cause = ReadOnlyCause::Medium(error.to_string());
+                return Ok(read_only(index, self.path, cause, reached, recovery));
+            }
+            return Err(Error::DirectoryNotDurable {
+                directory: storage.dir().locate(""),
+                error: error.to_string(),
+            });
+        }
+        let mut sealed: Vec<String> = Vec::new();
+        let writer = match &plan {
+            None => JournalWriter::resume(dir, self.directory_id, base, &contents),
+            Some(plan) => {
+                let folder = match repair::set_aside(&*dir, plan) {
+                    Ok(folder) => folder,
+                    Err(repair::SetAside::Create(error)) if refuses_writes(&error) => {
+                        recovery.repair = Some(plan.report(None));
+                        let cause = ReadOnlyCause::Medium(error.to_string());
+                        return Ok(read_only(index, self.path, cause, reached, recovery));
+                    }
+                    Err(repair::SetAside::Create(error)) => return Err(io("set aside")(error)),
+                    Err(repair::SetAside::Write(error)) => return Err(error),
+                };
+                zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::RepairAfterQuarantine);
+                if let Some(cut) = &cut {
+                    repair::cut_segments(&*dir, &numbers, cut.segment, cut.at)
+                        .map_err(io("cut"))?;
+                }
+                repair::remove_stale(&*dir, &plan.stale).map_err(io("set aside"))?;
+                zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::RepairAfterCut);
+                let folder_path = PathBuf::from(dir.quarantine().locate(&folder));
+                recovery.repair = Some(plan.report(Some(folder_path)));
+                sealed.push(folder);
+                // The writer carries on the journal as the repair left it,
+                // which reads whole, so it is read again.
+                let (numbers, files, bytes) = read_segment_files(&*dir)?;
+                let segments = segment_bytes(&numbers, &files, &bytes);
+                let cut_journal = read_segments(&segments, &expected, &journal_name)?;
+                if let Some(refusal) = cut_journal.refusal() {
+                    return Err(refusal);
+                }
+                JournalWriter::resume(storage.journal_dir(), self.directory_id, base, &cut_journal)
+            }
+        };
+        let writer = match writer {
+            Ok(writer) => writer,
+            Err(failure) if failure.refuses_writes => {
+                let cause = ReadOnlyCause::Medium(failure.error.to_string());
+                return Ok(read_only(index, self.path, cause, reached, recovery));
+            }
+            Err(failure) => return Err(failure.error),
+        };
+        let mut sink = JournalSink::from_writer(writer, self.durability, self.lock.guard)?;
+        // A repair checkpoints where it cut, and where an unfinished repair
+        // names the directory's own snapshot, since that one's checkpoint
+        // never landed.
+        let repaired = plan.is_some()
+            || unfinished
+                .iter()
+                .any(|(_, snapshot)| *snapshot == self.snapshot);
+        if !repaired {
+            sink.remove_stale()?;
+            crate::journal::remove_covered_legacy(
+                storage,
+                self.directory_id,
+                self.record.sequence,
+            )?;
+        }
+        index.attach_sink(Box::new(sink));
+        // The fault a failed commit left lived in memory alone, so a process
+        // restarted after one would take writes on top of whatever the
+        // failed sync lost. A checkpoint writes the collection from memory
+        // and rolls past the abort first. One checkpoint serves a repair and
+        // an abort together, and its roll deletes every segment the journal
+        // held, the stale ones among them.
+        if repaired || contents.aborts > 0 {
+            index.checkpoint()?;
+            recovery.checkpoint_taken = Some(if repaired {
+                CheckpointTaken::Repair
+            } else {
+                CheckpointTaken::Abort
+            });
+        }
+        if repaired {
+            zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::RepairAfterCheckpoint);
+            crate::journal::remove_covered_legacy(
+                storage,
+                self.directory_id,
+                index.journal_sequence(),
+            )?;
+        }
+        sealed.extend(unfinished.into_iter().map(|(folder, _)| folder));
+        repair::seal(&*storage.journal_dir(), &sealed)?;
+        recovery.report(self.path);
+        Ok((index, recovery))
+    }
+
+    /// Replay the journal of format version 1 beside a 3.x or 4.x directory
+    /// onto the checkpoint `index` holds, then upgrade the directory, or
+    /// hand the collection back read only where the medium refuses the
+    /// upgrade's first write.
+    ///
+    /// The upgrade is a checkpoint at 5.0.0 with a journal of segments: the
+    /// journal's directory is created empty, a writer carrying the sequence
+    /// on from the last record replayed is attached, the checkpoint commits
+    /// and rolls the writer onto its first segment, and then the file goes.
+    /// A crash before the commit leaves the old directory and its file, which
+    /// the next load replays and upgrades again. A crash after it leaves a
+    /// 5.0.0 directory holding every record of the file, which the next load
+    /// deletes.
+    ///
+    /// A repair cuts a corrupt middle at the damaged record, since version 1
+    /// frames no call, and cuts the same way at a record that would not
+    /// decode or apply, reading the checkpoint again and replaying the
+    /// records before it. What it sets aside is copied into the quarantine
+    /// of the new journal's directory, which is its first write, the file is
+    /// cut, and the upgrade's checkpoint seals it.
+    fn replay_legacy(
+        self,
+        index: Collection,
+        mut recovery: Recovery,
+    ) -> Result<(Collection, Recovery), Error> {
+        let storage = self.storage;
+        let wal = storage.legacy_journal_path();
+        let file = wal.display().to_string();
+        if !storage.legacy_journal_exists() {
+            return Err(Error::JournalMissing {
+                directory: self.path.to_string(),
+                file,
+                recorded: self.record.file.clone(),
+                sequence: self.record.sequence,
+            });
+        }
+        let bytes = storage
+            .read_legacy_journal()
+            .map_err(|error| Error::JournalIoFailed {
+                path: wal.to_path_buf(),
+                what: "read",
+                error: error.to_string(),
+            })?;
+        let checkpoint = self.record.sequence;
+        let contents = match read_legacy_journal(&bytes, &file) {
+            Ok(contents) => contents,
+            Err(Error::JournalHeaderInvalid {
+                file: named,
+                detail,
+            }) => {
+                // A header that does not read names no collection and no
+                // first sequence, so no record of the file is replayed. A
+                // repair sets the whole file aside and the upgrade's
+                // checkpoint seals it, and any other load names the repair.
+                let first = checkpoint.saturating_add(1);
+                if !self.repairing {
+                    return Err(Error::repairable(
+                        Error::JournalHeaderInvalid {
+                            file: named,
+                            detail,
+                        },
+                        first,
+                        0,
+                    ));
+                }
+                self.journal_record_names_the_directory()?;
+                let cut = Cut {
+                    segment: 0,
+                    at: 0,
+                    sequence: first,
+                    kind: "header",
+                    damage_segment: 0,
+                    damage_at: 0,
+                    damage_sequence: first,
+                    detail,
+                };
+                let plan = repair::plan_legacy(&cut, &file, &bytes, self.snapshot, checkpoint);
+                recovery.first_sequence = first;
+                recovery.damage = Some(plan.damage.clone());
+                recovery.good_bytes = 0;
+                return self.finish_legacy(index, recovery, Some(plan), checkpoint, &file);
+            }
+            Err(other) => return Err(other),
+        };
+        if let Some(
+            JournalDamage::Corrupt { at, sequence, .. } | JournalDamage::TornTail { at, sequence },
+        ) = &contents.damage
+        {
+            self.refuse_feature_record(&bytes, *at, *sequence, false)?;
+        }
+        crate::journal::check_legacy_contents(
+            &contents,
+            &file,
+            self.directory_id,
+            self.record.sequence,
+            self.repairing,
+        )?;
+        self.journal_record_names_the_directory()?;
+
+        // Version 1 frames no call, so a repair cuts at the damaged record.
+        let mut cut = match (&contents.damage, self.repairing) {
+            (
+                Some(JournalDamage::Corrupt {
+                    at,
+                    sequence,
+                    detail,
+                }),
+                true,
+            ) => Some(Cut {
+                segment: 0,
+                at: *at,
+                sequence: *sequence,
+                kind: "corrupt",
+                damage_segment: 0,
+                damage_at: *at,
+                damage_sequence: *sequence,
+                detail: detail.clone(),
+            }),
+            _ => None,
+        };
+        let mut index = index;
+        let mut kept = contents.records.len();
+        if let Err((place, unapplied)) =
+            replay_legacy_records(&index, &contents.records, checkpoint, &file)
+        {
+            let record = &contents.records[place];
+            if !self.repairing {
+                return Err(Error::repairable(
+                    unapplied.error,
+                    record.sequence,
+                    record.offset,
+                ));
+            }
+            cut = Some(Cut {
+                segment: 0,
+                at: record.offset,
+                sequence: record.sequence,
+                kind: unapplied.kind,
+                damage_segment: 0,
+                damage_at: record.offset,
+                damage_sequence: record.sequence,
+                detail: unapplied.cut_detail(),
+            });
+            kept = place;
+            index = self.reopened()?;
+            replay_legacy_records(&index, &contents.records[..kept], checkpoint, &file)
+                .map_err(|(_, unapplied)| unapplied.error)?;
+        }
+        let records = &contents.records[..kept];
+        recovery.skipped = records.iter().filter(|r| r.sequence <= checkpoint).count();
+        recovery.replayed = records.len() - recovery.skipped;
+        // The first sequence above the checkpoint and the records above it
+        // the load kept, as a journal of segments reports them. A journal
+        // starting past the sequence after the checkpoint is refused above.
+        recovery.first_sequence = checkpoint.saturating_add(1);
+        recovery.records_in_journal = recovery.replayed;
+        recovery.damage = contents
+            .damage
+            .as_ref()
+            .map(|damage| Damage::of(damage, &file));
+        recovery.good_bytes = contents.good_bytes;
+        let mut reached = contents
+            .next_sequence()
+            .saturating_sub(1)
+            .max(self.record.sequence);
+        let plan = cut.as_ref().map(|cut| {
+            repair::plan_legacy(cut, &file, &bytes, self.snapshot, self.record.sequence)
+        });
+        if let Some(plan) = &plan {
+            recovery.damage = Some(plan.damage.clone());
+            if let Some(at) = plan.cut_at() {
+                recovery.good_bytes = at;
+            }
+            reached = plan.kept_through.max(self.record.sequence);
+        }
+        self.finish_legacy(index, recovery, plan, reached, &file)
+    }
+
+    /// The end of a replay of a journal of format version 1, from the
+    /// collection the replay built, the repair's plan where there is one and
+    /// the last sequence kept: open read only where a cause allows no write,
+    /// or set aside what the plan names, cut the file, and upgrade.
+    fn finish_legacy(
+        self,
+        index: Collection,
+        mut recovery: Recovery,
+        plan: Option<repair::Plan<'_>>,
+        reached: u64,
+        file: &str,
+    ) -> Result<(Collection, Recovery), Error> {
+        let storage = self.storage;
+        let wal = storage.legacy_journal_path();
+        let unfinished = if self.repairing {
+            repair::unfinished(&*storage.journal_dir())
+        } else {
+            Vec::new()
+        };
+
+        // The upgrade below is a save, and a save records the generation after
+        // the directory's. A directory at the largest generation opens read only
+        // here, before anything is written, as one on a medium that refuses
+        // writes does. The generation refuses a save into every directory, so
+        // it is the cause named ahead of the medium, which refuses a save into
+        // its own directory alone, and ahead of a value past a bound, as on a
+        // medium that takes writes.
+        let identity = index.identity();
+        let largest = identity.next(0).is_none().then_some(identity.generation);
+        if let Some(cause) = self.read_only_cause_of(&index, &file_name_of(wal)) {
+            let cause = match (cause, largest) {
+                (ReadOnlyCause::Medium(_) | ReadOnlyCause::Bound(_), Some(generation)) => {
+                    ReadOnlyCause::Generation(generation)
+                }
+                (cause, _) => cause,
+            };
+            recovery.repair = plan.as_ref().map(|plan| plan.report(None));
+            return Ok(read_only(index, self.path, cause, reached, recovery));
+        }
+        if let Some(generation) = largest {
+            recovery.repair = plan.as_ref().map(|plan| plan.report(None));
+            let cause = ReadOnlyCause::Generation(generation);
+            return Ok(read_only(index, self.path, cause, reached, recovery));
+        }
+        // A collection holding a value past the bound on a vector's norm or
+        // on a sparse value opens read only here too, before the upgrade
+        // writes it again.
+        if let Some(past) = self.past_bound(&index, &file_name_of(wal)) {
+            recovery.repair = plan.as_ref().map(|plan| plan.report(None));
+            let cause = ReadOnlyCause::Bound(past);
+            return Ok(read_only(index, self.path, cause, reached, recovery));
+        }
+        zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::UpgradeAfterReplay);
+        let mut sealed: Vec<String> = Vec::new();
+        if let Some(plan) = &plan {
+            let dir = storage.journal_dir();
+            let folder = match repair::set_aside(&*dir, plan) {
+                Ok(folder) => folder,
+                Err(repair::SetAside::Create(error)) if refuses_writes(&error) => {
+                    recovery.repair = Some(plan.report(None));
+                    let cause = ReadOnlyCause::Medium(error.to_string());
+                    return Ok(read_only(index, self.path, cause, reached, recovery));
+                }
+                Err(repair::SetAside::Create(error)) => {
+                    return Err(Error::JournalIoFailed {
+                        path: storage.journal_path().to_path_buf(),
+                        what: "set aside",
+                        error: error.to_string(),
+                    })
+                }
+                Err(repair::SetAside::Write(error)) => return Err(error),
+            };
+            zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::RepairAfterQuarantine);
+            let at = plan
+                .cut_at()
+                .expect("a repair of a journal held in one file cuts it");
+            storage
+                .cut_legacy_journal(at)
+                .map_err(|error| Error::JournalIoFailed {
+                    path: wal.to_path_buf(),
+                    what: "cut",
+                    error: error.to_string(),
+                })?;
+            zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::RepairAfterCut);
+            let folder_path = PathBuf::from(dir.quarantine().locate(&folder));
+            recovery.repair = Some(plan.report(Some(folder_path)));
+            sealed.push(folder);
+        }
+        // The upgrade's first write, before anything has changed.
+        if let Err(error) = storage.probe_writable() {
+            if refuses_writes(&error) {
+                return Ok(read_only(
+                    index,
+                    self.path,
+                    ReadOnlyCause::Medium(error.to_string()),
+                    reached,
+                    recovery,
+                ));
+            }
+            return Err(Error::JournalIoFailed {
+                path: storage.journal_path().to_path_buf(),
+                what: "upgrade",
+                error: error.to_string(),
+            });
+        }
+        let sink = JournalSink::create_at(
+            storage,
+            self.directory_id,
+            reached,
+            self.durability,
+            self.lock.guard,
+        )?;
+        index.attach_sink(Box::new(sink));
+        index.upgrade_checkpoint(self.path)?;
+        match storage.remove_legacy_journal() {
+            Ok(()) => crate::journal::sync_in_place(storage)?,
+            Err(error) => warn!(target: LOG_TARGET, operation = "upgrade_old_journal_kept",
+                journal = file,
+                error = %error,
+                "The directory was upgraded and its journal of format version 1 could not be \
+                 deleted; the directory holds every record in it, and the next load deletes it"
+            ),
+        }
+        zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::UpgradeAfterOldRemoved);
+        recovery.upgraded_from = Some(recovery.format_version.clone());
+        // The upgrade's checkpoint seals a repair this load made, and one an
+        // earlier load left unfinished under the directory's own snapshot.
+        let repaired = plan.is_some()
+            || unfinished
+                .iter()
+                .any(|(_, snapshot)| *snapshot == self.snapshot);
+        recovery.checkpoint_taken = Some(if repaired {
+            CheckpointTaken::Repair
+        } else {
+            CheckpointTaken::Upgrade
+        });
+        if repaired {
+            zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::RepairAfterCheckpoint);
+        }
+        sealed.extend(unfinished.into_iter().map(|(folder, _)| folder));
+        repair::seal(&*storage.journal_dir(), &sealed)?;
+        recovery.report(self.path);
+        Ok((index, recovery))
+    }
+}
+
+/// A journal's segments in name order: their numbers, their paths as a
+/// message names them, and their bytes.
+type SegmentFiles = (Vec<u64>, Vec<String>, Vec<Vec<u8>>);
+
+/// Every segment of the journal `dir`, read whole.
+fn read_segment_files(dir: &dyn zeusdb_vector_core::JournalDir) -> Result<SegmentFiles, Error> {
+    let io = |what: &'static str| {
+        move |error: std::io::Error| Error::JournalIoFailed {
+            path: dir.path().to_path_buf(),
+            what,
+            error: error.to_string(),
+        }
+    };
+    let numbers = dir.segments().map_err(io("list"))?;
+    let mut files = Vec::with_capacity(numbers.len());
+    let mut bytes = Vec::with_capacity(numbers.len());
+    for &number in &numbers {
+        files.push(dir.segment_path(number).display().to_string());
+        bytes.push(dir.read_segment(number).map_err(io("read"))?);
+    }
+    Ok((numbers, files, bytes))
+}
+
+/// The refusal a plain load gives for a journal of segments `read_segments`
+/// refused, carrying the cut a repair makes where `read_segments_for_repair`
+/// reads the same segments with a cut, so the refusal names `repair=True`
+/// wherever a repair handles the damage. A refusal the reading for a repair
+/// gives as well is returned as it is, and so is the refusal of a stale
+/// segment's header, whose own words name the repair.
+fn repairable_segments(
+    refusal: Error,
+    segments: &[SegmentBytes<'_>],
+    expected: &Expected,
+    journal: &str,
+) -> Error {
+    let Ok(contents) = read_segments_for_repair(segments, expected, journal) else {
+        return refusal;
+    };
+    if let Error::JournalHeaderInvalid { file, .. } = &refusal {
+        if contents
+            .stale_set_aside
+            .iter()
+            .any(|stale| &stale.file == file)
+        {
+            return refusal;
+        }
+    }
+    match &contents.cut {
+        Some(cut) => Error::repairable(refusal, cut.sequence, cut.at),
+        None => refusal,
+    }
+}
+
+/// The segments `read_segment_files` read, as the reader borrows them.
+fn segment_bytes<'a>(
+    numbers: &[u64],
+    files: &'a [String],
+    bytes: &'a [Vec<u8>],
+) -> Vec<SegmentBytes<'a>> {
+    numbers
+        .iter()
+        .zip(files)
+        .zip(bytes)
+        .map(|((number, file), bytes)| SegmentBytes {
+            number: *number,
+            file,
+            bytes,
+        })
+        .collect()
+}
+
+/// A record a replay could not apply: the refusal a load that does not
+/// repair gives for it, and the kind of damage a repair names it, `decode`
+/// or `apply`.
+struct Unapplied {
+    error: Error,
+    kind: &'static str,
+}
+
+impl Unapplied {
+    /// The detail a repair records for the record it cuts for. For a record
+    /// that would not apply it is the words of what refused it, without the
+    /// plain load's refusal around them, which says the directory was not
+    /// opened. For a record that would not decode it is the decoder's
+    /// refusal.
+    fn cut_detail(&self) -> String {
+        match &self.error {
+            Error::JournalReplayFailed { detail, .. } => detail.clone(),
+            other => other.to_string(),
+        }
+    }
+
+    /// The cut a repair makes for the record at `place` among `records`,
+    /// whose call begins at `start`, being that call's first record, so no
+    /// call is applied in part. `numbers` are the segments' numbers.
+    fn cut_before(
+        &self,
+        records: &[LiveRecord<'_>],
+        start: usize,
+        place: usize,
+        numbers: &[u64],
+    ) -> Cut {
+        let segment_of = |sequence: u64| {
+            numbers[numbers
+                .partition_point(|&number| number <= sequence)
+                .saturating_sub(1)]
+        };
+        let first = &records[start].record;
+        let damaged = &records[place].record;
+        Cut {
+            segment: segment_of(first.sequence),
+            at: first.offset,
+            sequence: first.sequence,
+            kind: self.kind,
+            damage_segment: segment_of(damaged.sequence),
+            damage_at: damaged.offset,
+            damage_sequence: damaged.sequence,
+            detail: self.cut_detail(),
+        }
+    }
+}
+
+/// Apply the records of a journal of segments in order, a committed one at
+/// the values it names and a withdrawn one as the live collection left it.
+/// Returns the place of the first record that would not decode or apply,
+/// with how, and stops there.
+fn replay_live(
+    index: &Collection,
+    records: &[LiveRecord<'_>],
+    numbers: &[u64],
+    files: &[String],
+) -> Result<(), (usize, Unapplied)> {
+    let dim = index.dim();
+    for (place, live) in records.iter().enumerate() {
+        let file = segment_file(numbers, files, live.record.sequence);
+        let operation = Operation::decode(&live.record, dim, file).map_err(|error| {
+            (
+                place,
+                Unapplied {
+                    error,
+                    kind: "decode",
+                },
+            )
+        })?;
+        let applied = applied_or_panicked(|| match live.state {
+            RecordState::Committed => index.apply(operation),
+            RecordState::Withdrawn => index.apply_withdrawn(operation),
+        });
+        applied.map_err(|error| {
+            let error = Error::JournalReplayFailed {
+                file: file.to_string(),
+                sequence: live.record.sequence,
+                detail: error.replay_detail(),
+            };
+            (
+                place,
+                Unapplied {
+                    error,
+                    kind: "apply",
+                },
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// Apply the records of a journal of format version 1 above `checkpoint`
+/// in order, as the release that wrote them applied them. Returns the place
+/// of the first record that would not decode or apply, with how, and stops
+/// there.
+fn replay_legacy_records(
+    index: &Collection,
+    records: &[JournalRecord<'_>],
+    checkpoint: u64,
+    file: &str,
+) -> Result<(), (usize, Unapplied)> {
+    let dim = index.dim();
+    for (place, record) in records.iter().enumerate() {
+        if record.sequence <= checkpoint {
             continue;
         }
-        let operation = zeusdb_vector_core::Operation::decode(journal_record, dim, &file)?;
-        restored_index
-            .apply(operation)
-            .map_err(|error| Error::JournalReplayFailed {
-                file: file.clone(),
-                sequence: journal_record.sequence,
+        let operation = Operation::decode_legacy(record, dim, file).map_err(|error| {
+            (
+                place,
+                Unapplied {
+                    error,
+                    kind: "decode",
+                },
+            )
+        })?;
+        applied_or_panicked(|| index.apply_legacy(operation)).map_err(|error| {
+            let error = Error::JournalReplayFailed {
+                file: file.to_string(),
+                sequence: record.sequence,
                 detail: error.replay_detail(),
-            })?;
-        replayed += 1;
+            };
+            (
+                place,
+                Unapplied {
+                    error,
+                    kind: "apply",
+                },
+            )
+        })?;
     }
+    Ok(())
+}
 
-    // The journal is cut back to its last whole record and reopened for
-    // append after it. Where the body is empty the header is restated at the
-    // checkpoint's sequence plus one, which completes a truncation a crash
-    // left half done.
-    let writer = zeusdb_vector_core::JournalWriter::open_for_append(
-        storage,
-        &contents,
-        record.sequence + 1,
-    )?;
-    restored_index.attach_sink(Box::new(crate::journal::JournalSink::from_writer(
-        writer, durability,
-    )?));
+/// Apply one record, taking a panic inside its install as the refusal of a
+/// record that will not apply, with the panic's words. A panic may leave the
+/// record part applied, so the collection it was applied to is not used
+/// again: a load that does not repair drops it with its refusal, and a
+/// repair reads the checkpoint again and replays the calls before the
+/// record's call onto that.
+fn applied_or_panicked(apply: impl FnOnce() -> Result<(), Error>) -> Result<(), Error> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(apply)).unwrap_or_else(|payload| {
+        Err(Error::Engine(format!(
+            "The engine failed inside the install of the record: {}",
+            panic_words(&*payload).trim_end_matches('.')
+        )))
+    })
+}
 
-    let recovery = Recovery {
-        checkpoint_sequence: record.sequence,
-        first_sequence: contents.header.first_sequence,
-        records_in_journal: contents.records.len(),
-        replayed,
-        skipped,
-        damage: contents.damage.clone(),
-        good_bytes: contents.good_bytes,
-        restored_from_aside,
-        graph_rebuilt,
-        journaled: true,
-    };
+/// The segment's file a record of `sequence` sits in, being the last
+/// segment named at or below it.
+fn segment_file<'a>(numbers: &[u64], files: &'a [String], sequence: u64) -> &'a str {
+    let after = numbers.partition_point(|&number| number <= sequence);
+    after
+        .checked_sub(1)
+        .and_then(|at| files.get(at))
+        .map_or("", String::as_str)
+}
+
+/// The file a loaded collection's raw vectors were read from: `vectors.bin`
+/// where the load built the graph again from it or the graph keeps a raw
+/// vector beside each code, and the graph dump otherwise.
+fn raw_vectors_file(index: &Collection, graph_rebuilt: bool) -> &'static str {
+    if graph_rebuilt || index.writes_raw_vectors() {
+        "vectors.bin"
+    } else {
+        GRAPH_DUMP_FILENAME
+    }
+}
+
+/// The last part of `path`, being the name a warning gives a journal.
+fn file_name_of(path: &Path) -> String {
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
+}
+
+/// The collection a load hands back read only, where the medium refused its
+/// first write, the directory holds features this build does not know and
+/// its manifest marks `read_only`, the directory records the largest
+/// generation, or the collection holds a value past the bound on a vector's
+/// norm or on a sparse value: every record replayed, nothing on the medium
+/// changed, and a sink
+/// attached that refuses every mutation. `reached` is the last sequence the
+/// replay reached, which a save into another directory records.
+fn read_only(
+    index: Collection,
+    path: &str,
+    cause: ReadOnlyCause,
+    reached: u64,
+    mut recovery: Recovery,
+) -> (Collection, Recovery) {
+    index.set_journal_sequence(reached);
+    recovery.read_only = Some(cause.reason());
+    match &cause {
+        ReadOnlyCause::Features(features) => recovery
+            .notes
+            .extend(features.iter().cloned().map(Note::ReadOnlyFeature)),
+        ReadOnlyCause::Generation(generation) => {
+            recovery.notes.push(Note::ReadOnlyGeneration(*generation))
+        }
+        ReadOnlyCause::Bound(_) => recovery.notes.push(Note::ReadOnlyBound),
+        ReadOnlyCause::Medium(_) => {}
+    }
+    index.attach_sink(Box::new(ReadOnlySink::new(
+        std::path::PathBuf::from(path),
+        cause,
+        reached,
+    )));
     recovery.report(path);
-    Ok((restored_index, recovery))
+    (index, recovery)
 }
 
 // ============================================================================
@@ -3323,23 +5418,10 @@ fn save_mappings(index: &Collection, dir: &dyn Dir, ledger: &mut SaveLedger) -> 
     Ok(())
 }
 
-/// The codes frame over every record `ids` holds that has codes, each named
-/// by the internal id `id_of` gives its position. Compiled once for each
-/// reader, so the loop tests nothing the other reader needs.
-fn codes_of(
-    ids: &IdStore,
-    pq_codes: &HashMap<String, Vec<u8>>,
-    width: usize,
-    id_of: impl Fn(usize) -> Option<usize>,
-) -> Result<(Vec<u8>, usize), Error> {
-    let records = ids.iter().filter_map(|(at, id)| {
-        let code = pq_codes.get(id)?;
-        Some((id_of(at)?, code.as_slice()))
-    });
-    framed::write_codes(width, records, pq_codes.len())
-}
-
 /// Save vector metadata as JSON for external tool compatibility
+///
+/// Compact, and naming only the records that hold a field, since a load
+/// gives every record the file leaves out an empty entry.
 fn save_metadata(index: &Collection, dir: &dyn Dir, ledger: &mut SaveLedger) -> Result<(), Error> {
     debug!(target: LOG_TARGET, "Saving metadata.json...");
 
@@ -3347,18 +5429,23 @@ fn save_metadata(index: &Collection, dir: &dyn Dir, ledger: &mut SaveLedger) -> 
     // the id store before vector_metadata. The file is keyed by external id
     // and the store by position, so every record is written under the id
     // the id store holds for it, in position order, which is increasing
-    // internal id and the order the store walks in. `to_string_pretty`
-    // returns an owned String, so the file is written with nothing held.
+    // internal id and the order the store walks in. `to_string` returns an
+    // owned String, so the file is written with nothing held.
     let (metadata_json, record_count) = {
         let ids = index.ids();
         let vector_metadata = index.vector_metadata();
         let file = MetadataFile {
             records: ids
                 .iter()
-                .filter_map(|(slot, id)| vector_metadata.get(slot).map(|fields| (id, fields)))
+                .filter_map(|(slot, id)| {
+                    vector_metadata
+                        .get(slot)
+                        .filter(|fields| !fields.is_empty())
+                        .map(|fields| (id, fields))
+                })
                 .collect(),
         };
-        let json = serde_json::to_string_pretty(&file);
+        let json = serde_json::to_string(&file);
         (json, file.records.len())
     };
     let metadata_json = metadata_json.map_err(|e| Error::SerializeFailed {
@@ -3372,9 +5459,9 @@ fn save_metadata(index: &Collection, dir: &dyn Dir, ledger: &mut SaveLedger) -> 
     Ok(())
 }
 
-/// `metadata.json` as it is written: one object per record under its
-/// external id, holding the record's fields. The same shape the file has
-/// always had, which `load_metadata` reads back into a map of maps.
+/// `metadata.json` as it is written: one object per record holding a field,
+/// under its external id, holding the record's fields, which `load_metadata`
+/// reads back into a map of maps.
 struct MetadataFile<'a> {
     records: Vec<(&'a str, RecordFields<'a>)>,
 }
@@ -3416,42 +5503,15 @@ fn save_quantization_config(
         let (subvectors, bits) = config.scheme.pq_shape().unwrap_or((1, 8));
 
         // When the codebook was fitted, taken from the index rather than from
-        // the clock. This used to be `Utc::now()`, so the field recorded the
-        // save and moved every time a trained index was saved again. `None` on
-        // an index that never trained, and also on one loaded from a directory
-        // written before the index carried the value; see the field on
-        // `Collection`.
+        // the clock, since the clock's time here would be the save's and would
+        // move every time a trained index was saved again. `None` on an index
+        // that never trained, and also on one loaded from a directory written
+        // before the index carried the value; see the field on `Collection`.
         let training_completed_at = index.training_completed_at();
 
         // CAPTURE TRAINING STATE:
         let training_ids = index.training_ids().clone();
         let training_threshold_reached = index.training_threshold_reached();
-
-        let (memory_stats, pq_config) = if let Some(pq) = index.pq() {
-            let (memory_mb, total_centroids) = pq.get_memory_stats();
-
-            let memory_stats = MemoryStats {
-                centroid_storage_mb: memory_mb,
-                compression_ratio: (pq.dim() * 4) as f64 / pq.subvectors() as f64,
-                centroids_per_subvector: pq.num_centroids(),
-                total_centroids,
-            };
-
-            let pq_config = PQConfig {
-                dim: pq.dim(),
-                sub_dim: pq.sub_dim(),
-                num_centroids: pq.num_centroids(),
-            };
-
-            (Some(memory_stats), pq_config)
-        } else {
-            let pq_config = PQConfig {
-                dim: index.dim(),
-                sub_dim: index.dim() / subvectors,
-                num_centroids: 1 << bits,
-            };
-            (None, pq_config)
-        };
 
         let quant_persistence = QuantizationPersistence {
             r#type: "pq".to_string(),
@@ -3462,8 +5522,6 @@ fn save_quantization_config(
             storage_mode: config.storage_mode.to_string().to_string(),
             is_trained: index.can_use_quantization(),
             training_completed_at,
-            memory_stats,
-            pq_config,
             training_ids,
             training_threshold_reached,
             rerank_calibration: index.rerank_calibration(),
@@ -3555,28 +5613,6 @@ fn save_int8_scales(
     Ok(())
 }
 
-/// The rows artefact: every live record's internal id and row, ascending,
-/// written straight into the frame's buffer. Nothing is written for an index
-/// holding no record, and the manifest then names no rows artefact.
-fn save_int8_rows(index: &Collection, dir: &dyn Dir, ledger: &mut SaveLedger) -> Result<(), Error> {
-    let stride = 4 + index.quantization_code_bytes();
-    let mut out = frame_begin(
-        FrameKind::Int8Rows,
-        FrameEncoding::Engine,
-        index.len().saturating_mul(stride),
-    );
-    let entries = index.write_int8_rows(&mut out);
-    if entries == 0 {
-        return Ok(());
-    }
-    debug!(target: LOG_TARGET, "Saving {}...", INT8_ROWS_FILENAME);
-    let bytes = frame_finish(out, entries as u64);
-    zeusdb_vector_core::write_artefact(dir, INT8_ROWS_FILENAME, &bytes)?;
-    ledger.record_digest(INT8_ROWS_FILENAME, bytes.len() as u64, None);
-    debug!(target: LOG_TARGET, "{} saved ({} rows)", INT8_ROWS_FILENAME, entries);
-    Ok(())
-}
-
 /// Save PQ centroids for vector reconstruction
 fn save_pq_centroids(
     index: &Collection,
@@ -3601,50 +5637,16 @@ fn save_pq_centroids(
     Ok(())
 }
 
-/// Save quantized vector codes, each under its record's internal id
-fn save_pq_codes(index: &Collection, dir: &dyn Dir, ledger: &mut SaveLedger) -> Result<(), Error> {
-    let width = index.quantization_code_bytes();
-    // The guards end with the frame, taken in the documented order, the id
-    // store, the dense index, then the codes, so the file is written with
-    // nothing held. The codes follow position order, which is increasing
-    // internal id and the order the store holds its records in, each under
-    // the internal id its record's node was inserted under.
-    let (codes_data, code_count) = {
-        let ids = index.ids();
-        let dense = index.dense_index();
-        let pq_codes = index.pq_codes();
-        if pq_codes.is_empty() {
-            return Ok(());
-        }
-        debug!(target: LOG_TARGET, "Saving pq_codes.bin...");
-        match dense.ids_by_position().reader() {
-            PositionReader::Shifted { extent } => {
-                codes_of(&ids, &pq_codes, width, |at| shifted_internal_id(extent, at))?
-            }
-            PositionReader::Read {
-                node_at,
-                origin_ids,
-            } => codes_of(&ids, &pq_codes, width, |at| {
-                read_internal_id(node_at, origin_ids, at)
-            })?,
-        }
-    };
-
-    write_framed(dir, "pq_codes.bin", &codes_data, ledger)?;
-
-    debug!(target: LOG_TARGET, "pq_codes.bin saved ({} vectors)", code_count);
-    Ok(())
-}
-
-/// Save raw vectors based on storage mode configuration
+/// Save the raw vectors a product quantized graph keeps beside its codes
 ///
 /// Every record's internal id and raw vector, read out of the store the graph
 /// is addressed against, in increasing internal id, straight into the frame.
 ///
-/// A trained `quantized_only` index writes none, as before, because it holds
-/// none.
+/// Written only by a trained product quantized graph under
+/// `quantized_with_raw`. Every other graph's rows are what it stores, which
+/// the graph dump holds.
 fn save_vectors(index: &Collection, dir: &dyn Dir, ledger: &mut SaveLedger) -> Result<(), Error> {
-    if !index.holds_raw_vectors() {
+    if !index.writes_raw_vectors() {
         return Ok(());
     }
     let dim = index.dim();
@@ -3661,33 +5663,35 @@ fn save_vectors(index: &Collection, dir: &dyn Dir, ledger: &mut SaveLedger) -> R
     Ok(())
 }
 
+/// What a manifest records that the save settles rather than reads from the
+/// collection.
+pub(crate) struct ManifestRecord<'a> {
+    /// The identity the save records, which carries the snapshot it drew.
+    pub(crate) identity: &'a crate::Identity,
+    /// The journal sequence the saved state holds.
+    pub(crate) sequence: u64,
+    /// When the manifest was written, RFC 3339.
+    pub(crate) saved_at: &'a str,
+    /// Whether the manifest names the collection's journal, which a save of
+    /// the collection's own directory does where it holds one and a backup's
+    /// copy never does.
+    pub(crate) names_journal: bool,
+}
+
 /// Write manifest.json, which is the last file a save writes
 ///
 /// It names every other artefact, records the length and digest of each, and
-/// records the directory size. All three are facts about files that are already
-/// on disk, which is why it is written last and why there is no second pass to
-/// correct any of them. It records `identity` too, which the save settled
-/// before its first artefact.
+/// records the directory size, being those lengths added. All three are facts
+/// about files that are already on disk, which is why it is written last and
+/// why there is no second pass to correct any of them. It records what
+/// `record` holds too, which the save settled.
 pub(crate) fn save_manifest(
     index: &Collection,
     dir: &dyn Dir,
     ledger: SaveLedger,
-    identity: &crate::Identity,
+    record: &ManifestRecord<'_>,
 ) -> Result<(), Error> {
     debug!(target: LOG_TARGET, "Saving manifest.json...");
-
-    // The manifest needs two facts about the stores rather than the stores
-    // themselves, so it takes those two facts and releases both guards here.
-    //
-    // This used to hold the `vectors` and `pq_codes` read guards for the whole
-    // function, and `get_storage_mode` below takes the graph's read guard. The
-    // documented order is `hnsw < vectors < pq_codes`, so that acquired the
-    // three in exactly the wrong order. It could not deadlock, because a save
-    // holds the mutation lock and every path that takes the graph's write guard
-    // holds it too, so no counterparty could be in flight. That is the same
-    // reasoning that failed the three inversions found before this one.
-    let has_raw_vectors = index.holds_raw_vectors() && index.vector_count() > 0;
-    let code_count = index.pq_codes().len();
 
     // Determine what files are included based on what we actually saved
     let mut files_included = vec![
@@ -3706,20 +5710,14 @@ pub(crate) fn save_manifest(
         if index.can_use_quantization() {
             if int8 {
                 files_included.push(INT8_SCALES_FILENAME.to_string());
-                if index.vector_count() > 0 {
-                    files_included.push(INT8_ROWS_FILENAME.to_string());
-                }
             } else {
                 files_included.push("pq_centroids.bin".to_string());
-                if code_count > 0 {
-                    files_included.push("pq_codes.bin".to_string());
-                }
             }
         }
     }
 
     // Add vectors.bin if it was saved
-    if has_raw_vectors {
+    if ledger.recorded_bytes("vectors.bin").is_some() {
         files_included.push("vectors.bin".to_string());
     } else {
         files_excluded.push("vectors.bin".to_string());
@@ -3747,68 +5745,37 @@ pub(crate) fn save_manifest(
         debug!(target: LOG_TARGET, "No graph file (empty index)");
     }
 
-    // Calculate compression info for quantized indexes
-    //
-    // Both sizes are taken over the coded records, so the ratio is the size of
-    // a code against the size of the vector it stands for. `original_size_mb`
-    // used to count the raw vectors the index still holds, which under
-    // quantized_only is only the training records. That put a record count in
-    // the numerator and a different one in the denominator, and the ratio came
-    // out as the compression ratio scaled by the share of records collected
-    // before training. At 1,000 training records in 3,000 it read 10.7x where
-    // the codes are 32x smaller than the vectors. Under quantized_with_raw the
-    // two counts were already equal, so this changes nothing there.
-    // A scalar index holds one row a live record, so the coded count is the
-    // live count once it is trained.
-    let code_count = if int8 && index.can_use_quantization() {
-        vector_count
-    } else {
-        code_count
-    };
-    let compression_info =
-        if index.has_quantization() && index.can_use_quantization() && code_count > 0 {
-            let raw_size_mb = (code_count * index.dim() * 4) as f64 / (1024.0 * 1024.0);
-            let compressed_size_mb =
-                (code_count * index.quantization_code_bytes()) as f64 / (1024.0 * 1024.0);
-            let compression_ratio = if compressed_size_mb > 0.0 {
-                raw_size_mb / compressed_size_mb
-            } else {
-                1.0
-            };
+    // Every artefact the ledger recorded, the graph dump included, because
+    // they are all on disk by the time this runs. manifest.json itself is
+    // not, so the figure counts the directory without it.
+    let total_size_mb = ledger
+        .digests
+        .values()
+        .fold(0u64, |total, digest| total.saturating_add(digest.bytes))
+        as f64
+        / MEBIBYTE;
 
-            Some(CompressionInfo {
-                original_size_mb: raw_size_mb,
-                compressed_size_mb,
-                compression_ratio,
-            })
-        } else {
-            None
-        };
-
-    // Every artefact, the graph dump included, because they are all on disk by
-    // the time this runs. manifest.json itself is not, so the figure counts the
-    // directory without it, which the field's own comment states.
-    let total_size_mb = calculate_directory_size(dir).unwrap_or(0.0);
-
-    // The journal, where the collection holds one. Its two names come from
-    // the sink itself and the sequence from the collection, which the
-    // checkpoint wrote there after it synced, so all three describe the
-    // records the directory being written already holds.
+    // The journal, where the collection holds one and the directory is its
+    // own. Its two names come from the sink itself and the sequence from the
+    // save, which a checkpoint took from the collection after it synced, so
+    // all three describe the records the directory being written already
+    // holds.
     let journal = index
         .sink_journal_names()
+        .filter(|_| record.names_journal)
         .map(|(file, collection_id)| JournalManifest {
             file,
-            sequence: index.journal_sequence(),
+            sequence: record.sequence,
             collection_id: crate::journal::id_hex(collection_id),
         });
 
     // What the directory holds, each by the condition the part's own writer
-    // tests: the identity this function records, the journal record above,
-    // quantization.json in the layout its writer chooses, and the space
-    // config.json declares.
+    // tests: the journal record above, quantization.json in the layout its
+    // writer chooses, and the space config.json declares. The identity is
+    // part of the base at 5.x and is not listed.
     let space = index.sparse_named().map(|(_, space)| space);
     let held = features::Held {
-        identity: true,
+        identity: false,
         int8: index.has_quantization() && int8,
         journal: journal.is_some(),
         pq: index.has_quantization() && !int8,
@@ -3819,10 +5786,10 @@ pub(crate) fn save_manifest(
     let manifest = IndexManifest {
         format_version: FORMAT_VERSION.to_string(),
         features: Some(held.record()),
-        identity: Some(IdentityManifest::of(identity)),
+        identity: Some(IdentityManifest::of(record.identity, record.sequence)),
         zeusdb_version: env!("CARGO_PKG_VERSION").to_string(),
         created_at: index.created_at(),
-        saved_at: Utc::now().to_rfc3339(),
+        saved_at: record.saved_at.to_string(),
         total_vectors: vector_count,
         index_type: "HNSW".to_string(),
         has_quantization: index.has_quantization(),
@@ -3832,7 +5799,6 @@ pub(crate) fn save_manifest(
         files_excluded,
         file_digests: ledger.digests,
         total_size_mb,
-        compression_info,
         journal,
     };
 
@@ -3850,16 +5816,6 @@ pub(crate) fn save_manifest(
 
     debug!(target: LOG_TARGET, "manifest.json saved");
     Ok(())
-}
-
-// ============================================================================
-// HELPER FUNCTIONS
-// ============================================================================
-
-/// Calculate the total size of a directory in MB, the artefacts under
-/// `spaces/` included.
-fn calculate_directory_size(dir: &dyn Dir) -> Result<f64, std::io::Error> {
-    Ok(dir.total_bytes()? as f64 / (1024.0 * 1024.0))
 }
 
 // ============================================================================
@@ -3886,5 +5842,9 @@ pub(crate) fn get_index_info(_path: &str) -> Option<IndexManifest> {
     None
 }
 
+#[cfg(test)]
+mod fuzz_tests;
+#[cfg(test)]
+pub(crate) mod memory;
 #[cfg(test)]
 mod tests;

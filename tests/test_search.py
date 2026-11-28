@@ -6,6 +6,7 @@ import pytest
 import struct
 
 import numpy as np
+from helpers import artefact_digest, layouts, vector_layouts
 from zeusdb_vector_database import VectorDatabase
 
 # ------------------------------------------------------------
@@ -601,13 +602,12 @@ def test_search_single_query_wrong_dimension():
 def test_search_empty_list_query():
     index = build_validation_index()
 
-    # Current behaviour, asserted rather than expected. An empty list extracts
-    # as an empty batch before the single vector path is reached, so a caller
-    # who passed one empty query vector is told the batch is empty. The
-    # expectation this violates is that the message describes what was passed,
-    # which here would be an empty search vector.
-    with pytest.raises(ValueError, match="Batch cannot be empty"):
-        index.search([])
+    # An empty list, an empty tuple and an empty one dimensional array are
+    # each one empty query, and the message says so. A two dimensional array
+    # with no rows is the empty batch of test 64.
+    for empty in ([], (), np.array([], dtype=np.float32), np.array([], dtype=np.float64)):
+        with pytest.raises(ValueError, match="^Search vector cannot be empty$"):
+            index.search(empty)
 
 # ------------------------------------------------------------
 # Test 63: None as a query
@@ -639,15 +639,11 @@ def test_search_none_query():
 def test_search_empty_batch():
     index = build_validation_index()
 
-    # A batch with no queries in it is the same object as the empty single
-    # query of test 62, and the two are indistinguishable to the index.
-    empty_batch = []
-    with pytest.raises(ValueError, match="Batch cannot be empty"):
-        index.search(empty_batch)
-
-    # A NumPy array with no rows is rejected the same way.
-    with pytest.raises(ValueError, match="Batch cannot be empty"):
-        index.search(np.zeros((0, 4), dtype=np.float32))
+    # A batch with no queries in it is a two dimensional array with no rows,
+    # of any dtype. An empty list is the empty query of test 62.
+    for dtype in (np.float32, np.float64, np.int64):
+        with pytest.raises(ValueError, match="^Batch cannot be empty$"):
+            index.search(np.zeros((0, 4), dtype=dtype))
 
 # ------------------------------------------------------------
 # Test 65: A batch containing an empty vector
@@ -689,8 +685,7 @@ def test_search_non_finite_query_values():
 
     # The batch path applies the same value check, and the message names the
     # entry in the batch as well as the component within it. Without the check
-    # the vector is normalized to itself, because the norm of a vector
-    # containing NaN is not greater than zero, and the search returns hits
+    # the NaN would reach the traversal, and the search would return hits
     # whose scores carry no distance information.
     with pytest.raises(
         ValueError, match=r"Vector 0 in batch contains invalid value at index 0: NaN"
@@ -911,7 +906,7 @@ def test_dot_is_accepted_and_reported_the_way_the_other_three_are():
 
 
 def test_an_unsupported_space_names_dot_among_the_four():
-    with pytest.raises(RuntimeError, match=r"'cosine', 'l2', 'l1', 'dot'"):
+    with pytest.raises(ValueError, match=r"'cosine', 'l2', 'l1', 'dot'"):
         VectorDatabase().create("hnsw", dim=4, space="inner_product")
 
 
@@ -1001,12 +996,32 @@ def test_dot_cannot_be_quantized():
     every vector is a unit vector. For an inner product it does not, because the
     stored vector's own length enters the L2 and not the inner product.
     """
-    with pytest.raises(RuntimeError, match=r"space='dot' cannot be product quantized"):
+    with pytest.raises(ValueError, match=r"space='dot' cannot be product quantized"):
         VectorDatabase().create(
             "hnsw", dim=16, space="dot", expected_size=20000,
             quantization_config={"type": "pq", "subvectors": 4, "bits": 8,
                                  "training_size": 1000},
         )
+
+
+def _claim_quantization(path):
+    """Write a product quantized quantization.json into the saved directory at
+    `path`, and record it in the manifest as a save holding one records it."""
+    data = json.dumps({
+        "type": "pq", "subvectors": 4, "bits": 8, "training_size": 1000,
+        "max_training_vectors": None, "storage_mode": "quantized_only",
+        "is_trained": False, "training_completed_at": None, "memory_stats": None,
+        "pq_config": {"dim": 16, "sub_dim": 4, "num_centroids": 256},
+    }).encode("utf-8")
+    (path / "quantization.json").write_bytes(data)
+    manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
+    manifest["files_included"].append("quantization.json")
+    manifest["file_digests"]["quantization.json"] = {"bytes": len(data),
+                                                     "checksum": artefact_digest(data)}
+    manifest["has_quantization"] = True
+    manifest["total_size_mb"] = sum(
+        entry["bytes"] for entry in manifest["file_digests"].values()) / (1024 * 1024)
+    (path / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
 
 def test_a_hand_assembled_dot_directory_claiming_quantization_is_refused(tmp_path):
@@ -1015,16 +1030,7 @@ def test_a_hand_assembled_dot_directory_claiming_quantization_is_refused(tmp_pat
     index = _dot_index(corpus)
     path = tmp_path / "forged.zdb"
     index.save(str(path))
-
-    manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
-    manifest["files_included"].append("quantization.json")
-    (path / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    (path / "quantization.json").write_text(json.dumps({
-        "type": "pq", "subvectors": 4, "bits": 8, "training_size": 1000,
-        "max_training_vectors": None, "storage_mode": "quantized_only",
-        "is_trained": False, "training_completed_at": None, "memory_stats": None,
-        "pq_config": {"dim": 16, "sub_dim": 4, "num_centroids": 256},
-    }), encoding="utf-8")
+    _claim_quantization(path)
 
     with pytest.raises(ValueError, match=r"space='dot' cannot be product quantized"):
         VectorDatabase().load(str(path))
@@ -1044,7 +1050,7 @@ def test_l1_cannot_be_quantized():
     the pair stays refused. `validate_space_supports_quantization` records the
     figures.
     """
-    with pytest.raises(RuntimeError, match=r"space='l1' cannot be product quantized"):
+    with pytest.raises(ValueError, match=r"space='l1' cannot be product quantized"):
         VectorDatabase().create(
             "hnsw", dim=16, space="l1", expected_size=20000,
             quantization_config={"type": "pq", "subvectors": 4, "bits": 8,
@@ -1065,16 +1071,7 @@ def test_a_hand_assembled_l1_directory_claiming_quantization_is_refused(tmp_path
                "vectors": corpus.tolist()})
     path = tmp_path / "forged.zdb"
     index.save(str(path))
-
-    manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
-    manifest["files_included"].append("quantization.json")
-    (path / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    (path / "quantization.json").write_text(json.dumps({
-        "type": "pq", "subvectors": 4, "bits": 8, "training_size": 1000,
-        "max_training_vectors": None, "storage_mode": "quantized_only",
-        "is_trained": False, "training_completed_at": None, "memory_stats": None,
-        "pq_config": {"dim": 16, "sub_dim": 4, "num_centroids": 256},
-    }), encoding="utf-8")
+    _claim_quantization(path)
 
     with pytest.raises(ValueError, match=r"space='l1' cannot be product quantized"):
         VectorDatabase().load(str(path))
@@ -1251,3 +1248,220 @@ def test_a_hit_carries_the_metadata_its_record_was_added_with(quantization):
         hit["metadata"]["added"] = 1
     for hit in index.search(queries[0], top_k=10):
         assert _same(hit["metadata"], expected[hit["id"]])
+
+
+# ------------------------------------------------------------
+# A search through removed records' stranded nodes
+# ------------------------------------------------------------
+def test_a_search_through_removed_records_returns_the_live_records_nearest_the_query():
+    """Removals leave twenty live records among a thousand nodes, one in
+    each of twenty clusters. A search for a live record's own vector returns
+    ten live records at the default width and at a wider one, and the page
+    is the one the exact scan gives under a filter admitting exactly the
+    live records, ids and scores both. A batch and a query's dense arm
+    return the same pages."""
+    rng = np.random.default_rng(223)
+    centres = rng.standard_normal((50, 8)).astype(np.float32)
+    noise = rng.standard_normal((1000, 8)).astype(np.float32)
+    vectors = (centres[np.arange(1000) % 50] + np.float32(0.15) * noise).astype(np.float32)
+    ids = [f"r{i:04d}" for i in range(1000)]
+    live = [i for i in range(1000) if i % 51 == 2]
+    index = VectorDatabase().create(
+        "hnsw", dim=8, space="l2", m=8, ef_construction=60, expected_size=4000,
+        indexed_fields=["keep"],
+    )
+    added = index.add({
+        "ids": ids,
+        "embeddings": vectors,
+        "metadatas": [{"keep": "y" if i % 51 == 2 else "n"} for i in range(1000)],
+    })
+    assert added.is_success()
+    assert index.remove_points([ids[i] for i in range(1000) if i % 51 != 2]) == []
+    assert len(index) == len(live) == 20
+
+    def page(hits):
+        return [(hit["id"], hit["score"]) for hit in hits]
+
+    queries = [vectors[i] for i in live]
+    for ef_search in (None, 400):
+        exact = [page(index.search(q, top_k=10, filter={"keep": "y"})) for q in queries]
+        assert all(len(p) == 10 for p in exact)
+        single = [page(index.search(q, top_k=10, ef_search=ef_search)) for q in queries]
+        assert single == exact, ef_search
+        batch = [page(hits) for hits in index.search(np.stack(queries), top_k=10, ef_search=ef_search)]
+        assert batch == exact, ef_search
+        arm = {"vector": None} if ef_search is None else {"vector": None, "ef_search": ef_search}
+        arms = [[{**arm, "vector": q}] for q in queries]
+        queried = [page(index.query(a, top_k=10)) for a in arms]
+        assert queried == exact, ef_search
+
+
+# ------------------------------------------------------------
+# A query past the bound on a vector's norm
+# ------------------------------------------------------------
+# 2^62 as a float32, the largest norm an index under l2, dot or l1 searches
+# for, and the next float32 above it.
+AT_BOUND = float(np.float32(2.0 ** 62))
+PAST_BOUND = float(np.nextafter(np.float32(2.0 ** 62), np.float32(np.inf)))
+
+
+def past_bound_words(norm):
+    """What a refusal says of a norm past the bound after it names the
+    vector, with the norm as the engine prints it."""
+    return (f"has a Euclidean norm of {repr(float(norm)).replace('e+', 'e')} "
+            f"(must be at most 2^62, 4.611686018427388e18, under l2, dot or l1)")
+
+
+@pytest.mark.parametrize("space", ["l2", "dot", "l1"])
+def test_search_refuses_a_query_past_the_bound_on_its_norm(space):
+    """Under l2, dot and l1, search() refuses a query whose Euclidean norm
+    passes 2^62 with ValueError naming the norm and the bound, alone, in a
+    batch and as the dense arm of query(), and searches a query at the bound
+    with finite scores."""
+    index = VectorDatabase().create("hnsw", dim=4, space=space, expected_size=20)
+    added = index.add({"ids": [f"r{i}" for i in range(8)],
+                       "embeddings": np.arange(32, dtype=np.float32).reshape(8, 4)})
+    assert added.is_success(), added.errors
+    at = [AT_BOUND, 0.0, 0.0, 0.0]
+    past = [0.0, 0.0, -PAST_BOUND, 0.0]
+    words = past_bound_words(PAST_BOUND)
+
+    hits = index.search(at, top_k=3)
+    assert len(hits) == 3 and all(np.isfinite(hit["score"]) for hit in hits)
+    with pytest.raises(ValueError) as refusal:
+        index.search(past, top_k=3)
+    assert str(refusal.value) == f"Search vector {words}"
+    with pytest.raises(ValueError) as refusal:
+        index.search(np.array(past, dtype=np.float32), top_k=3)
+    assert str(refusal.value) == f"Search vector {words}"
+    for batch in ([at, past], [at] * 6 + [past]):
+        with pytest.raises(ValueError) as refusal:
+            index.search(batch, top_k=3)
+        assert str(refusal.value) == f"Vector {len(batch) - 1} in batch {words}"
+    with pytest.raises(ValueError) as refusal:
+        index.query(arms=[{"vector": past}], top_k=3)
+    assert f"Search vector {words}" in str(refusal.value)
+
+
+def test_a_cosine_query_past_the_bound_is_normalized_and_searched():
+    """Under cosine no query is held to the bound, and a query whose squares
+    overflow a float32 is normalized to unit length and finds the records the
+    same query scaled down finds, in the same order."""
+    index = VectorDatabase().create("hnsw", dim=4, space="cosine", expected_size=20)
+    rng = np.random.default_rng(2249)
+    vectors = rng.standard_normal((16, 4)).astype(np.float32)
+    assert index.add({"ids": [f"r{i}" for i in range(16)], "embeddings": vectors}).is_success()
+    direction = vectors[5] / np.linalg.norm(vectors[5])
+    huge = (direction.astype(np.float64) * 3.0e38).astype(np.float32)
+    plain = index.search(direction.tolist(), top_k=3)
+    scaled = index.search(huge.tolist(), top_k=3)
+    assert scaled[0]["id"] == "r5" == plain[0]["id"]
+    assert [hit["id"] for hit in scaled] == [hit["id"] for hit in plain]
+    assert all(np.isfinite(hit["score"]) for hit in scaled)
+
+
+# ------------------------------------------------------------
+# An unfiltered search wider than the index, with a node stranded
+# ------------------------------------------------------------
+def test_an_unfiltered_arm_wider_than_the_index_is_priced_as_a_scan():
+    """With a node stranded, a search whose traversal runs at the larger of
+    ef_search and top_k, above the record count, scans every record, so
+    explain() prices its arm as exact, at the default width and with an
+    ef_search below the record count alike."""
+    rng = np.random.default_rng(15)
+    index = VectorDatabase().create("hnsw", dim=3, space="l2", expected_size=50)
+    assert index.add({"ids": [f"r{i}" for i in range(15)],
+                      "embeddings": rng.standard_normal((15, 3)).astype(np.float32)}).is_success()
+    assert index.remove_point("r0")
+    for arm in ({"vector": [0.1, 0.2, 0.3]}, {"vector": [0.1, 0.2, 0.3], "ef_search": 5}):
+        plan = index.explain([arm], top_k=20)
+        assert plan["arms"][0]["exact"] is True, (arm, plan)
+
+
+# ------------------------------------------------------------
+# A query batch is read by rows whatever its layout
+# ------------------------------------------------------------
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_a_query_batch_is_read_by_rows_whatever_its_layout(dtype):
+    """A two dimensional query batch is its rows, as NumPy defines them,
+    whether it is C-ordered, Fortran-ordered or strided."""
+    rows = np.arange(12, dtype=np.float32).reshape(3, 4) + 1
+    index = VectorDatabase().create("hnsw", dim=4, space="l2", expected_size=10)
+    assert index.add({"ids": ["a", "b", "c"], "embeddings": rows}).is_success()
+    for name, batch in layouts(rows.astype(dtype)).items():
+        pages = index.search(batch, top_k=1)
+        assert [page[0]["id"] for page in pages] == ["a", "b", "c"], name
+        assert [page[0]["score"] for page in pages] == [0.0, 0.0, 0.0], name
+
+
+# ------------------------------------------------------------
+# A one dimensional query is read by its values whatever its layout
+# ------------------------------------------------------------
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_a_one_dimensional_query_is_read_by_its_values_whatever_its_layout(dtype):
+    """search() reads a one dimensional query as NumPy defines its values,
+    whether it is a column, a reversed view or a stepped view, and finds
+    what the same values as a list find."""
+    rows = np.arange(12, dtype=np.float32).reshape(3, 4) + 1
+    index = VectorDatabase().create("hnsw", dim=4, space="l2", expected_size=10)
+    assert index.add({"ids": ["a", "b", "c"], "embeddings": rows}).is_success()
+    for name, query in vector_layouts(rows[1].astype(dtype)).items():
+        page = index.search(query, top_k=1)
+        assert [(hit["id"], hit["score"]) for hit in page] == [("b", 0.0)], name
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_a_one_dimensional_dense_arm_is_read_by_its_values_whatever_its_layout(dtype):
+    """query() and explain() read a dense arm's one dimensional array as
+    NumPy defines its values, whether it is a column, a reversed view or a
+    stepped view, and query() finds what the same values as a list find."""
+    rows = np.arange(12, dtype=np.float32).reshape(3, 4) + 1
+    index = VectorDatabase().create("hnsw", dim=4, space="l2", expected_size=10)
+    assert index.add({"ids": ["a", "b", "c"], "embeddings": rows}).is_success()
+    listed = index.query(arms=[{"vector": rows[1].tolist()}], top_k=1)
+    for name, vector in vector_layouts(rows[1].astype(dtype)).items():
+        assert index.query(arms=[{"vector": vector}], top_k=1) == listed, name
+        assert index.explain([{"vector": vector}], top_k=1)["arms"], name
+
+
+# ------------------------------------------------------------
+# explain() prices a dense arm at its own ef_search
+# ------------------------------------------------------------
+def test_explain_prices_a_dense_arm_at_its_own_ef_search():
+    """A dense arm's traversal runs at the larger of its ef_search and its
+    fetch, so the price explain() gives it rises with its ef_search."""
+    rng = np.random.default_rng(1)
+    index = VectorDatabase().create("hnsw", dim=4, space="l2", expected_size=2000)
+    index.add({"ids": [str(i) for i in range(2000)],
+               "embeddings": rng.random((2000, 4), dtype=np.float32)})
+
+    def price(**arm):
+        return index.explain([{"vector": [0.1] * 4, **arm}])["arms"][0]["cost_ns"]
+
+    assert price(ef_search=1000) > price()
+
+
+# ------------------------------------------------------------
+# A finite value past what a float32 holds, in a query
+# ------------------------------------------------------------
+def test_search_query_and_explain_name_a_value_past_the_float32_range_as_given():
+    """search(), query() and explain() refuse a query holding a finite value
+    past what a float32 holds with ValueError, naming it as given, from a
+    list or a float64 array, alone or in a batch."""
+    index = VectorDatabase().create("hnsw", dim=2, expected_size=10)
+    index.add({"ids": ["a", "b"], "vectors": [[0.1, 0.2], [0.3, 0.4]]})
+    one = "Search vector contains invalid value at index 0: 1e39, which a float32 holds as inf"
+    batch = ("Vector 0 in batch contains invalid value at index 0: 1e39, which a float32 holds "
+             "as inf (must be finite)")
+    calls = {
+        "search, a list": (lambda: index.search([1e39, 0.0], top_k=1), one),
+        "search, a float64 array": (lambda: index.search(np.array([1e39, 0.0]), top_k=1), one),
+        "search, a batch list": (lambda: index.search([[1e39, 0.0]], top_k=1), batch),
+        "search, a float64 batch": (lambda: index.search(np.array([[1e39, 0.0]]), top_k=1), batch),
+        "query": (lambda: index.query(arms=[{"vector": [1e39, 0.0]}]), one),
+        "explain": (lambda: index.explain(arms=[{"vector": [1e39, 0.0]}]), one),
+    }
+    for name, (call, words) in calls.items():
+        with pytest.raises(ValueError) as refusal:
+            call()
+        assert str(refusal.value) == words, (name, str(refusal.value))

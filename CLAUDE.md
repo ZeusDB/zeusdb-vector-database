@@ -34,11 +34,20 @@ Run from the repository root:
 
     cargo fmt --all -- --check
     cargo clippy --workspace --all-targets --locked -- -D warnings
+    cargo clippy --workspace --all-targets --locked --features zeusdb-vector-python/test-support -- -D warnings
     cargo test --workspace --locked --no-default-features
     cargo deny --locked check
-    pytest tests
+    maturin develop --release --locked
+    pytest tests --ignore=tests/test_interpreter.py --ignore=tests/test_overlap.py
+    maturin develop --release --locked --features test-support
+    pytest tests/test_interpreter.py tests/test_overlap.py
 
 Exactly one `clippy.toml` and one `deny.toml` exist, both at the root. A copy
 in a crate directory replaces the root file for that crate without a warning.
+
+The suite runs on the release build without `tests/test_interpreter.py` and
+`tests/test_overlap.py`, and those two modules run alone on the release build
+with the binding's `test-support` feature, which compiles the pauses their
+checks arm.
 
 Every cargo step passes `--locked`.

@@ -1,10 +1,11 @@
 //! The features a saved directory lists, and what a load does with them.
 //!
 //! What every kind of save lists, a feature this build does not know refused
-//! by its name unless the directory marks it compatible, one marked
-//! compatible opened and not kept, a record that does not describe its
-//! directory refused, what a directory below 4.0.0 or one saved before the
-//! record existed does, and the words of both refusals.
+//! by its name unless the directory marks it compatible or read_only, one
+//! marked compatible opened and not kept, one marked read_only opened read
+//! only, a record that does not describe its directory refused, what a
+//! directory below 4.0.0 or one saved before the record existed does, and the
+//! words of the refusals.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -15,7 +16,10 @@ use zeusdb_vector_core::{test_support::clustered, Error, SparseVector};
 use zeusdb_vector_sparse::SparseConfig;
 use zeusdb_vector_text::SimpleTokenizer;
 
+use super::journal_support::files_under;
 use super::{Collection, Declaration, Int8Scale, ParsedRecord, SparseHalf, StorageMode};
+use crate::journal::JournalPolicy;
+use crate::persistence::older::rewrite_before_five;
 use crate::Durability;
 
 // ============================================================================
@@ -209,41 +213,29 @@ fn ids(collection: &Collection) -> Vec<String> {
 fn every_save_lists_exactly_the_features_it_holds() {
     let temp = TempDir::new();
     let cases: Vec<(&str, Collection, Value)> = vec![
-        ("dense", dense(40), json!({"identity": "compatible"})),
+        ("dense", dense(40), json!({})),
         (
             "pq-raw",
             pq(StorageMode::QuantizedWithRaw, 1100),
-            json!({"identity": "compatible", "pq": "incompatible"}),
+            json!({"pq": "incompatible"}),
         ),
         (
             "pq-only",
             pq(StorageMode::QuantizedOnly, 1100),
-            json!({"identity": "compatible", "pq": "incompatible"}),
+            json!({"pq": "incompatible"}),
         ),
         (
             "pq-collecting",
             pq(StorageMode::QuantizedOnly, 40),
-            json!({"identity": "compatible", "pq": "incompatible"}),
+            json!({"pq": "incompatible"}),
         ),
-        (
-            "int8",
-            int8(1100),
-            json!({"identity": "compatible", "int8": "incompatible"}),
-        ),
-        (
-            "int8-collecting",
-            int8(40),
-            json!({"identity": "compatible", "int8": "incompatible"}),
-        ),
-        (
-            "sparse",
-            sparse(40),
-            json!({"identity": "compatible", "sparse": "incompatible"}),
-        ),
+        ("int8", int8(1100), json!({"int8": "incompatible"})),
+        ("int8-collecting", int8(40), json!({"int8": "incompatible"})),
+        ("sparse", sparse(40), json!({"sparse": "incompatible"})),
         (
             "text",
             text(40),
-            json!({"identity": "compatible", "sparse": "incompatible", "text": "incompatible"}),
+            json!({"sparse": "incompatible", "text": "incompatible"}),
         ),
     ];
     for (name, collection, expected) in cases {
@@ -266,7 +258,7 @@ fn every_save_lists_exactly_the_features_it_holds() {
         .unwrap();
     assert_eq!(
         manifest(&journaled)["features"],
-        json!({"identity": "compatible", "journal": "incompatible"})
+        json!({"journal": "incompatible"})
     );
     drop(collection);
     assert_eq!(load(&journaled).unwrap().len(), 30);
@@ -279,7 +271,6 @@ fn every_save_lists_exactly_the_features_it_holds() {
     assert_eq!(
         manifest(&both)["features"],
         json!({
-            "identity": "compatible",
             "journal": "incompatible",
             "sparse": "incompatible",
             "text": "incompatible"
@@ -311,7 +302,7 @@ fn the_features_follow_the_collection_and_are_byte_stable() {
     save(&collection, &cleared);
     assert_eq!(
         manifest(&cleared)["features"],
-        json!({"identity": "compatible", "sparse": "incompatible", "text": "incompatible"})
+        json!({"sparse": "incompatible", "text": "incompatible"})
     );
     assert_eq!(load(&cleared).unwrap().len(), 0);
 }
@@ -321,14 +312,14 @@ fn the_features_follow_the_collection_and_are_byte_stable() {
 // ============================================================================
 
 /// A feature this build does not know is refused by its name unless the
-/// directory marks it compatible, whatever else the mark says, and every
-/// such feature is named, in name order.
+/// directory marks it compatible or read_only, whatever else the mark says,
+/// and every such feature is named, in name order.
 #[test]
 fn a_feature_this_build_does_not_know_is_refused_by_name() {
     let temp = TempDir::new();
     let source = temp.at("source.zdb");
     save(&dense(20), &source);
-    for (i, mark) in ["incompatible", "read_only", ""].iter().enumerate() {
+    for (i, mark) in ["incompatible", "", "Read_only"].iter().enumerate() {
         let path = forged(&temp, &source, &format!("later-{i}.zdb"), |m| {
             m["features"]["a_later_feature"] = json!(mark);
         });
@@ -391,10 +382,7 @@ fn a_compatible_feature_this_build_does_not_know_opens_and_is_not_kept() {
     assert!(opened.is_quantized());
     let again = temp.at("again.zdb");
     save(&opened, &again);
-    assert_eq!(
-        manifest(&again)["features"],
-        json!({"identity": "compatible", "pq": "incompatible"})
-    );
+    assert_eq!(manifest(&again)["features"], json!({"pq": "incompatible"}));
 }
 
 // ============================================================================
@@ -437,31 +425,27 @@ fn the_listed_features_are_the_held_ones() {
 
     let plain = temp.at("plain.zdb");
     save(&dense(20), &plain);
+    // The identity is part of the base at 5.x, so a record listing it
+    // describes no directory a save writes.
+    let path = forged(&temp, &plain, "with-identity.zdb", |m| {
+        m["features"]["identity"] = json!("compatible");
+    });
     assert_eq!(
-        invalid(load(&drop_feature(&plain, "no-identity.zdb", "identity"))),
-        "it lists no feature, and the directory holds identity"
+        invalid(load(&path)),
+        "it lists identity, and the directory holds no feature"
     );
     for (feature, expected) in [
-        (
-            "int8",
-            "it lists identity and int8, and the directory holds identity",
-        ),
+        ("int8", "it lists int8, and the directory holds no feature"),
         (
             "journal",
-            "it lists identity and journal, and the directory holds identity",
+            "it lists journal, and the directory holds no feature",
         ),
-        (
-            "pq",
-            "it lists identity and pq, and the directory holds identity",
-        ),
+        ("pq", "it lists pq, and the directory holds no feature"),
         (
             "sparse",
-            "it lists identity and sparse, and the directory holds identity",
+            "it lists sparse, and the directory holds no feature",
         ),
-        (
-            "text",
-            "it lists identity and text, and the directory holds identity",
-        ),
+        ("text", "it lists text, and the directory holds no feature"),
     ] {
         let path = add_feature(&plain, &format!("with-{feature}.zdb"), feature);
         assert_eq!(invalid(load(&path)), expected, "{feature}");
@@ -471,23 +455,23 @@ fn the_listed_features_are_the_held_ones() {
     save(&pq(StorageMode::QuantizedOnly, 1100), &quantized);
     assert_eq!(
         invalid(load(&drop_feature(&quantized, "no-pq.zdb", "pq"))),
-        "it lists identity, and the directory holds identity and pq"
+        "it lists no feature, and the directory holds pq"
     );
     let scalar = temp.at("int8.zdb");
     save(&int8(1100), &scalar);
     assert_eq!(
         invalid(load(&drop_feature(&scalar, "no-int8.zdb", "int8"))),
-        "it lists identity, and the directory holds identity and int8"
+        "it lists no feature, and the directory holds int8"
     );
     let words = temp.at("text.zdb");
     save(&text(30), &words);
     assert_eq!(
         invalid(load(&drop_feature(&words, "no-text.zdb", "text"))),
-        "it lists identity and sparse, and the directory holds identity, sparse and text"
+        "it lists sparse, and the directory holds sparse and text"
     );
     assert_eq!(
         invalid(load(&drop_feature(&words, "no-sparse.zdb", "sparse"))),
-        "it lists identity and text, and the directory holds identity, sparse and text"
+        "it lists text, and the directory holds sparse and text"
     );
 
     let journaled = temp.at("journaled.zdb");
@@ -499,18 +483,34 @@ fn the_listed_features_are_the_held_ones() {
     let unlisted = drop_feature(&journaled, "no-journal.zdb", "journal");
     assert_eq!(
         invalid(load(&unlisted)),
-        "it lists identity, and the directory holds identity and journal"
+        "it lists no feature, and the directory holds journal"
     );
     // The journal record is the manifest's, so the checkpoint alone is
     // refused too.
     match Collection::load_checkpoint_only(unlisted.to_str().unwrap(), None) {
         Err(Error::FeaturesInvalid { detail, .. }) => assert_eq!(
             detail,
-            "it lists identity, and the directory holds identity and journal"
+            "it lists no feature, and the directory holds journal"
         ),
         Err(other) => panic!("expected the features refused, got {other}"),
         Ok(_) => panic!("expected the features refused, and the checkpoint opened"),
     }
+
+    // At 4.x the identity is listed where it is recorded.
+    let fourth = temp.at("fourth.zdb");
+    copy_dir(&plain, &fourth);
+    rewrite_before_five(&fourth, "4.0.0");
+    rewrite_manifest(&fourth, |m| {
+        m["features"].as_object_mut().unwrap().remove("identity");
+    });
+    assert_eq!(
+        invalid(load(&fourth)),
+        "it lists no feature, and the directory holds identity"
+    );
+    rewrite_manifest(&fourth, |m| {
+        m["features"]["identity"] = json!("compatible");
+    });
+    assert_eq!(load(&fourth).unwrap().len(), 20);
 }
 
 // ============================================================================
@@ -518,7 +518,8 @@ fn the_listed_features_are_the_held_ones() {
 // ============================================================================
 
 /// A 4.0.0 directory saved before the record existed lists no features and
-/// opens as it did, and its next save lists them.
+/// opens as it did, and its next save lists them. At 5.x a manifest that
+/// lists none is refused, which `journal_tests` holds.
 #[test]
 fn a_directory_listing_no_features_opens_and_lists_them_at_its_next_save() {
     let temp = TempDir::new();
@@ -526,6 +527,7 @@ fn a_directory_listing_no_features_opens_and_lists_them_at_its_next_save() {
         let path = temp.at(&format!("{name}.zdb"));
         save(&collection, &path);
         let expected = manifest(&path)["features"].clone();
+        rewrite_before_five(&path, "4.0.0");
         rewrite_manifest(&path, |m| {
             m.as_object_mut().unwrap().remove("features");
         });
@@ -545,6 +547,7 @@ fn below_the_fourth_major_the_version_decides() {
     let temp = TempDir::new();
     let source = temp.at("source.zdb");
     save(&dense(20), &source);
+    rewrite_before_five(&source, "3.0.0");
     let path = forged(&temp, &source, "third.zdb", |m| {
         m["format_version"] = json!("3.0.0");
         m["features"]["journal"] = json!("incompatible");
@@ -605,8 +608,355 @@ fn the_words_of_both_refusals() {
     assert_eq!(
         message(&listed),
         "manifest.json lists features that do not describe the directory: it lists \
-         identity and journal, and the directory holds identity. A saved directory lists \
-         every feature it holds and no other, and this build marks identity compatible and \
-         int8, journal, pq, sparse and text incompatible."
+         journal, and the directory holds no feature. A saved directory lists every feature \
+         it holds and no other, and this build marks identity compatible and int8, journal, \
+         pq, sparse and text incompatible."
     );
+}
+
+// ============================================================================
+// A FEATURE MARKED READ_ONLY
+// ============================================================================
+
+/// The reason a load read only by the feature `probe` gives.
+const PROBE_REASON: &str =
+    "it holds the feature 'probe', which this build does not know and its manifest marks read_only";
+
+/// Every change, every save, a checkpoint, a journal and a backup refused
+/// with `FeatureReadOnly`, naming the directory and the feature, and the
+/// records held as they were.
+fn refuses_every_change_and_every_copy(collection: &Collection, own: &Path, temp: &TempDir) {
+    let refused = |result: Result<(), Error>, what: &str| match result {
+        Err(Error::FeatureReadOnly { path, features }) => {
+            assert_eq!(path, own.to_str().unwrap(), "{what}");
+            assert_eq!(features, vec!["probe".to_string()], "{what}");
+        }
+        other => panic!("{what}: expected the refusal, got {other:?}"),
+    };
+    let before = ids(collection);
+    let added = collection.add_records(records(1, |_| None), vec![], true);
+    assert_eq!(added.total_errors, 1);
+    assert!(
+        added
+            .errors
+            .iter()
+            .all(|e| e.contains("marks the feature read_only")),
+        "{:?}",
+        added.errors
+    );
+    refused(
+        collection.remove_points(&["r1".to_string()]).map(|_| ()),
+        "remove",
+    );
+    refused(
+        collection
+            .update_metadata("r1", HashMap::from([("x".to_string(), json!(1))]))
+            .map(|_| ()),
+        "update",
+    );
+    refused(collection.clear().map(|_| ()), "clear");
+    refused(collection.compact().map(|_| ()), "compact");
+    refused(collection.checkpoint(), "checkpoint");
+    let journal = temp.at("journal-target.zdb");
+    refused(
+        collection.journal_to(journal.to_str().unwrap(), Durability::default()),
+        "journal_to",
+    );
+    refused(
+        collection.save(own.to_str().unwrap()),
+        "save into its own directory",
+    );
+    let elsewhere = temp.at("save-target.zdb");
+    refused(
+        collection.save(elsewhere.to_str().unwrap()),
+        "save into another directory",
+    );
+    let copy = temp.at("backup-target.zdb");
+    refused(
+        collection.backup(copy.to_str().unwrap()).map(|_| ()),
+        "backup",
+    );
+    for target in [&journal, &elsewhere, &copy] {
+        assert!(!target.exists(), "{} was written", target.display());
+    }
+    assert_eq!(ids(collection), before);
+}
+
+/// A directory listing a feature this build does not know, marked
+/// read_only, opens read only on a medium it can write, unjournaled: every
+/// record held and every page answered, nothing in the directory changed,
+/// the recovery naming the feature, and every change and every copy
+/// refused naming it.
+#[test]
+fn a_feature_marked_read_only_opens_an_unjournaled_directory_read_only() {
+    let temp = TempDir::new();
+    let source = temp.at("source.zdb");
+    let collection = dense(20);
+    save(&collection, &source);
+    let path = forged(&temp, &source, "probe.zdb", |m| {
+        m["features"]["probe"] = json!("read_only");
+    });
+    let files = files_under(&[&path]);
+    let (opened, recovery) = Collection::recover_with(
+        path.to_str().unwrap(),
+        None,
+        JournalPolicy::Replay(Durability::default()),
+    )
+    .unwrap();
+    assert_eq!(ids(&opened), ids(&collection));
+    let query = vec![0.1; DIM];
+    let page = |c: &Collection| -> Vec<(String, u32)> {
+        let params = c.search_params(5, None, false, None).unwrap();
+        c.search_one(&query, None, params)
+            .unwrap()
+            .iter()
+            .map(|hit| (hit.id().to_string(), hit.score().to_bits()))
+            .collect()
+    };
+    assert_eq!(page(&opened), page(&collection));
+    assert_eq!(recovery.read_only.as_deref(), Some(PROBE_REASON));
+    assert_eq!(recovery.read_only_features(), vec!["probe"]);
+    assert!(!recovery.journaled);
+    assert_eq!(
+        recovery.read_only_warning("D").unwrap(),
+        format!(
+            "The directory D was opened read only, since {PROBE_REASON}. It stays at format \
+             5.0.0. Every change, save, checkpoint, journal and backup is refused. Upgrade the \
+             package to change it."
+        )
+    );
+    refuses_every_change_and_every_copy(&opened, &path, &temp);
+    drop(opened);
+    assert_eq!(files_under(&[&path]), files, "the directory changed");
+
+    // The checkpoint alone opens read only too.
+    let alone = Collection::load_checkpoint_only(path.to_str().unwrap(), None).unwrap();
+    assert_eq!(ids(&alone), ids(&collection));
+    let refused = alone.add_records(records(1, |_| None), vec![], true);
+    assert_eq!(refused.total_errors, 1);
+}
+
+/// A journaled directory listing a feature marked read_only replays its
+/// journal in memory and changes nothing, under a replay, a repair and the
+/// checkpoint alone, and a later save of the feature's own kind is what
+/// the directory keeps.
+#[test]
+fn a_feature_marked_read_only_opens_a_journaled_directory_read_only() {
+    let temp = TempDir::new();
+    let path = temp.at("journaled.zdb");
+    let collection = dense(10);
+    collection
+        .journal_to(path.to_str().unwrap(), Durability::default())
+        .unwrap();
+    let later: Vec<ParsedRecord> = records(15, |_| None).into_iter().skip(10).collect();
+    let added = collection.add_records(later, vec![], false);
+    assert_eq!(added.total_errors, 0, "{:?}", added.errors);
+    let expected = ids(&collection);
+    drop(collection);
+    rewrite_manifest(&path, |m| {
+        m["features"]["probe"] = json!("read_only");
+    });
+    let journal = crate::journal::journal_path(&path).unwrap();
+    let files = files_under(&[&path, &journal]);
+    for policy in [
+        JournalPolicy::Replay(Durability::default()),
+        JournalPolicy::Repair(Durability::default()),
+    ] {
+        let (opened, recovery) =
+            Collection::recover_with(path.to_str().unwrap(), None, policy).unwrap();
+        assert_eq!(ids(&opened), expected, "{policy:?}");
+        assert!(recovery.journaled, "{policy:?}");
+        assert_eq!(recovery.replayed, 5, "{policy:?}");
+        assert_eq!(
+            recovery.read_only.as_deref(),
+            Some(PROBE_REASON),
+            "{policy:?}"
+        );
+        assert!(recovery.repair.is_none(), "{policy:?}");
+        assert!(recovery.checkpoint_taken.is_none(), "{policy:?}");
+        assert!(
+            recovery
+                .read_only_warning("D")
+                .unwrap()
+                .contains("and 5 records of its journal were replayed in memory"),
+            "{policy:?}"
+        );
+        refuses_every_change_and_every_copy(&opened, &path, &temp);
+        drop(opened);
+        assert_eq!(files_under(&[&path, &journal]), files, "{policy:?}");
+    }
+    let alone = Collection::load_checkpoint_only(path.to_str().unwrap(), None).unwrap();
+    assert_eq!(alone.len(), 10);
+    drop(alone);
+    assert_eq!(files_under(&[&path, &journal]), files);
+}
+
+/// A whole journal record of a kind this build does not know, in a
+/// directory holding a feature marked read_only, is the feature's and
+/// refuses the load naming the feature, the kind and the sequence, under a
+/// repair too, while the checkpoint alone opens. In a directory holding no
+/// such feature the same record is damage, a torn tail, as before.
+#[test]
+fn a_journal_record_of_a_read_only_feature_refuses_the_load() {
+    let temp = TempDir::new();
+    let path = temp.at("journaled.zdb");
+    let collection = dense(10);
+    collection
+        .journal_to(path.to_str().unwrap(), Durability::default())
+        .unwrap();
+    let sequence = collection.journal_sequence() + 1;
+    drop(collection);
+    let journal = crate::journal::journal_path(&path).unwrap();
+    let last = std::fs::read_dir(&journal)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|segment| segment.extension().is_some_and(|ext| ext == "zdbseg"))
+        .max()
+        .unwrap();
+    let mut record = sequence.to_le_bytes().to_vec();
+    record.extend_from_slice(&3u32.to_le_bytes());
+    record.extend_from_slice(&13u16.to_le_bytes());
+    record.extend_from_slice(&0u16.to_le_bytes());
+    record.extend_from_slice(b"new");
+    let sum = zeusdb_vector_core::checksum_of(&record);
+    record.extend_from_slice(&sum.to_le_bytes());
+    let mut bytes = std::fs::read(&last).unwrap();
+    bytes.extend_from_slice(&record);
+    std::fs::write(&last, &bytes).unwrap();
+
+    let plain = temp.at("plain.zdb");
+    copy_dir(&path, &plain);
+    copy_dir(&journal, &crate::journal::journal_path(&plain).unwrap());
+    let (opened, recovery) = Collection::recover_with(
+        plain.to_str().unwrap(),
+        None,
+        JournalPolicy::Replay(Durability::default()),
+    )
+    .unwrap();
+    assert_eq!(opened.len(), 10);
+    assert_eq!(recovery.damage.map(|damage| damage.kind), Some("torn_tail"));
+    drop(opened);
+
+    rewrite_manifest(&path, |m| {
+        m["features"]["probe"] = json!("read_only");
+    });
+    for policy in [
+        JournalPolicy::Replay(Durability::default()),
+        JournalPolicy::Repair(Durability::default()),
+    ] {
+        match Collection::recover_with(path.to_str().unwrap(), None, policy) {
+            Err(Error::FeatureJournalUnreadable {
+                path: named,
+                features,
+                kind,
+                sequence: at,
+            }) => {
+                assert_eq!(named, path.to_str().unwrap(), "{policy:?}");
+                assert_eq!(features, vec!["probe".to_string()], "{policy:?}");
+                assert_eq!((kind, at), (13, sequence), "{policy:?}");
+            }
+            other => panic!(
+                "{policy:?}: expected the refusal, got {:?}",
+                other.map(|_| ())
+            ),
+        }
+    }
+    let message = Collection::load(path.to_str().unwrap())
+        .err()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        message,
+        format!(
+            "The directory {} holds the feature 'probe', which this build does not know and its \
+             manifest marks read_only, and its journal holds a record of kind 13 at sequence {}, \
+             which this build cannot replay. Load it with checkpoint_only=True to read the \
+             directory as its last save left it, or upgrade the package.",
+            path.display(),
+            sequence
+        )
+    );
+    let alone = Collection::load_checkpoint_only(path.to_str().unwrap(), None).unwrap();
+    assert_eq!(alone.len(), 10);
+}
+
+/// The words of `FeatureReadOnly` for one feature and for two, and two
+/// features marked read_only both named in the recovery.
+#[test]
+fn the_words_of_a_read_only_refusal() {
+    let temp = TempDir::new();
+    let source = temp.at("source.zdb");
+    save(&dense(20), &source);
+    let path = forged(&temp, &source, "probe.zdb", |m| {
+        m["features"]["probe"] = json!("read_only");
+    });
+    let opened = load(&path).unwrap();
+    assert_eq!(
+        opened.checkpoint().err().unwrap().to_string(),
+        format!(
+            "The directory {} holds the feature 'probe', which this build does not know. Its \
+             manifest marks the feature read_only, so this build reads every record the \
+             directory holds and refuses every change, every save, a checkpoint, a journal and \
+             a backup, since a directory this build wrote would not hold the feature. Upgrade \
+             the package to change the collection.",
+            path.display()
+        )
+    );
+    drop(opened);
+    let two = forged(&temp, &source, "two.zdb", |m| {
+        m["features"]["beta"] = json!("read_only");
+        m["features"]["alpha"] = json!("read_only");
+    });
+    let (opened, recovery) = Collection::recover_with(
+        two.to_str().unwrap(),
+        None,
+        JournalPolicy::Replay(Durability::default()),
+    )
+    .unwrap();
+    assert_eq!(
+        recovery.read_only.as_deref(),
+        Some(
+            "it holds the features 'alpha' and 'beta', which this build does not know and its \
+             manifest marks read_only"
+        )
+    );
+    assert_eq!(
+        opened.checkpoint().err().unwrap().to_string(),
+        format!(
+            "The directory {} holds the features 'alpha' and 'beta', which this build does not \
+             know. Its manifest marks them read_only, so this build reads every record the \
+             directory holds and refuses every change, every save, a checkpoint, a journal and \
+             a backup, since a directory this build wrote would not hold the features. Upgrade \
+             the package to change the collection.",
+            two.display()
+        )
+    );
+}
+
+/// The read_only mark is read at every major: a directory written as one
+/// before format 5.0.0 and listing a feature marked read_only opens read
+/// only, and its journal of format version 1 is not upgraded.
+#[test]
+fn the_read_only_mark_is_read_below_the_fifth_major() {
+    let temp = TempDir::new();
+    let path = temp.at("fourth.zdb");
+    let collection = dense(20);
+    save(&collection, &path);
+    rewrite_before_five(&path, "4.0.0");
+    rewrite_manifest(&path, |m| {
+        m["features"]["probe"] = json!("read_only");
+    });
+    let files = files_under(&[&path]);
+    let (opened, recovery) = Collection::recover_with(
+        path.to_str().unwrap(),
+        None,
+        JournalPolicy::Replay(Durability::default()),
+    )
+    .unwrap();
+    assert_eq!(ids(&opened), ids(&collection));
+    assert_eq!(recovery.read_only.as_deref(), Some(PROBE_REASON));
+    assert_eq!(recovery.format_version, "4.0.0");
+    refuses_every_change_and_every_copy(&opened, &path, &temp);
+    drop(opened);
+    assert_eq!(files_under(&[&path]), files);
 }

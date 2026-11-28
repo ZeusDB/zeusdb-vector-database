@@ -9,10 +9,12 @@
 //! with the interpreter lock released.
 
 use super::{
-    Collection, DenseIndex, DenseOpen, Identity, QuantizationConfig, StorageMode, MAX_LAYER,
+    generated_number, Collection, DenseIndex, DenseOpen, DenseRestored, Identity, IdentityRecord,
+    QuantizationConfig, StorageMode, GENERATED_ID_CEILING, MAX_LAYER,
 };
-use crate::journal::{Durability, JournalPolicy, Recovery};
+use crate::journal::{Durability, JournalPolicy, PastBound, Recovery};
 use crate::locks::ReadGuard;
+use crate::persistence::unmapped_record;
 use crate::RerankCalibration;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -21,10 +23,106 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, info, instrument};
 use zeusdb_vector_core::{
-    ArtefactRecord, Bounds, Dir, Error, FsStorage, IdStore, Inventory, MetadataStore, Persist,
-    Position, PositionWalk, Restore, Storage, VectorGraph, DUMP_FILENAME,
+    screen, ArtefactRecord, Bounds, Dir, DumpRefusal, DumpRegion, DumpRows, Error, FsStorage,
+    IdStore, Int8Codec, Inventory, KillPoint, MetadataStore, Persist, Position, PositionWalk,
+    Screen, SegmentBase, SizedMap, Storage, VectorGraph, DUMP_FILENAME, NORM_BOUND, SPARSE_BOUND,
 };
-use zeusdb_vector_sparse::PostingsIndex;
+
+/// Where a load read the parts [`Collection::first_past_bound`] scans, for
+/// the file its words name.
+pub(crate) struct BoundSources<'a> {
+    /// The file the checkpoint's raw vectors were read from.
+    pub(crate) raw: &'a str,
+    /// The journal file the load replayed, where it replayed one.
+    pub(crate) journal: Option<&'a str>,
+    /// The internal id counter the checkpoint held. A record at or past it
+    /// was installed by the replay.
+    pub(crate) counter: usize,
+    /// Whether the checkpoint held a fitted quantizer, rather than one a
+    /// training during the replay fitted.
+    pub(crate) fitted: bool,
+}
+
+impl BoundSources<'_> {
+    /// The journal's file where `replayed` and the load replayed one, and
+    /// `checkpoint` otherwise.
+    fn file(&self, replayed: bool, checkpoint: &str) -> String {
+        match self.journal {
+            Some(journal) if replayed => journal.to_string(),
+            _ => checkpoint.to_string(),
+        }
+    }
+}
+
+/// What a checkpoint is for, which decides the kill points it passes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CheckpointKind {
+    /// A save, or the checkpoint of a journaled collection.
+    Save,
+    /// The checkpoint that writes a directory read at an older format again
+    /// at this build's, with a journal of segments.
+    Upgrade,
+}
+
+/// Whose directory a save writes, which decides the manifest's journal
+/// record, the sequence its identity records, the kill points the save
+/// passes, and whether the lineage moves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Written {
+    /// The collection's own: the manifest names the journal where the
+    /// collection holds one and records the sequence its checkpoint holds,
+    /// and the lineage moves to the directory once it commits.
+    Own,
+    /// A backup's copy: the manifest names no journal and records
+    /// `sequence`, and the lineage stays where it was.
+    Copy { sequence: u64 },
+}
+
+/// The points a crash test aborts a save at: after the artefacts, where the
+/// save has one, then after the graph dump, after the manifest, between the
+/// two renames and after the commit.
+struct SavePoints {
+    artefacts: Option<KillPoint>,
+    dump: KillPoint,
+    manifest: KillPoint,
+    between: KillPoint,
+    commit: KillPoint,
+}
+
+impl Written {
+    fn points(self) -> SavePoints {
+        match self {
+            Written::Own => SavePoints {
+                artefacts: Some(KillPoint::SaveAfterArtefacts),
+                dump: KillPoint::SaveAfterDump,
+                manifest: KillPoint::SaveAfterManifest,
+                between: KillPoint::SaveBetweenRenames,
+                commit: KillPoint::SaveAfterCommit,
+            },
+            Written::Copy { .. } => SavePoints {
+                artefacts: None,
+                dump: KillPoint::BackupAfterArtefacts,
+                manifest: KillPoint::BackupAfterManifest,
+                between: KillPoint::BackupBetweenRenames,
+                commit: KillPoint::BackupAfterCommit,
+            },
+        }
+    }
+}
+
+/// Refuse a target that is a file, or a folder holding entries and no
+/// `manifest.json`, which a save would replace whole. Asked before anything
+/// is written, the lock file included.
+fn refuse_foreign_target(storage: &dyn Storage, path: &str) -> Result<(), Error> {
+    match storage.foreign_target() {
+        Some(holds) => Err(Error::TargetNotAnIndex {
+            path: path.to_string(),
+            holds,
+        }),
+        None => Ok(()),
+    }
+}
+use zeusdb_vector_sparse::{PostingsIndex, Weighting};
 use zeusdb_vector_text::{TermDictionary, Tokenizer};
 
 /// The target every record this file emits carries. See the parent module.
@@ -44,6 +142,24 @@ fn rebuild_requested() -> bool {
         Ok(value) => !value.is_empty() && value != "0",
         Err(_) => false,
     }
+}
+
+/// What restoring the graph from its dump gave.
+pub(crate) enum DumpOutcome {
+    /// The graph the dump holds, installed, with its node count.
+    Read(usize),
+    /// The rows of a version 2 dump, each region verified, which the caller
+    /// rebuilds the graph from: its topology could not be used, or the
+    /// rebuild was asked for, which `asked` says.
+    Rows {
+        rows: DumpRows,
+        reason: String,
+        asked: bool,
+    },
+    /// Below format 5.0.0, why the dump cannot be used, which the caller
+    /// rebuilds the graph from the separate row stores for. Also the
+    /// collection holding no record, at any format, which writes no dump.
+    Rebuild(String),
 }
 
 /// What the manifest recorded about the graph dump, as the inventory the
@@ -99,10 +215,8 @@ impl Collection {
     /// order, so `write` sees one instant of both. The records are walked in
     /// position order, which is internal id order, and each is named by the
     /// internal id its node was inserted under. The one caller is the save
-    /// of an index that holds a raw vector for every record, which is every
-    /// raw index and a `quantized_with_raw` one; see `holds_raw_vectors` for
-    /// why a raw index writes the file beside the dump that already carries
-    /// its store.
+    /// of a product quantized graph that keeps a raw vector beside every
+    /// code; see `writes_raw_vectors`.
     pub(crate) fn with_raw_vectors<R>(
         &self,
         write: impl FnOnce(&mut dyn Iterator<Item = (usize, &[f32])>, usize) -> R,
@@ -120,6 +234,168 @@ impl Collection {
         write(&mut records, ids.len())
     }
 
+    /// The first value the collection holds past what the bound on a
+    /// vector's norm or the bound on a sparse value allows, named with the
+    /// file `sources` says it came from: under l2, dot or l1 a raw vector
+    /// whose norm passes `NORM_BOUND`, a record's before that of a node no
+    /// record holds, then a codebook value past 2^62, then
+    /// a scale past the largest one vectors within the bound fit, then a
+    /// term weighting `k1` past `SPARSE_BOUND`, then a sparse value whose
+    /// magnitude passes it. `None` for every collection this build writes,
+    /// since `add` refuses a vector and a sparse value past its bound,
+    /// `create` refuses such a `k1`, and a fit to vectors within the bound
+    /// holds no such value.
+    ///
+    /// A load asks this once the checkpoint is read and any journal replayed,
+    /// before anything is written, and opens the collection read only where
+    /// it answers one. Every raw vector takes the one pass of
+    /// `zeusdb_vector_core::screen`, under the id store's guard and the
+    /// index's, in that order, and the sparse values take one pass of
+    /// `PostingsIndex::first_value_past_bound` under the id store's guard,
+    /// the dense index's and the sparse space's, in that order.
+    pub(crate) fn first_past_bound(&self, sources: &BoundSources<'_>) -> Option<PastBound> {
+        if self.dense().bounded() {
+            let ids = self.ids.read().unwrap();
+            let index = self.dense().index.read().unwrap();
+            let node_at = index.node_at();
+            let graph = index.graph();
+            let origin_ids = graph.origin_ids();
+            let replayed = |node: u32| {
+                origin_ids
+                    .get(node as usize)
+                    .is_some_and(|&internal_id| internal_id >= sources.counter)
+            };
+            let allowed = || {
+                format!(
+                    "2^62 ({:e}), the largest norm an index under {} takes",
+                    NORM_BOUND,
+                    self.dense().metric
+                )
+            };
+            // The nodes a record holds, so the pass after this one reads
+            // every other node once.
+            let mut held = vec![false; origin_ids.len()];
+            for at in ids.slots() {
+                let Some(&node) = node_at.get(at) else {
+                    continue;
+                };
+                if let Some(slot) = held.get_mut(node as usize) {
+                    *slot = true;
+                }
+                let Some(vector) = graph.raw_vector_at(node) else {
+                    continue;
+                };
+                let Screen::PastBound { norm } = screen(vector, true) else {
+                    continue;
+                };
+                return Some(PastBound {
+                    file: sources.file(replayed(node), sources.raw),
+                    detail: format!(
+                        "the vector of '{}', whose Euclidean norm is {:e}",
+                        ids.read_name(at).unwrap_or_default(),
+                        norm
+                    ),
+                    allowed: allowed(),
+                });
+            }
+            // A node no record holds keeps its vector, being the node of a
+            // record a removal or an overwrite left, and a save writes every
+            // node, so its vector is held to the bound as well.
+            for (node, &kept) in held.iter().enumerate() {
+                if kept {
+                    continue;
+                }
+                let Ok(node) = u32::try_from(node) else {
+                    break;
+                };
+                let Some(vector) = graph.raw_vector_at(node) else {
+                    continue;
+                };
+                let Screen::PastBound { norm } = screen(vector, true) else {
+                    continue;
+                };
+                return Some(PastBound {
+                    file: sources.file(replayed(node), sources.raw),
+                    detail: format!(
+                        "the vector of a removed or replaced record, whose Euclidean norm is {:e}",
+                        norm
+                    ),
+                    allowed: allowed(),
+                });
+            }
+        }
+        if let Some((subvector, centroid, place, value)) = self
+            .pq()
+            .filter(|pq| pq.is_trained())
+            .and_then(|pq| pq.first_value_past_bound())
+        {
+            return Some(PastBound {
+                file: sources.file(!sources.fitted, "pq_centroids.bin"),
+                detail: format!(
+                    "{:e} at value {} of centroid {} of subvector {}",
+                    value, place, centroid, subvector
+                ),
+                allowed: format!(
+                    "2^62 ({:e}), the largest value a codebook fitted to vectors whose norm is \
+                     within 2^62 holds",
+                    NORM_BOUND
+                ),
+            });
+        }
+        if let Some((dimension, scale)) = self
+            .dense()
+            .int8_codec()
+            .and_then(|codec| codec.first_scale_past_bound())
+        {
+            return Some(PastBound {
+                file: sources.file(!sources.fitted, crate::persistence::INT8_SCALES_FILENAME),
+                detail: format!("a scale of {:e} at dimension {}", scale, dimension),
+                allowed: format!(
+                    "{:e}, the largest scale vectors whose norm is within 2^62 fit",
+                    Int8Codec::largest_scale_within_bound()
+                ),
+            });
+        }
+        let (name, space) = self.sparse_named()?;
+        let bound_words = |what: &str| {
+            format!(
+                "2^40 ({:e}), the largest {} a sparse space takes",
+                f64::from(SPARSE_BOUND),
+                what
+            )
+        };
+        if let Weighting::Bm25 { k1, .. } = space.config().weighting {
+            if k1 > SPARSE_BOUND {
+                return Some(PastBound {
+                    file: "config.json".to_string(),
+                    detail: format!("a term weighting k1 of {:e}", k1),
+                    allowed: bound_words("k1"),
+                });
+            }
+        }
+        let ids = self.ids.read().unwrap();
+        let dense = self.dense_index();
+        let postings = space.index.read().unwrap();
+        let (at, index, value) = postings.first_value_past_bound()?;
+        let replayed = dense
+            .ids_by_position()
+            .get(at.slot())
+            .is_some_and(|internal_id| internal_id >= sources.counter);
+        let artefact = postings
+            .artefact_names(&Self::space_prefix(name))
+            .swap_remove(0);
+        Some(PastBound {
+            file: sources.file(replayed, &artefact),
+            detail: format!(
+                "the sparse value {:e} at index {} of '{}'",
+                value,
+                index,
+                ids.read_name(at.slot()).unwrap_or_default()
+            ),
+            allowed: bound_words("magnitude"),
+        })
+    }
+
     /// Whether this index should hold a raw store beside its codes.
     ///
     /// Asked by the loader after the graph is back and before the vectors are
@@ -135,22 +411,40 @@ impl Collection {
                 .is_some_and(|config| config.storage_mode == StorageMode::QuantizedWithRaw)
     }
 
-    /// Whether the index holds a raw vector for every record it holds.
+    /// Whether a save writes `vectors.bin`, which is where the graph is a
+    /// product quantized one keeping a raw vector beside every code, being a
+    /// trained one under `quantized_with_raw`.
     ///
-    /// True on every raw graph and on a `quantized_with_raw` one, false on a
-    /// trained `quantized_only` one. It is what decides whether a save writes
-    /// `vectors.bin`.
+    /// Every other graph's raw vectors, where it keeps any, are the rows it
+    /// stores, which the graph dump holds, and the dump holds the only copy
+    /// of each.
+    pub(crate) fn writes_raw_vectors(&self) -> bool {
+        let index = self.dense().index.read().unwrap();
+        let graph = index.graph();
+        graph.is_pq() && graph.holds_raw()
+    }
+
+    /// Every live record's codes, read off a product quantized graph's own
+    /// store and keyed by external id, at the capacity of the live count.
+    /// Empty for any other graph.
     ///
-    /// **The saved directory still holds two copies of every raw vector on a
-    /// raw index**, one in `vectors.bin` and one in the graph dump's vector
-    /// region. Removing the map did not remove that, and the reason is the
-    /// rebuild fallback: `vectors.bin` is keyed by external id and a damaged
-    /// graph dump is exactly the case where the node ordering that addresses
-    /// the store is unavailable. Dropping the file would make a raw index with
-    /// a damaged dump unloadable, which is a recovery path the loader
-    /// documents and thirty-three tests hold.
-    pub(crate) fn holds_raw_vectors(&self) -> bool {
-        self.dense().index.read().unwrap().graph().holds_raw()
+    /// The codes map a load restores at format 5.0.0, where the graph dump
+    /// holds the only copy of each record's codes.
+    pub(crate) fn codes_from_graph(&self) -> HashMap<String, Vec<u8>> {
+        let ids = self.ids.read().unwrap();
+        let index = self.dense().index.read().unwrap();
+        let graph = index.graph();
+        if !graph.is_pq() {
+            return HashMap::new();
+        }
+        let mut codes = HashMap::with_capacity(ids.len());
+        for (at, id) in ids.iter() {
+            let node = index.node_of(Position::from_slot(at));
+            if let Some(code) = node.and_then(|node| graph.codes_at(node)) {
+                codes.insert(id.to_string(), code.to_vec());
+            }
+        }
+        codes
     }
 
     /// Rebuild the raw side store of a loaded quantized graph.
@@ -190,6 +484,10 @@ impl Collection {
         let stranded_fill = vec![0f32; self.dense().dim];
         let mut placed = 0usize;
         let mut stranded = 0usize;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the node count, held below 2^31 by append_node and loading_layout"
+        )]
         for node in 0..nodes as u32 {
             let at = hnsw.record_of_at(node);
             match by_position.get(&(at as usize)) {
@@ -242,36 +540,67 @@ impl Collection {
     /// The save, and the checkpoint it is on a journaled collection, with
     /// the mutation guard already held.
     ///
-    /// On a collection with no sink attached this is the four phases and
-    /// nothing else, and the directory it writes is byte for byte the
-    /// directory the four phases have always written.
+    /// On a collection with no journal this is the four phases under the
+    /// directory's lock, held exclusive for the save, and the directory it
+    /// writes is the directory the four phases write.
     ///
-    /// On a journaled collection three things wrap them.
+    /// On a journaled collection three things wrap them, under the lock the
+    /// journal already holds.
     ///
     /// The journal is synced first, whatever the commit mode the sink was
     /// given, and the sequence it has reached is written onto the collection
-    /// so that phase three records it in the manifest. Syncing before the
-    /// phases rather than after is what makes the pair consistent: every
-    /// record the manifest claims is on the device before a byte of the
-    /// directory is written.
+    /// so that phase three records it in the manifest. A sync that fails is
+    /// logged and passed, since the directory is written from memory and
+    /// holds every record whatever reached the device. A save that fails
+    /// puts back the sequence the collection named before the sync, which
+    /// the directory it last committed holds and the journal still follows.
+    /// A save that moved its directory into place and could not sync the
+    /// folder leaves the collection refusing every record until a checkpoint
+    /// commits, since either directory may be in place after a power loss.
     ///
     /// Then the four phases, under the one hold this already has, so the
     /// directory that is committed holds exactly the mutations at or below
     /// the sequence it names.
     ///
-    /// Then the journal is truncated, in the two steps the writer makes each
-    /// durable on its own. A crash before the truncation leaves records the
-    /// new directory already holds, which a recovery skips by sequence. A
-    /// crash between the two steps leaves an empty body under a header naming
-    /// the old first sequence, which the reader accepts and the next open
-    /// completes. A crash after both is the ordinary state.
+    /// Then the journal rolls onto a segment naming the directory just
+    /// committed and deletes every segment that directory holds where the
+    /// system allows. A crash before the roll leaves segments naming the
+    /// previous directory, every record of which the new one holds, so a load
+    /// finds them stale, creates the segment the roll would have and deletes
+    /// them. A crash in the deletion leaves some of them, which a load
+    /// deletes. The commit of the roll clears a fault a failed commit left.
     pub(crate) fn save_locked(&self, path: &str) -> Result<(), Error> {
+        self.save_locked_as(path, CheckpointKind::Save)
+    }
+
+    /// [`Collection::save_locked`], as the save or as the checkpoint that
+    /// upgrades a directory read at an older format, which passes three kill
+    /// points of its own besides the save's.
+    pub(crate) fn save_locked_as(&self, path: &str, kind: CheckpointKind) -> Result<(), Error> {
+        let storage = FsStorage::at(Path::new(path))?;
+        // A collection read only for features its directory holds saves
+        // nowhere, since a directory this build wrote would not hold them.
+        if self.sink_read_only_features() {
+            return Err(self
+                .sink_refusal()
+                .expect("a sink naming read-only features refuses"));
+        }
+        // A collection read from a medium it cannot write saves into another
+        // directory alone, which copies it somewhere writable.
+        if let Some(directory) = self.sink_read_only_directory() {
+            if crate::journal::same_directory(&directory, Path::new(path)) {
+                return Err(self
+                    .sink_refusal()
+                    .expect("a sink naming a read-only directory refuses"));
+            }
+        }
         // A checkpoint saves to the directory its journal sits beside and to
         // no other, because the manifest it writes names that journal as a
         // sibling and a directory whose sibling is elsewhere is one nothing
         // can open.
-        if let Some(journal) = self.sink_journal_path() {
-            if !FsStorage::at(Path::new(path))?.names_journal(&journal) {
+        let journal = self.sink_journal_path();
+        if let Some(journal) = &journal {
+            if !storage.names_journal(journal) {
                 return Err(Error::JournalDirectoryMismatch {
                     journal: journal.display().to_string(),
                     target: path.to_string(),
@@ -291,9 +620,18 @@ impl Collection {
                 });
             }
         }
-        // Every record handed over is on the device before the directory
-        // that will claim them is written.
-        if let Some(reached) = self.sync_sink_locked()? {
+        refuse_foreign_target(&storage, path)?;
+        // The directory's lock. A journal holds it for the collection's life,
+        // and any other save takes it for the save, so a second writer in
+        // this process or another is refused before anything is written.
+        let _lock = match journal {
+            Some(_) => None,
+            None => Some(crate::journal::lock_for_save(&storage, path)?),
+        };
+        // Every record handed over is synced before the directory that will
+        // claim them is written, where the device allows.
+        let in_place = self.journal_sequence();
+        if let Some(reached) = self.sync_sink_locked(false)? {
             self.set_journal_sequence(reached);
             debug!(target: LOG_TARGET, operation = "checkpoint_sync",
                 sequence = reached,
@@ -301,24 +639,73 @@ impl Collection {
             );
         }
         zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::CheckpointBeforeSave);
-        self.save_phases(path)?;
-        zeusdb_vector_core::kill_at(
-            zeusdb_vector_core::KillPoint::CheckpointAfterSaveBeforeTruncate,
-        );
+        if let Err(error) = self.save_phases(&storage, path) {
+            // The journal still follows the checkpoint the collection last
+            // committed, so the collection names that checkpoint's sequence
+            // again. A save that moved its directory into place and could
+            // not sync the folder leaves either directory there after a
+            // power loss, so the collection takes no record until a
+            // checkpoint commits, since a record under the old checkpoint
+            // would not replay over the new directory.
+            self.set_journal_sequence(in_place);
+            if let Error::SaveMoveNotDurable {
+                target,
+                error: cause,
+                ..
+            } = &error
+            {
+                if journal.is_some() {
+                    self.fault_after_move(&target.display().to_string(), cause);
+                }
+            }
+            return Err(error);
+        }
+        zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::CheckpointAfterSaveBeforeRoll);
+        if kind == CheckpointKind::Upgrade {
+            zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::UpgradeAfterCommit);
+        }
         // The directory now holds every record at or below the sequence it
-        // names, so the journal need hold none of them.
-        self.truncate_sink_locked()?;
-        zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::CheckpointAfterTruncate);
+        // names, so the journal goes on after it and holds none of them.
+        if journal.is_some() {
+            let identity = self.identity();
+            let base = SegmentBase {
+                snapshot: identity
+                    .snapshot
+                    .expect("a committed save records the snapshot it drew"),
+                sequence: self.journal_sequence(),
+                generation: identity.generation,
+                parent: identity.parent.unwrap_or(0),
+            };
+            self.roll_sink_locked(base)?;
+            if kind == CheckpointKind::Upgrade {
+                zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::UpgradeAfterSegment);
+            }
+        }
         Ok(())
     }
 
+    /// The checkpoint that upgrades a directory read at an older format,
+    /// with the mutation guard taken here. The load calls it once the sink
+    /// over the new journal is attached.
+    pub(crate) fn upgrade_checkpoint(&self, path: &str) -> Result<(), Error> {
+        let _writers = self.writers.lock().unwrap();
+        self.save_locked_as(path, CheckpointKind::Upgrade)
+    }
+
+    /// The four phases into `storage`, under the mutation guard, for a test
+    /// that saves into a directory held in memory.
+    #[cfg(test)]
+    pub(crate) fn save_into(&self, storage: &dyn Storage) -> Result<(), Error> {
+        let _writers = self.writers.lock().unwrap();
+        self.save_to(storage, Written::Own).map(|_| ())
+    }
+
     /// The four phases, with the mutation guard already held.
-    fn save_phases(&self, path: &str) -> Result<(), Error> {
+    fn save_phases(&self, storage: &FsStorage, path: &str) -> Result<(), Error> {
         let start_time = Instant::now();
         info!(target: LOG_TARGET, operation = "save_start", path = path, "Starting index save");
 
-        let storage = FsStorage::at(Path::new(path))?;
-        self.save_to(&storage)?;
+        self.save_to(storage, Written::Own)?;
 
         let duration_ms = start_time.elapsed().as_millis();
         info!(target: LOG_TARGET, operation = "save_complete",
@@ -329,11 +716,23 @@ impl Collection {
         Ok(())
     }
 
-    /// The four phases, into the directory `storage` keeps.
-    fn save_to(&self, storage: &dyn Storage) -> Result<(), Error> {
+    /// The four phases, into the directory `storage` keeps, returning what
+    /// the manifest records of the directory's identity.
+    fn save_to(&self, storage: &dyn Storage, written: Written) -> Result<IdentityRecord, Error> {
+        let points = written.points();
+        // A collection read only for a value past the bound on a vector's
+        // norm writes nothing, into any directory, since this build writes no
+        // such value. Every save, backup and checkpoint passes here.
+        if let Some(refusal) = self.sink_bound_refusal() {
+            return Err(refusal);
+        }
         // What the directory will be, settled before anything is written, so
         // a collection whose generation cannot move writes nothing.
         let identity = self.next_identity()?;
+        let (sequence, names_journal) = match written {
+            Written::Own => (self.journal_sequence(), true),
+            Written::Copy { sequence } => (sequence, false),
+        };
 
         // Every artefact goes into a directory of its own that is moved into
         // place at the end, so a reader sees the previous index or this one and
@@ -344,31 +743,123 @@ impl Collection {
         // Phase 1: Save all ZeusDB components (already tested to work)
         debug!(target: LOG_TARGET, operation = "save_phase1", "Saving ZeusDB components");
         let mut ledger = crate::persistence::save_index(self, staging.dir())?;
-        zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::SaveAfterArtefacts);
+        if let Some(point) = points.artefacts {
+            zeusdb_vector_core::kill_at(point);
+        }
 
         // Phase 2: Save the HNSW graph in ZeusDB's own format
         debug!(target: LOG_TARGET, operation = "save_phase2", "Saving HNSW graph");
         self.save_hnsw_graph(staging.dir(), &mut ledger)?;
-        zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::SaveAfterDump);
+        zeusdb_vector_core::kill_at(points.dump);
 
         // Phase 3: The manifest, last, because it records a length and a digest
         // for every artefact above and the directory size all of them add up
         // to.
         debug!(target: LOG_TARGET, operation = "save_phase3", "Writing the manifest");
-        crate::persistence::save_manifest(self, staging.dir(), ledger, &identity)?;
-        zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::SaveAfterManifest);
+        let saved_at = zeusdb_vector_core::Timestamp::now().to_rfc3339();
+        let record = crate::persistence::ManifestRecord {
+            identity: &identity,
+            sequence,
+            saved_at: &saved_at,
+            names_journal,
+        };
+        crate::persistence::save_manifest(self, staging.dir(), ledger, &record)?;
+        zeusdb_vector_core::kill_at(points.manifest);
 
         // Phase 4: Two renames, or one where nothing is there yet.
         debug!(target: LOG_TARGET, operation = "save_phase4",
             "Moving the saved index into place"
         );
-        staging.commit()?;
+        staging.commit(points.between)?;
+        let record = IdentityRecord {
+            identity,
+            saved_at: Some(saved_at),
+            sequence,
+        };
         // The directory is in place, so it is the one this collection last
         // committed. A save that failed before here left the lineage where
-        // it was, and the next one records the same generation again.
-        self.set_lineage(&identity);
-        zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::SaveAfterCommit);
-        Ok(())
+        // it was, and the next one records the same generation again. A
+        // backup's copy is not the collection's directory.
+        if written == Written::Own {
+            self.set_lineage(&record);
+        }
+        zeusdb_vector_core::kill_at(points.commit);
+        Ok(record)
+    }
+
+    /// Write a copy of this collection into the directory `path`, at format
+    /// 5.0.0 and standalone, and return what its manifest records of the
+    /// copy's identity.
+    ///
+    /// Under the mutation guard, so writers wait for it as they wait for a
+    /// checkpoint and searches run throughout. A collection read only for
+    /// features its directory holds is refused first, with
+    /// [`Error::FeatureReadOnly`]. Five targets are refused
+    /// before anything is written: the directory the collection's journal
+    /// sits beside or a read-only collection was read from, a directory with
+    /// a journal of either version beside it, a path that is not an index
+    /// directory, and a directory another holder locks. The journal is
+    /// synced as a checkpoint syncs it. A child forked from the process that
+    /// opened the journal is refused there, and any other failure is logged
+    /// and leaves the fault, since the copy is written from memory and holds
+    /// every record the collection holds whatever the journal lost. Then
+    /// the save's four phases under the target's lock.
+    ///
+    /// The copy's manifest names no journal. Its identity is the next
+    /// generation under a snapshot of its own, with the collection's
+    /// snapshot as its parent and, as its sequence, the sequence the
+    /// journal has reached, or the collection's own where it has no
+    /// journal. Neither the lineage nor the journal moves, so the next
+    /// checkpoint names the same parent.
+    pub fn backup(&self, path: &str) -> Result<IdentityRecord, Error> {
+        let _writers = self.writers.lock().unwrap();
+        // A collection read only for features its directory holds writes no
+        // copy, for the reason a save into another directory gives.
+        if self.sink_read_only_features() {
+            return Err(self
+                .sink_refusal()
+                .expect("a sink naming read-only features refuses"));
+        }
+        let storage = FsStorage::at(Path::new(path))?;
+        let own = self
+            .sink_journal_path()
+            .and_then(|journal| crate::journal::directory_of(&journal))
+            .or_else(|| self.sink_read_only_directory());
+        if own.is_some_and(|own| crate::journal::same_directory(&own, Path::new(path))) {
+            return Err(Error::BackupIntoOwnDirectory {
+                path: path.to_string(),
+            });
+        }
+        let journal = if storage.journal_exists() {
+            Some(storage.journal_path())
+        } else if storage.legacy_journal_exists() {
+            Some(storage.legacy_journal_path())
+        } else {
+            None
+        };
+        if let Some(journal) = journal {
+            return Err(Error::BackupTargetJournaled {
+                path: path.to_string(),
+                journal: journal.display().to_string(),
+            });
+        }
+        refuse_foreign_target(&storage, path)?;
+        let _lock = crate::journal::lock_for_save(&storage, path)?;
+        let sequence = match self.sync_sink_locked(true)? {
+            Some(reached) => reached,
+            None => self.journal_sequence(),
+        };
+        zeusdb_vector_core::kill_at(KillPoint::BackupAfterSync);
+        let start_time = Instant::now();
+        info!(target: LOG_TARGET, operation = "backup_start", path = path, "Starting backup");
+        let record = self.save_to(&storage, Written::Copy { sequence })?;
+        info!(target: LOG_TARGET, operation = "backup_complete",
+            path = path,
+            sequence = sequence,
+            duration_ms = start_time.elapsed().as_millis(),
+            "Backup completed successfully"
+        );
+        Ok(record)
     }
 
     /// What the next save records: this collection's id, one generation on
@@ -379,14 +870,9 @@ impl Collection {
     /// collection reaches by saving and a directory reaches only by an edit.
     fn next_identity(&self) -> Result<Identity, Error> {
         let current = self.identity();
-        current.next(super::construct::draw_id()).ok_or_else(|| {
-            Error::Engine(format!(
-                "This collection was read from a directory recording generation {}, the \
-                 largest a manifest can hold, so no save can record the one after it. No \
-                 release writes that generation, so the directory's manifest was edited.",
-                current.generation
-            ))
-        })
+        current
+            .next(super::construct::draw_id())
+            .ok_or_else(|| Error::Engine(super::generation_exhausted(current.generation)))
     }
 
     /// Write the HNSW graph in ZeusDB's own format. See `graph::dump`.
@@ -459,11 +945,11 @@ impl Collection {
     /// `config.json` records the tokenizer by value. The built-in one is
     /// recorded as `simple` and needs nothing handed. A caller's own
     /// implementation is recorded as `external`, and a directory recording
-    /// that opens only when the same implementation is handed here, because
-    /// a query tokenized any other way would not find the terms the records
-    /// were counted into. A tokenizer whose declaration is not the one
-    /// recorded is refused, and so is one handed to a directory that takes
-    /// no text.
+    /// that opens only when an implementation is handed here, which the caller
+    /// keeps the same, because a query tokenized any other way would not find
+    /// the terms the records were counted into. A tokenizer whose declaration
+    /// is not the one recorded is refused, and so is one handed to a directory
+    /// that takes no text.
     pub fn load_with(path: &str, tokenizer: Option<Arc<dyn Tokenizer>>) -> Result<Self, Error> {
         crate::persistence::load_index(
             path,
@@ -503,7 +989,18 @@ impl Collection {
         tokenizer: Option<Arc<dyn Tokenizer>>,
         durability: Durability,
     ) -> Result<(Self, Recovery), Error> {
-        crate::persistence::load_index(path, tokenizer, JournalPolicy::Replay(durability))
+        Self::recover_with(path, tokenizer, JournalPolicy::Replay(durability))
+    }
+
+    /// [`Collection::recover`] under any of the three policies, being a
+    /// replay, a repair or the checkpoint alone, with the report of what the
+    /// load did. See [`JournalPolicy`].
+    pub fn recover_with(
+        path: &str,
+        tokenizer: Option<Arc<dyn Tokenizer>>,
+        policy: JournalPolicy,
+    ) -> Result<(Self, Recovery), Error> {
+        crate::persistence::load_index(path, tokenizer, policy)
     }
 
     /// Open a directory's checkpoint and leave the journal beside it alone.
@@ -547,29 +1044,37 @@ impl Collection {
     ///
     /// The mutation guard is held for the whole of it, so nothing is
     /// recorded that the checkpoint does not hold and nothing is held that
-    /// is not recorded. The file is created first, because the manifest
-    /// names it and a manifest naming a file that was never created is a
-    /// directory this build refuses to open. Then the sink is attached. Then
-    /// the save runs as a checkpoint, which syncs a journal with no records,
-    /// records sequence zero, writes a manifest naming the file at format
-    /// 4.0.0 with `journal` among its features, and truncates a journal that
-    /// is already empty.
+    /// is not recorded. The directory's lock is taken first, exclusive, and
+    /// the journal holds it from then on. The journal's directory is created
+    /// empty next, because the manifest names it and a manifest naming a
+    /// journal that was never created is a directory this build refuses to
+    /// open. Then the sink is attached. Then the save runs as a checkpoint,
+    /// which syncs a journal with no records, records sequence zero, writes
+    /// a manifest naming the journal with `journal` among its features, and
+    /// rolls the journal onto its first segment, which names that
+    /// checkpoint.
     ///
     /// # The collection it names
     ///
-    /// The journal's header carries this collection's id, and the checkpoint
+    /// The journal's segments carry this collection's id, and the checkpoint
     /// records the same id in the manifest's identity and in its journal
     /// record, so the three agree by construction; a load holds the journal
     /// to the identity and refuses a manifest whose two ids disagree. The
     /// checkpoint is a save like any other, so it records the next
     /// generation, with the directory the collection last committed or read
     /// as its parent. The journal's sequence restarts at one here and the
-    /// generation does not.
+    /// generation does not, and every segment names the checkpoint's
+    /// snapshot, so a journal of an earlier history is never taken for this
+    /// one.
     ///
-    /// A process killed between the file and the save leaves a journal with
-    /// no directory, which nothing opens and the next call replaces.
+    /// A process killed between the journal's directory and the save leaves
+    /// an empty journal with no directory, which nothing opens and the next
+    /// call empties again.
     pub fn journal_to(&self, dir: &str, durability: Durability) -> Result<(), Error> {
         let _writers = self.writers.lock().unwrap();
+        if let Some(refusal) = self.sink_refusal() {
+            return Err(refusal);
+        }
         if self.sink_attached() {
             return Err(Error::Engine(
                 "This collection already hands its records to a sink, so opening a journal for \
@@ -579,21 +1084,26 @@ impl Collection {
             ));
         }
         let storage = FsStorage::at(Path::new(dir))?;
+        refuse_foreign_target(&storage, dir)?;
+        let lock = crate::journal::lock_for_journal(&storage, dir)?;
+        zeusdb_vector_core::kill_at(zeusdb_vector_core::KillPoint::LockHeld);
         info!(target: LOG_TARGET, operation = "journal_open",
             directory = dir,
             journal = %storage.journal_path().display(),
             "Opening a journal beside the directory and writing the checkpoint it replays onto"
         );
-        let sink = crate::journal::JournalSink::create(&storage, self.collection_id(), durability)?;
+        let sink =
+            crate::journal::JournalSink::create(&storage, self.collection_id(), durability, lock)?;
         self.attach_sink_locked(Box::new(sink));
         self.save_locked(dir)
     }
 
-    /// Save into the directory the journal sits beside and empty the
-    /// journal, which is [`Collection::save`] with the path taken from the
+    /// Save into the directory the journal sits beside and roll the journal
+    /// past it, which is [`Collection::save`] with the path taken from the
     /// journal rather than named again.
     ///
-    /// Nothing runs this on its own. A checkpoint holds the mutation guard
+    /// Nothing runs this on its own but a load, which takes one for an upgrade,
+    /// an abort or a repair. A checkpoint holds the mutation guard
     /// for the whole of a save, which is seconds at scale, and an engine
     /// that ran one inside an `add` would make one call in some thousands
     /// stall for that long at a moment the caller did not choose. The
@@ -606,6 +1116,9 @@ impl Collection {
     /// take mutations again; see `SinkSlot`.
     pub fn checkpoint(&self) -> Result<(), Error> {
         let _writers = self.writers.lock().unwrap();
+        if let Some(refusal) = self.sink_refusal() {
+            return Err(refusal);
+        }
         let Some(journal) = self.sink_journal_path() else {
             return Err(Error::NotJournaled);
         };
@@ -637,22 +1150,34 @@ impl Collection {
     /// installed the id mappings and the product quantizer, because both decide
     /// what the dump is checked against. `positions` is the internal id of the
     /// record at each position, which the mappings gave, and the reader files
-    /// each node at the position of the id it carries.
+    /// each node at the position of the id it carries. `version` is the dump
+    /// version the directory's format requires.
     ///
-    /// Returns the number of graph nodes restored, or the reason the dump
-    /// cannot be used. Every reason is a fallback rather than a failure: the
-    /// caller rebuilds instead, so a directory whose dump is absent, was written
-    /// by a release whose distance types were named differently, or is damaged
-    /// still loads.
+    /// Below format 5.0.0 every reason the dump cannot be used is a fallback
+    /// rather than a failure: the caller rebuilds from the separate row
+    /// stores, so a directory whose dump is absent, was written by a release
+    /// whose distance types were named differently, or is damaged still
+    /// loads. At 5.0.0 the dump holds the only copy of each record's row, so a
+    /// dump refused on its header, its identity or its rows refuses the load
+    /// with [`Error::GraphDumpInvalid`], naming the check, and one whose
+    /// topology cannot be used hands back its rows, which the caller rebuilds
+    /// from. `ZEUSDB_LOAD_REBUILD_GRAPH` asks for the rebuild from the rows
+    /// at 5.0.0, which still reads and verifies them, and for the rebuild from
+    /// the separate stores below it.
     pub(crate) fn restore_graph_from_dump(
         &mut self,
         dir: &dyn Dir,
         max_origin_id: usize,
         recorded_bytes: Option<u64>,
         positions: &[u32],
-    ) -> Result<usize, String> {
-        if rebuild_requested() {
-            return Err(format!("{} asked for the rebuild", REBUILD_ENV));
+        version: u32,
+    ) -> Result<DumpOutcome, Error> {
+        let asked = rebuild_requested();
+        if asked && version < 2 {
+            return Ok(DumpOutcome::Rebuild(format!(
+                "{} asked for the rebuild",
+                REBUILD_ENV
+            )));
         }
 
         // A save skips the graph dump entirely when the index holds nothing, so
@@ -660,8 +1185,20 @@ impl Collection {
         // save and describes records this one no longer holds.
         let live = self.ids.read().unwrap().len();
         if live == 0 {
-            return Err("the index holds no records".to_string());
+            return Ok(DumpOutcome::Rebuild(
+                "the index holds no records".to_string(),
+            ));
         }
+        let refused = |refusal: DumpRefusal| {
+            if version >= 2 {
+                Err(Error::GraphDumpInvalid {
+                    name: DUMP_FILENAME.to_string(),
+                    detail: refusal.detail,
+                })
+            } else {
+                Ok(DumpOutcome::Rebuild(refusal.detail))
+            }
+        };
 
         // The dense index restores itself from the dump. The length
         // manifest.json recorded is checked there before the dump is read,
@@ -679,6 +1216,8 @@ impl Collection {
             pq: dense.pq.clone(),
             int8: dense.int8_codec().cloned(),
             keeps_raw: dense.keeps_raw(),
+            version,
+            rows_only: asked,
         };
         let bounds = Bounds {
             min_records: live,
@@ -686,8 +1225,23 @@ impl Collection {
             max_bytes: u64::MAX,
             ids_by_position: positions,
         };
-        let mut index = DenseIndex::restore(&open, "", dir, &DumpLength(recorded_bytes), &bounds)
-            .map_err(|e| e.to_string())?;
+        let mut index =
+            match DenseIndex::open_dump(&open, "", dir, &DumpLength(recorded_bytes), &bounds) {
+                Ok(DenseRestored::Index(index)) => *index,
+                Ok(DenseRestored::Rows { rows, reason }) => {
+                    let reason = if asked {
+                        format!("{} asked for the rebuild", REBUILD_ENV)
+                    } else {
+                        reason
+                    };
+                    return Ok(DumpOutcome::Rows {
+                        rows,
+                        reason,
+                        asked,
+                    });
+                }
+                Err(refusal) => return refused(refusal),
+            };
         let nodes = index.graph().nb_points();
 
         // Every record the mappings hold has a node in a dump this index
@@ -700,13 +1254,16 @@ impl Collection {
             index.set_live(ids.slots())
         };
         if unplaced > 0 {
-            return Err(format!(
-                "the graph dump names no node for {} of the records mappings.bin holds",
-                unplaced
-            ));
+            return refused(DumpRefusal {
+                region: DumpRegion::Identity,
+                detail: format!(
+                    "the graph dump names no node for {} of the records mappings.bin holds",
+                    unplaced
+                ),
+            });
         }
         dense.replace_index(index);
-        Ok(nodes)
+        Ok(DumpOutcome::Read(nodes))
     }
 
     /// Rebuild the graph from the stored PQ codes (for persistence loading only)
@@ -720,25 +1277,28 @@ impl Collection {
     /// A record that has a raw vector but no stored codes is quantized through
     /// the loaded codebook rather than dropped. An intact directory saved by a
     /// trained index holds codes for every record, so that path only runs on a
-    /// directory that lost pq_codes.bin while keeping its raw vectors. A record
-    /// missing from mappings.bin is assigned a fresh internal id for the same
-    /// reason: every record must come back. It takes the next position, and
-    /// its id joins `positions`, the internal id of the record at each
-    /// position.
+    /// directory that lost pq_codes.bin while keeping its raw vectors. Every
+    /// record is filed at the position mappings.bin gives it, `positions`
+    /// being the internal id of the record at each position, and a record
+    /// mappings.bin does not hold is refused, in the words the readers of the
+    /// two files refuse one in, since its internal id is not known. The
+    /// readers refuse such a record first, so none reaches here from a load.
+    /// A replacement with no room for a record is refused with the graph's
+    /// own words. Either refusal installs nothing.
     ///
-    /// Returns (records inserted, quantized from raw, remapped).
+    /// Returns (records inserted, quantized from raw).
     pub(crate) fn rebuild_graph_from_codes(
         &mut self,
         pq_codes: &HashMap<String, Vec<u8>>,
         vectors: &HashMap<String, Vec<f32>>,
-        positions: &mut Vec<u32>,
-    ) -> Result<(usize, usize, usize), String> {
+        positions: &[u32],
+    ) -> Result<(usize, usize), Error> {
         let pq = match &self.dense().pq {
             Some(pq) if pq.is_trained() => pq.clone(),
             _ => {
-                return Err(
+                return Err(Error::Engine(
                     "the quantized graph rebuild requires a trained product quantizer".to_string(),
-                )
+                ))
             }
         };
 
@@ -746,11 +1306,11 @@ impl Collection {
         for (id, vector) in vectors {
             if !pq_codes.contains_key(id) {
                 let codes = pq.quantize(vector).map_err(|e| {
-                    format!(
+                    Error::Engine(format!(
                         "record '{}' has a raw vector but no stored PQ codes, and quantizing \
                          it through the loaded codebook failed: {}",
                         id, e
-                    )
+                    ))
                 })?;
                 extra.push((id.clone(), codes));
             }
@@ -770,36 +1330,31 @@ impl Collection {
 
         let mut batch: Vec<(&Vec<u8>, usize, Position)> =
             Vec::with_capacity(pq_codes.len() + extra.len());
-        let mut lost: Vec<(&String, &Vec<u8>)> = Vec::new();
+        // The least id of a record mappings.bin does not hold, with the file
+        // that named it, so the refusal names the same record in every
+        // process whatever order the maps hand their entries in.
+        let mut unmapped: Option<(&str, &str)> = None;
         {
             let ids = self.ids.read().unwrap();
-            for (id, codes) in pq_codes
+            let named = pq_codes
                 .iter()
-                .chain(extra.iter().map(|(id, codes)| (id, codes)))
-            {
+                .map(|(id, codes)| (id, codes, "pq_codes.bin"))
+                .chain(extra.iter().map(|(id, codes)| (id, codes, "vectors.bin")));
+            for (id, codes, file) in named {
                 match ids.slot_of(id) {
                     Some(at) => {
                         batch.push((codes, positions[at] as usize, Position::from_slot(at)))
                     }
-                    None => lost.push((id, codes)),
+                    None => {
+                        if unmapped.is_none_or(|(least, _)| id.as_str() < least) {
+                            unmapped = Some((id, file));
+                        }
+                    }
                 }
             }
         }
-        let remapped = lost.len();
-        lost.sort_by(|a, b| a.0.cmp(b.0));
-        for (id, codes) in lost {
-            let internal_id = self.get_next_id();
-            // Held to the ceiling before the id store is touched, as the
-            // mappings' own ids are, so no id past it is cut to 32 bits.
-            crate::persistence::refuse_past_last_id(internal_id).map_err(|e| e.to_string())?;
-            let at = {
-                let mut ids = self.ids.write().unwrap();
-                let at = ids.extent();
-                ids.insert(at, id).map_err(|e| e.to_string())?;
-                at
-            };
-            positions.push(internal_id as u32);
-            batch.push((codes, internal_id, Position::from_slot(at)));
+        if let Some((id, file)) = unmapped {
+            return Err(unmapped_record(file, id));
         }
 
         // Insert in internal id order, which is arrival order, rather than in
@@ -810,23 +1365,25 @@ impl Collection {
         // Filled before it is installed, and installed under one write guard, so
         // the graph the index holds is never a partly rebuilt one.
         if !batch.is_empty() {
-            new_hnsw.insert_batch_pq(&batch)?;
+            new_hnsw
+                .insert_batch_pq(&batch)
+                .map_err(Error::in_rebuild)?;
         }
         // Every record the index holds takes a node, so a record the codes
         // did not reach refuses the rebuild before anything is swapped, rather
         // than leaving a held record outside the graph.
         let held = self.ids.read().unwrap().len();
         if new_hnsw.nb_points() != held {
-            return Err(format!(
+            return Err(Error::Engine(format!(
                 "the rebuild from codes built {} nodes for the {} records the index holds",
                 new_hnsw.nb_points(),
                 held
-            ));
+            )));
         }
         self.dense().replace_graph(new_hnsw);
         self.sync_dense_live();
 
-        Ok((batch.len(), extra.len(), remapped))
+        Ok((batch.len(), extra.len()))
     }
 
     /// Rebuild the graph of a trained scalar index from the rows artefact,
@@ -842,12 +1399,10 @@ impl Collection {
         &mut self,
         rows: &crate::persistence::Int8Rows,
         positions: &[u32],
-    ) -> Result<usize, String> {
-        let codec = self
-            .dense()
-            .int8_codec()
-            .cloned()
-            .ok_or_else(|| "the scalar graph rebuild requires fitted scales".to_string())?;
+    ) -> Result<usize, Error> {
+        let codec = self.dense().int8_codec().cloned().ok_or_else(|| {
+            Error::Engine("the scalar graph rebuild requires fitted scales".to_string())
+        })?;
         let mut new_hnsw = VectorGraph::new_int8(
             &self.dense().metric,
             self.dense().m(),
@@ -861,16 +1416,18 @@ impl Collection {
             .iter()
             .map(|(internal_id, row)| {
                 let at = walk.position_of(internal_id).ok_or_else(|| {
-                    format!(
+                    Error::Engine(format!(
                         "the row of internal id {} names a record mappings.bin does not hold",
                         internal_id
-                    )
+                    ))
                 })?;
                 Ok((row, internal_id, Position::from_slot(at)))
             })
-            .collect::<Result<_, String>>()?;
+            .collect::<Result<_, Error>>()?;
         if !batch.is_empty() {
-            new_hnsw.insert_batch_int8(&batch)?;
+            new_hnsw
+                .insert_batch_int8(&batch)
+                .map_err(Error::in_rebuild)?;
         }
         self.dense().replace_graph(new_hnsw);
         self.sync_dense_live();
@@ -896,34 +1453,6 @@ impl Collection {
         self.dense()
             .install_int8_codec(codec)
             .map_err(|_| Error::Engine("the scalar codec was already fitted".to_string()))
-    }
-
-    /// Append every live record's internal id and scalar row to `out`, in
-    /// internal id order, and return how many were written. The payload of
-    /// the rows artefact, written straight into the frame's buffer so the
-    /// rows are copied once. Zero on any graph that is not a scalar one.
-    /// The records are walked in position order, which is internal id order,
-    /// and each is named by the internal id its node was inserted under.
-    pub(crate) fn write_int8_rows(&self, out: &mut Vec<u8>) -> usize {
-        let ids = self.ids.read().unwrap();
-        let index = self.dense().index.read().unwrap();
-        let graph = index.graph();
-        let origin_ids = graph.origin_ids();
-        let mut written = 0usize;
-        for at in ids.slots() {
-            let Some((row, internal_id)) = index
-                .node_of(Position::from_slot(at))
-                .and_then(|node| Some((graph.int8_row_at(node)?, origin_ids[node as usize])))
-            else {
-                continue;
-            };
-            let id =
-                u32::try_from(internal_id).expect("internal ids are issued below the u32 ceiling");
-            out.extend_from_slice(&id.to_le_bytes());
-            out.extend(row.iter().map(|&byte| byte as u8));
-            written += 1;
-        }
-        written
     }
 
     /// Values a scalar graph has clipped since its scales were fitted; see
@@ -960,61 +1489,32 @@ impl Collection {
 
     /// Set the vector count alone (for persistence loading only)
     ///
-    /// Separate from `set_counters` because the id counter must keep whatever
-    /// a graph rebuild advanced it to for a record the mappings did not name.
-    /// Rewinding it would hand out an internal id such a record already holds.
+    /// Separate from `set_counters` because the count is set from the records
+    /// the load restored, once they are counted, and the id counter is the one
+    /// config.json records, which nothing after it moves.
     pub(crate) fn set_vector_count(&mut self, vector_count: usize) {
         *self.vector_count.lock().unwrap() = vector_count;
     }
 
     /// Replace the stored record data with what was read from disk
     ///
-    /// For persistence loading only, and only after the graph is back, because
-    /// the columns are built over the id store and either rebuild fallback may add
-    /// an id for a record the mappings did not name. Writing the two maps back
-    /// and building the columns from them leaves the loaded index holding
-    /// exactly what was saved.
+    /// For persistence loading only, once the graph is back. The metadata
+    /// store comes whole, read straight from `metadata.json` with every
+    /// record at the position the mappings give it, which no rebuild moves,
+    /// since a rebuild refuses a record the mappings do not name. An entry
+    /// naming an id the mappings do not hold had no position to go in and
+    /// was dropped by the read. Writing the codes back, taking the store and
+    /// building the columns from it leaves the loaded index holding exactly
+    /// what was saved. Every read that builds the codes inserts and never
+    /// removes, so the buckets their table holds are taken from its capacity.
     pub(crate) fn restore_storage_maps(
         &mut self,
         pq_codes: HashMap<String, Vec<u8>>,
-        vector_metadata: HashMap<String, HashMap<String, Value>>,
+        vector_metadata: MetadataStore,
     ) {
-        *self.dense().pq_codes.write().unwrap() = pq_codes;
-        self.restore_metadata(vector_metadata);
+        *self.dense().pq_codes.write().unwrap() = SizedMap::from_unremoved(pq_codes);
+        *self.vector_metadata.write().unwrap() = vector_metadata;
         self.rebuild_columns();
-    }
-
-    /// Place every record's metadata at the position the id store holds for
-    /// it.
-    ///
-    /// `metadata.json` is keyed by external id and the store is indexed by
-    /// position, so each entry is resolved through the id store, which the
-    /// mappings and either graph rebuild have filled by now. An entry naming
-    /// an id the mappings do not hold has no slot to go in and is dropped,
-    /// counted in the log. No reader could reach such an entry by id, since
-    /// every one resolved a record through the id store first; a filtered
-    /// `count` on an undeclared field used to count it, and counts it no
-    /// longer.
-    ///
-    /// The guards are taken in the declared order, the id store then
-    /// `vector_metadata`.
-    fn restore_metadata(&mut self, metadata: HashMap<String, HashMap<String, Value>>) {
-        let ids = self.ids.read().unwrap();
-        let mut store = self.vector_metadata.write().unwrap();
-        store.clear(self.expected_size());
-        let mut unmapped = 0usize;
-        for (ext_id, fields) in metadata {
-            match ids.slot_of(&ext_id) {
-                Some(at) => store.insert(at, fields),
-                None => unmapped += 1,
-            }
-        }
-        if unmapped > 0 {
-            debug!(target: LOG_TARGET, operation = "restore_metadata",
-                unmapped = unmapped,
-                "metadata.json names records the mappings do not hold, and their entries were dropped"
-            );
-        }
     }
 
     /// Build every declared column from the restored metadata.
@@ -1121,29 +1621,32 @@ impl Collection {
     /// own mappings, with the quantized fallback, and with anything outside
     /// the directory keyed on internal ids.
     ///
-    /// A record the mappings do not name is given a fresh id, as the
-    /// quantized fallback gives one, taken in external id order so the ids
-    /// are handed out the same way in every process, and the next position,
-    /// its id joining `positions`. Ascending internal id is arrival order and
-    /// position order, so the rebuild is as close to the original build as a
-    /// rebuild can get, and two rebuilds of one directory are one graph.
+    /// A record the mappings do not name is refused, as the quantized
+    /// fallback refuses one, since its internal id is not known; the least
+    /// such id is named, so every process names the same one. The reader of
+    /// vectors.bin refuses such a record first, so none reaches here from a
+    /// load. Ascending internal id is arrival order and position order, so
+    /// the rebuild is as close to the original build as a rebuild can get,
+    /// and two rebuilds of one directory are one graph.
     ///
     /// What is reproduced exactly from the path this replaced is
-    /// `extract_single_vector`'s validation and its call to
+    /// `extract_single_vector_safe`'s validation and its call to
     /// `process_vector_for_space`. A stored vector is already normalized for
     /// a cosine index, and normalizing it a second time is what `add` did, so
     /// it is what this does. Skipping it would build a different graph, which
     /// on this path means giving a user's index different answers. A refused
     /// record fails the whole rebuild rather than being dropped, since a
     /// graph short of a record the storage maps still report is an index
-    /// every query silently misses on.
+    /// every query silently misses on. So is a record the replacement has no
+    /// room for, with the room's refusal as a rebuild gives it, and the
+    /// replacement is dropped.
     pub(crate) fn rebuild_from_records(
         &self,
         records: Vec<(String, Vec<f32>)>,
-        positions: &mut Vec<u32>,
+        positions: &[u32],
     ) -> Result<usize, Error> {
         let mut mapped: Vec<(usize, usize, Vec<f32>)> = Vec::with_capacity(records.len());
-        let mut unmapped: Vec<(String, Vec<f32>)> = Vec::new();
+        let mut unmapped: Option<String> = None;
         {
             let ids = self.ids.read().unwrap();
             for (id, vector) in records {
@@ -1168,32 +1671,23 @@ impl Collection {
                 let vector = self.process_vector_for_space(vector);
                 match ids.slot_of(&id) {
                     Some(at) => mapped.push((at, positions[at] as usize, vector)),
-                    None => unmapped.push((id, vector)),
+                    None => {
+                        if unmapped.as_ref().is_none_or(|least| id < *least) {
+                            unmapped = Some(id);
+                        }
+                    }
                 }
             }
+        }
+        if let Some(id) = unmapped {
+            return Err(unmapped_record("vectors.bin", &id));
         }
 
         // The binding releases the interpreter lock around the whole load,
         // so the rebuild runs without it. The mutation guard is held for the
-        // ids handed to unmapped records and for the swap, which is the
-        // discipline every other mutation keeps, though nothing else can
-        // reach a collection the loader still holds.
+        // swap, which is the discipline every other mutation keeps, though
+        // nothing else can reach a collection the loader still holds.
         let _writers = self.writers.lock().unwrap();
-        unmapped.sort_by(|a, b| a.0.cmp(&b.0));
-        for (id, vector) in unmapped {
-            let internal_id = self.get_next_id();
-            // Held to the ceiling before the id store is touched, as the
-            // mappings' own ids are, so no id past it is cut to 32 bits.
-            crate::persistence::refuse_past_last_id(internal_id)?;
-            let at = {
-                let mut ids = self.ids.write().unwrap();
-                let at = ids.extent();
-                ids.insert(at, &id)?;
-                at
-            };
-            positions.push(internal_id as u32);
-            mapped.push((at, internal_id, vector));
-        }
         mapped.sort_by_key(|&(_, internal_id, _)| internal_id);
 
         let dense = self.dense();
@@ -1206,7 +1700,9 @@ impl Collection {
             dense.ef_construction(),
         );
         for (at, internal_id, vector) in &mapped {
-            new_hnsw.insert(vector, *internal_id, Position::from_slot(*at));
+            new_hnsw
+                .try_insert(vector, *internal_id, Position::from_slot(*at))
+                .map_err(Error::in_rebuild)?;
         }
 
         // Filled before it is installed, and installed under one write guard,
@@ -1253,24 +1749,23 @@ impl Collection {
     /// actually holds. A directory written before this field existed carries a
     /// zero and would otherwise reissue every generated id it holds, so the
     /// records themselves supply the floor. A directory that carries the field
-    /// is at or above its own floor already and the max changes nothing.
+    /// is at or above its own floor already and the max changes nothing. The
+    /// saved value is held to [`GENERATED_ID_CEILING`] as the floor is, so a
+    /// counter a load restores never wraps.
     pub(crate) fn set_generated_ids(&mut self, saved: usize, floor: usize) {
-        *self.generated_ids.lock().unwrap() = saved.max(floor);
+        *self.generated_ids.lock().unwrap() = saved.min(GENERATED_ID_CEILING).max(floor);
     }
 
     /// The highest N among ids of the form `vec_N`, or zero where there is none
     ///
     /// A user is free to add a record called `vec_9` by hand, and this counts
     /// it, so the next generated id is above it. That is the point: the counter
-    /// exists to stop an id being handed out twice.
+    /// exists to stop an id being handed out twice. An N past
+    /// [`GENERATED_ID_CEILING`] is not counted; see [`generated_number`].
     pub(crate) fn highest_generated_id(ids: impl Iterator<Item = impl AsRef<str>>) -> usize {
-        ids.filter_map(|id| {
-            id.as_ref()
-                .strip_prefix("vec_")
-                .and_then(|rest| rest.parse::<usize>().ok())
-        })
-        .max()
-        .unwrap_or(0)
+        ids.filter_map(|id| generated_number(id.as_ref()))
+            .max()
+            .unwrap_or(0)
     }
 
     /// Get the current ID counter value (thread-safe)
@@ -1278,13 +1773,14 @@ impl Collection {
         *self.id_counter.lock().unwrap()
     }
 
-    /// Get read access to the PQ codes HashMap (thread-safe)
+    /// Get read access to the PQ codes HashMap (thread-safe), for the tests
     ///
     /// Crate private, as are the four accessors below that also hand out a
     /// guard. They return a [`ReadGuard`], and the binding reaches nothing
     /// through a guard: it takes owned values from the operations and
     /// nothing else.
-    pub(crate) fn pq_codes(&self) -> ReadGuard<'_, HashMap<String, Vec<u8>>> {
+    #[cfg(test)]
+    pub(crate) fn pq_codes(&self) -> ReadGuard<'_, SizedMap<String, Vec<u8>>> {
         self.dense().pq_codes.read().unwrap()
     }
 
@@ -1315,22 +1811,6 @@ impl Collection {
     /// Get reference to the PQ instance
     pub(crate) fn pq(&self) -> Option<&Arc<zeusdb_vector_core::PQ>> {
         self.dense().pq.as_ref()
-    }
-
-    /// Bytes one record's code occupies: one a subvector under product
-    /// quantization, one a value plus the norm tail under scalar
-    /// quantization, and one where no quantization is declared.
-    pub(crate) fn quantization_code_bytes(&self) -> usize {
-        match self
-            .dense()
-            .quantization_config
-            .as_ref()
-            .map(|config| &config.scheme)
-        {
-            Some(super::QuantizationScheme::Pq { subvectors, .. }) => *subvectors,
-            Some(super::QuantizationScheme::Int8 { .. }) => self.int8_row_bytes(),
-            None => 1,
-        }
     }
 
     /// Get the index creation timestamp

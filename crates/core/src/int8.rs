@@ -17,10 +17,13 @@
 //! code `-128` is never written, so the codes are symmetric and a negated
 //! vector encodes to negated codes.
 //!
-//! A dimension whose sample holds only zeros gets a scale of one, so that
-//! it decodes to zero and a later non-zero value in it rounds to zero as
-//! well rather than saturating. That dimension carries nothing the sample
-//! could see, and a scale of one is the least surprising value for it.
+//! A dimension whose sample holds only zeros gets a scale of one, so it
+//! decodes to zero, and a later value in it is coded at that scale. That
+//! dimension carries nothing the sample could see, and a scale of one is
+//! the least surprising value for it. A dimension whose largest magnitude
+//! is so small that dividing it by 127 rounds to zero in single precision
+//! takes a scale of one for the same reason, so every scale a fit produces
+//! is positive and a codec built from the scales again is the codec fitted.
 //!
 //! # What is exact
 //!
@@ -34,6 +37,10 @@
 
 /// The largest magnitude a code can hold. The range is `-QMAX..=QMAX`.
 const QMAX: f32 = 127.0;
+
+/// The widest difference of two codes, `QMAX` either side of zero, which a
+/// distance between two decoded vectors multiplies a scale by.
+const WIDEST: f32 = 2.0 * QMAX;
 
 /// A fitted scalar quantizer: one scale a dimension.
 ///
@@ -52,6 +59,8 @@ impl Int8Codec {
     /// Refuses an empty sample, a zero width, and a row of the wrong width
     /// or holding a value that is not finite, naming the row.
     pub fn fit(dim: usize, sample: &[Vec<f32>]) -> Result<Self, String> {
+        #[cfg(any(test, feature = "test-support"))]
+        crate::pq::count_fit();
         if dim == 0 {
             return Err("a scalar codec quantizes vectors of at least one value".to_string());
         }
@@ -84,8 +93,9 @@ impl Int8Codec {
         let scales = largest
             .into_iter()
             .map(|magnitude| {
-                if magnitude > 0.0 {
-                    magnitude / QMAX
+                let scale = magnitude / QMAX;
+                if scale > 0.0 {
+                    scale
                 } else {
                     1.0
                 }
@@ -96,10 +106,12 @@ impl Int8Codec {
 
     /// A codec over scales read back from a saved index.
     ///
-    /// Refuses an empty array and any scale that is not finite and
-    /// positive, since a zero or negative scale decodes every code to the
-    /// same value or to the wrong sign and a non-finite one poisons every
-    /// distance.
+    /// Refuses an empty array, any scale that is not finite and positive,
+    /// since a zero or negative scale decodes every code to the same value or
+    /// to the wrong sign and a non-finite one poisons every distance, and any
+    /// scale for which 254 times it, the widest difference of two decoded
+    /// codes, is not finite, since a distance between two decoded vectors
+    /// then overflows.
     pub fn from_scales(scales: Vec<f32>) -> Result<Self, String> {
         if scales.is_empty() {
             return Err("a scalar codec carries at least one scale".to_string());
@@ -114,7 +126,37 @@ impl Int8Codec {
                 at, scale
             ));
         }
+        if let Some((at, &scale)) = scales
+            .iter()
+            .enumerate()
+            .find(|(_, scale)| !(**scale * WIDEST).is_finite())
+        {
+            return Err(format!(
+                "scale {} is {}, and {} times it, the widest difference of two codes, is not \
+                 finite",
+                at, scale, WIDEST
+            ));
+        }
         Ok(Int8Codec { scales })
+    }
+
+    /// The largest scale a sample within [`NORM_BOUND`](crate::NORM_BOUND)
+    /// fits, being the scale of a magnitude of 2^62. Every value of a vector
+    /// within the bound is at most its norm, and a scale is its dimension's
+    /// largest magnitude over 127 in `f32`, which rises with the magnitude.
+    pub fn largest_scale_within_bound() -> f32 {
+        crate::distance::NORM_BOUND_F32 / QMAX
+    }
+
+    /// The first scale past [`Int8Codec::largest_scale_within_bound`], and
+    /// its dimension. `None` for every codec a sample within the bound fits.
+    pub fn first_scale_past_bound(&self) -> Option<(usize, f32)> {
+        let largest = Self::largest_scale_within_bound();
+        self.scales
+            .iter()
+            .enumerate()
+            .find(|(_, scale)| **scale > largest)
+            .map(|(at, &scale)| (at, scale))
     }
 
     /// Values in a vector this codec encodes.
@@ -199,6 +241,10 @@ impl Int8Codec {
 
 /// One value to its code: scaled, rounded half to even, and saturated.
 #[inline(always)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "a scaled value clamped to the code's range before the cast"
+)]
 fn encode(value: f32, scale: f32) -> i8 {
     let scaled = (value / scale).round_ties_even();
     // A NaN would compare false against both bounds and reach the cast,
@@ -251,6 +297,27 @@ mod tests {
             codec.quantize(&[-1.0, -3.5, 0.0, -12.7]).unwrap(),
             vec![-127, -127, 0, -127]
         );
+    }
+
+    /// A dimension whose largest magnitude divided by 127 rounds to zero in
+    /// single precision takes a scale of one, as a dimension of zeros does,
+    /// so every scale is positive and the codec built from the scales again
+    /// is the codec fitted. Above that magnitude the scale is the quotient.
+    #[test]
+    fn a_tiny_largest_magnitude_takes_a_scale_of_one() {
+        let tiny = 1e-44f32;
+        assert_eq!(tiny / QMAX, 0.0, "the quotient rounds to zero");
+        let least = 9e-44f32;
+        assert!(least / QMAX > 0.0, "the quotient is the least subnormal");
+        let codec = Int8Codec::fit(3, &[vec![tiny, -least, 0.5], vec![-tiny, 0.0, -0.25]]).unwrap();
+        assert_eq!(codec.scales()[0], 1.0);
+        assert_eq!(codec.scales()[1], least / QMAX);
+        assert_eq!(codec.scales()[2], 0.5 / QMAX);
+        let rebuilt = Int8Codec::from_scales(codec.scales().to_vec()).unwrap();
+        assert_eq!(rebuilt, codec);
+        let codes = codec.quantize(&[tiny, -least, 0.5]).unwrap();
+        assert_eq!((codes[0], codes[2]), (0, 127));
+        assert!((-127..0).contains(&codes[1]), "{codes:?}");
     }
 
     /// A value beyond the fitted range saturates at the edge rather than
@@ -361,5 +428,43 @@ mod tests {
             codec.memory_bytes(),
             std::mem::size_of::<Int8Codec>() + 100 * 4
         );
+    }
+
+    /// A scale for which 254 times it is not finite is refused, naming it,
+    /// and a scale for which it is finite is taken, so two codes at the ends
+    /// of the range decode to a finite difference.
+    #[test]
+    fn a_scale_whose_widest_difference_overflows_is_refused() {
+        let past = f32::MAX / 200.0;
+        assert_eq!(
+            Int8Codec::from_scales(vec![1.0, past]).unwrap_err(),
+            format!(
+                "scale 1 is {}, and 254 times it, the widest difference of two codes, is not \
+                 finite",
+                past
+            )
+        );
+        let largest = f32::MAX / 256.0;
+        let codec = Int8Codec::from_scales(vec![largest]).unwrap();
+        assert!((decode(127, largest) - decode(-127, largest)).is_finite());
+        assert_eq!(codec.scales(), &[largest]);
+    }
+
+    /// The largest scale within the bound is the scale a fit to a value of
+    /// 2^62 takes, and a fit to the next value above it takes a scale past
+    /// it, which `first_scale_past_bound` names with its dimension.
+    #[test]
+    fn the_largest_scale_within_the_bound_is_the_fit_of_2_62() {
+        let at = f32::from_bits(0x5E80_0000);
+        let past = f32::from_bits(0x5E80_0001);
+        let within = Int8Codec::fit(2, &[vec![at, -1.0], vec![0.5, 2.0]]).unwrap();
+        assert_eq!(within.scales()[0], Int8Codec::largest_scale_within_bound());
+        assert_eq!(within.first_scale_past_bound(), None);
+        let beyond = Int8Codec::fit(2, &[vec![1.0, -past]]).unwrap();
+        assert_eq!(
+            beyond.first_scale_past_bound(),
+            Some((1, beyond.scales()[1]))
+        );
+        assert!(beyond.scales()[1] > Int8Codec::largest_scale_within_bound());
     }
 }

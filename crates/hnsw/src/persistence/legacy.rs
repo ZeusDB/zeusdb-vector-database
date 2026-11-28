@@ -23,7 +23,8 @@
 //! forward map of `mappings.bin`, for which the loader holds no count, at the
 //! distinct keys its bytes carry. A codebook is walked whole before anything
 //! is allocated for it and refused there if it is not the shape the
-//! configuration describes.
+//! configuration describes, and a codebook holding a value that is not
+//! finite is refused as it is read.
 //!
 //! **A value that reads is the value the old decode returned for the same
 //! bytes**, a map keeping the last copy of a key it holds twice. A file the
@@ -31,7 +32,7 @@
 //! after the last entry, which the old decode left unread and no release
 //! wrote, are refused.
 
-use super::framed::Shape;
+use super::framed::{non_finite_codebook, Shape};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::{BuildHasher, BuildHasherDefault, RandomState};
 use zeusdb_vector_core::Error;
@@ -63,6 +64,14 @@ enum Stop {
     },
     /// Bytes after the last entry, starting at `at`.
     Trailing { at: usize },
+    /// A codebook value that is not finite, at value `position` of centroid
+    /// `centroid` of subvector `subvector`.
+    NotFinite {
+        subvector: usize,
+        centroid: usize,
+        position: usize,
+        value: f32,
+    },
 }
 
 impl Stop {
@@ -95,6 +104,12 @@ impl Stop {
                 "the file continues past its last entry, from byte {} to byte {}",
                 at, bytes
             )),
+            Stop::NotFinite {
+                subvector,
+                centroid,
+                position,
+                value,
+            } => non_finite_codebook(file, subvector, centroid, position, value),
         }
     }
 }
@@ -309,16 +324,23 @@ fn vectors(bytes: &[u8], records: usize) -> Result<HashMap<String, Vec<f32>>, St
 /// set sized by `records`, the count the mappings hold, and a set as large as
 /// the file's count proves every id distinct. A smaller set holds a duplicate
 /// or a collision, and the ids are counted again by name, which no file a
-/// save wrote reaches.
-pub(super) fn walk_vectors(
-    bytes: &[u8],
+/// save wrote reaches. `each` is handed every entry's id and the number of
+/// values its vector holds, in the order the file holds them, and what it
+/// gathers stands only where the walk returns the count.
+pub(super) fn walk_vectors<'a>(
+    bytes: &'a [u8],
     file: &str,
     records: usize,
+    each: &mut dyn FnMut(&'a str, usize),
 ) -> Result<(usize, Vec<String>), Error> {
-    walk(bytes, records).map_err(|stop| stop.refusal(file, bytes.len()))
+    walk(bytes, records, each).map_err(|stop| stop.refusal(file, bytes.len()))
 }
 
-fn walk(bytes: &[u8], records: usize) -> Result<(usize, Vec<String>), Stop> {
+fn walk<'a>(
+    bytes: &'a [u8],
+    records: usize,
+    each: &mut dyn FnMut(&'a str, usize),
+) -> Result<(usize, Vec<String>), Stop> {
     let hasher = RandomState::new();
     let mut wire = Wire::new(bytes);
     let entries = wire.len(2)?;
@@ -326,11 +348,13 @@ fn walk(bytes: &[u8], records: usize) -> Result<(usize, Vec<String>), Stop> {
     let mut offenders: BTreeSet<&str> = BTreeSet::new();
     for _ in 0..entries {
         let id = wire.str()?;
-        if all_finite(wire.floats()?) {
+        let values = wire.floats()?;
+        if all_finite(values) {
             offenders.remove(id);
         } else {
             offenders.insert(id);
         }
+        each(id, values.len() / 4);
         hashes.insert(hasher.hash_one(id));
     }
     wire.end()?;
@@ -411,17 +435,31 @@ fn measure(bytes: &[u8]) -> Result<((usize, usize, usize), bool), Stop> {
     Ok(((subvectors, centroids, width), uniform))
 }
 
-/// A codebook `measure` has read whole, at exactly its shape.
+/// A codebook `measure` has read whole, at exactly its shape, every value
+/// finite.
 fn codebook(bytes: &[u8], shape: (usize, usize, usize)) -> Result<Codebook, Stop> {
     let (subvectors, centroids, _) = shape;
     let mut wire = Wire::new(bytes);
     wire.len(1)?;
     let mut out = Vec::with_capacity(subvectors);
-    for _ in 0..subvectors {
+    for subvector in 0..subvectors {
         wire.len(1)?;
         let mut sub = Vec::with_capacity(centroids);
-        for _ in 0..centroids {
-            sub.push(floats_of(wire.floats()?));
+        for centroid in 0..centroids {
+            let values = floats_of(wire.floats()?);
+            if let Some((position, &value)) = values
+                .iter()
+                .enumerate()
+                .find(|(_, value)| !value.is_finite())
+            {
+                return Err(Stop::NotFinite {
+                    subvector,
+                    centroid,
+                    position,
+                    value,
+                });
+            }
+            sub.push(values);
         }
         out.push(sub);
     }

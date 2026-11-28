@@ -160,6 +160,7 @@ pub fn fuse<I: Clone + Ord + Hash>(fusion: Fusion, pages: &[&[(I, f32)]]) -> Vec
         .into_iter()
         .map(|(id, score, contributions)| FusedHit {
             id,
+            #[expect(clippy::cast_possible_truncation, reason = "a fused score narrowed to the f32 a hit carries, not an offset, a count, an index or an id")]
             score: score as f32,
             contributions,
         })

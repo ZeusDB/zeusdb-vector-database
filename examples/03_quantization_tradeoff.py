@@ -1,6 +1,6 @@
 """Measure what product quantization costs you, on your own machine.
 
-Quantization is a memory decision that costs accuracy, and above roughly 10,000
+Quantization is a memory decision that costs accuracy, and above about 25,000
 records it costs query time as well. The size of the accuracy cost is much
 larger than most people expect, and one of the two storage modes cannot recover
 it at all. This file builds the same 3,000 vectors three ways, measures the
@@ -12,7 +12,7 @@ unquantized one. It stops being faster somewhere above that, because the rerank
 fetch grows with the corpus and the graph traversal has to be as wide as the
 fetch. Where it stops depends on your data. On clustered vectors of dimension
 768 it is between 10,000 and 15,000 records, and on real OpenAI embeddings it is
-near 11,000. See the README for the measured tables.
+near 25,000. See the README for the measured tables.
 
 How deep the fetch has to go is measured on your own data when training
 completes, not set by a formula, so `get_stats()["rerank_default_fetch"]` tells
@@ -23,9 +23,9 @@ sample so the fetch can be scaled to a corpus larger than the one it was
 measured on. It is also taken at pages of 1, 10 and 100, because the hundredth
 true neighbour sits deeper than the tenth, and a search interpolates between
 those three for whatever page you ask for. This file runs at dimension 64, where
-`create()` warns that quantization removes only a few percent of what an
-unquantized index holds. That warning is the point of the file rather than a
-problem with it.
+`create()` warns that quantization holds more than an unquantized index at
+this record count. That warning is the point of the file rather than a problem
+with it.
 
 The short version, which the numbers below reproduce every run. Use
 `quantized_with_raw` and leave rerank on, or do not quantize.

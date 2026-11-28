@@ -1,16 +1,12 @@
 """Concurrent search, and search running alongside a write.
 
-Three separate defects sat on this path. Search held an exclusive lock on the
-graph, so two searches never ran at once. Above that, the mutating methods took
-`&mut self`, which PyO3 enforces as an exclusive borrow of the whole object, so a
-write arriving while a search held its shared borrow across `allow_threads`
-raised `RuntimeError: Already borrowed` before any lock was reached. Below both,
-`add` held the interpreter lock for its entire duration, so a write in flight
-stopped every Python thread in the process rather than only the ones touching the
-index. These tests hold the line on all three, which is that concurrent searches
-return exactly what the same queries return alone, that a write in flight never
-makes a search raise, and that searches keep running at a real rate while an
-insert is underway.
+Every method of the index takes `&self`, so a write that arrives while a
+search is in flight takes no exclusive borrow of the object. These tests hold
+that concurrent searches return exactly what the same queries return alone,
+and that a write in flight never makes a search raise. That a call releases
+the interpreter for its work, so other Python threads run beside it, is held
+in `tests/test_interpreter.py`, and that a write made while a search is held
+in flight completes is held in `tests/test_overlap.py`.
 
 Every test here is built to fail for a reason rather than on timing.
 
@@ -20,10 +16,11 @@ interference rather than scheduling noise. Where the index is being written, an
 exact reference does not exist, so the assertions drop to invariants that hold at
 every instant of the write instead.
 
-Overlap is measured rather than assumed. Readers maintain an in flight counter
-around each search, the writer samples it as it enters, and the test asserts
-afterwards that the write genuinely landed on top of a read. A run that failed to
-construct the overlap fails the test rather than passing on an empty exercise.
+Every count a test asserts is one its own loops run until they reach, so a slow
+machine takes longer and fails nothing. Every wait ends at a limit far above what
+any run needs, and reaching it fails the test with words that name a hang. Where
+a rule needs one operation to overlap another, the overlap is made at a pause, in
+`tests/test_overlap.py` and in the index crate's own tests, and not counted here.
 """
 
 import os
@@ -51,37 +48,6 @@ PQ_CONFIG = {"type": "pq", "subvectors": 8, "bits": 8, "training_size": 1000}
 THREADS = 8
 ROUNDS = 6
 
-# The interpreter lock test below. The insert is split into rounds so that
-# each one can be timed against a control window of its own length, and the
-# rounds together insert what one call used to.
-GIL_DIM = 32
-GIL_BASE = 1500
-GIL_ROUNDS = 9
-GIL_BATCH = 700
-MIN_ADD_WINDOW_S = 0.10
-
-# The search rate during an insert, as a share of the rate the same thread
-# reaches over a window of the same length with a second search thread beside
-# it in place of the insert. A share rather than a count, so the bound is a
-# fraction of what this machine actually does rather than a number tuned to
-# one machine.
-#
-# Both halves of "same length" and "in place of" are load bearing, and neither
-# held before. The control window was a fixed 0.30 seconds against an insert
-# lasting seconds, and a 0.30 second sample on a loaded machine lands anywhere
-# across a factor of four. The control also ran with the reader alone in the
-# process while the insert's window held two threads, so the share measured
-# how many cores the machine has as much as what the lock does. On four cores
-# the old form read 0.164 and 0.194 against this bound with nothing wrong.
-# Matched in length, matched in threads and reduced by a median over the
-# rounds, the same contention reads 0.61 to 1.79.
-#
-# A build where `add` never released the lock was measured at 2.2 to 2.4
-# percent of the reader's rate. Releasing it puts the two threads in ordinary
-# competition for the CPU. A fifth sits an order of magnitude above the first
-# and well below what a matched pair reads.
-MIN_SEARCH_SHARE = 0.20
-
 # The sustained mixed workload. Its assertions are counts and known answers
 # rather than durations, and the writer is bounded by batches rather than by a
 # clock. Bounded by a clock, the eight readers had to be created and scheduled
@@ -101,14 +67,9 @@ TRAIN_PRELOAD = 600
 TRAIN_BATCH = 200
 TRAIN_BATCHES = 6
 
-# A batch search holds its shared borrow of the index for the whole batch, which
-# is what gives a writer a window wide enough to land in reliably.
+# The queries a read thread searches as one batch, so its shared borrow of the
+# index is held for the whole batch.
 READ_BATCH = 128
-
-# How many times a write must be observed starting on top of a live read before
-# the overlap counts as constructed.
-MIN_OVERLAPS = 5
-OVERLAP_TIMEOUT_S = 60.0
 
 
 def unit(vectors):
@@ -189,13 +150,11 @@ def run_on_threads(work, threads=THREADS):
 
 
 class ReadLoad:
-    """Background threads searching continuously, with a count of reads in flight.
+    """Background threads searching continuously.
 
-    A reader raises its slot of `in_flight` immediately before entering `search`
-    and lowers it immediately after. A writer that samples a non zero total as it
-    starts is therefore starting on top of a read, which is exactly the pairing
-    that used to raise. Reads run a batch so the shared borrow is held for the
-    whole batch rather than for one traversal.
+    Reads run a batch, so each thread's shared borrow of the index is held for
+    the whole batch rather than for one traversal. A reader that raises stops
+    and keeps what it raised, which `check()` raises on the calling thread.
     """
 
     def __init__(self, index, batch, threads=4):
@@ -203,15 +162,12 @@ class ReadLoad:
         self.batch = batch
         self.reads = 0
         self.errors = []
-        self._in_flight = 0
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._threads = [threading.Thread(target=self._run) for _ in range(threads)]
 
     def _run(self):
         while not self._stop.is_set():
-            with self._lock:
-                self._in_flight += 1
             try:
                 self.index.search(self.batch, top_k=TOP_K)
             except BaseException as exc:  # noqa: BLE001 - surfaced by check()
@@ -219,12 +175,7 @@ class ReadLoad:
                 return
             finally:
                 with self._lock:
-                    self._in_flight -= 1
                     self.reads += 1
-
-    def in_flight(self):
-        with self._lock:
-            return self._in_flight
 
     def __enter__(self):
         for thread in self._threads:
@@ -251,26 +202,6 @@ class ReadLoad:
     def check(self):
         if self.errors:
             raise self.errors[0]
-
-
-def drive_writes(load, write, min_overlaps=MIN_OVERLAPS):
-    """Call `write` repeatedly until enough calls have started on top of a read.
-
-    Returns the number of writes that began while at least one search was in
-    flight. The caller asserts on it, so a run that could not construct the
-    overlap fails rather than reporting a pass it did not earn.
-    """
-    overlaps = 0
-    attempts = 0
-    deadline = time.monotonic() + OVERLAP_TIMEOUT_S
-    while overlaps < min_overlaps and time.monotonic() < deadline:
-        overlapping = load.in_flight() > 0
-        write(attempts)
-        attempts += 1
-        if overlapping:
-            overlaps += 1
-        load.check()
-    return overlaps
 
 
 # ------------------------------------------------------------
@@ -332,61 +263,6 @@ def test_concurrent_quantized_queries_do_not_share_a_lookup_table():
 # ------------------------------------------------------------
 # Writing while searches are in flight
 # ------------------------------------------------------------
-
-
-@pytest.mark.parametrize("build", [build_raw, build_quantized], ids=["raw", "quantized"])
-def test_add_during_search_does_not_raise(build):
-    """An add arriving while a search is in flight completes rather than raising.
-
-    This is the user facing symptom. `add` took `&mut self` and `search` holds a
-    shared borrow across the traversal it runs with the GIL released, so the add
-    raised `RuntimeError: Already borrowed` on arrival. Nothing about it was
-    intermittent once the pairing was constructed, and this constructs it.
-    """
-    index, _ = build()
-    read_batch = query_set(index.dim, READ_BATCH, seed=303)
-    write_vectors = clustered(64, index.dim, seed=404)
-
-    with ReadLoad(index, read_batch) as load:
-        def write(attempt):
-            index.add(
-                {
-                    "ids": [f"new_{attempt}_{i}" for i in range(64)],
-                    "embeddings": write_vectors,
-                }
-            )
-
-        overlaps = drive_writes(load, write)
-        load.check()
-
-    assert overlaps >= MIN_OVERLAPS, "could not get an add to start on top of a read"
-
-
-def test_remove_metadata_and_compact_during_search_do_not_raise():
-    """The other three mutating methods release the object too.
-
-    `remove_point`, `add_metadata` and `compact` took the same exclusive borrow
-    `add` did, so each raised in the same pairing. Removal runs first so that
-    `compact` has stranded nodes to reclaim and is a real rebuild rather than the
-    no-op it returns on a clean graph.
-    """
-    index, ids = build_raw()
-    read_batch = query_set(DIM, READ_BATCH, seed=505)
-
-    with ReadLoad(index, read_batch) as load:
-        removals = drive_writes(load, lambda attempt: index.remove_point(ids[attempt]))
-        load.check()
-        metadata = drive_writes(
-            load, lambda attempt: index.add_metadata({"phase": str(attempt)})
-        )
-        load.check()
-        compactions = drive_writes(load, lambda _attempt: index.compact())
-        load.check()
-
-    assert removals >= MIN_OVERLAPS, "no removal started on top of a read"
-    assert metadata >= MIN_OVERLAPS, "no metadata write started on top of a read"
-    assert compactions >= MIN_OVERLAPS, "no compact started on top of a read"
-    assert not index.contains(ids[0])
 
 
 @pytest.mark.parametrize("build", [build_raw, build_quantized], ids=["raw", "quantized"])
@@ -470,153 +346,6 @@ def test_concurrent_searches_during_add_stay_correct(build):
     assert sum(counts) >= THREADS, (
         f"every reader runs a search before it reads the flag, so {sum(counts)} "
         f"searches across {THREADS} readers means a reader never ran"
-    )
-
-
-# ------------------------------------------------------------
-# The interpreter lock during a write
-# ------------------------------------------------------------
-
-
-class SearchCounter:
-    """One thread issuing single queries in a loop, counting completed calls.
-
-    Single queries rather than batches, because a batch releases the lock once
-    for the whole batch and would hide the thing being measured.
-    """
-
-    def __init__(self, index, queries):
-        self.index = index
-        self.queries = queries
-        self.count = 0
-        self.error = None
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run)
-
-    def _run(self):
-        cursor = 0
-        size = len(self.queries)
-        try:
-            while not self._stop.is_set():
-                self.index.search(self.queries[cursor], top_k=TOP_K)
-                cursor = cursor + 1 if cursor + 1 < size else 0
-                self.count += 1
-        except BaseException as exc:  # noqa: BLE001 - surfaced by the caller
-            self.error = exc
-
-    def __enter__(self):
-        self._thread.start()
-        # Do not sample until the thread has actually issued a search, so the
-        # first window is a steady state rather than thread start-up. The bound
-        # is a stuck thread detector and not a race bound, as `ReadLoad`'s is.
-        deadline = time.monotonic() + 30.0
-        while self.count == 0 and self.error is None and time.monotonic() < deadline:
-            time.sleep(0.001)
-        if self.error is not None:
-            raise self.error
-        assert self.count > 0, "the search thread completed no search in thirty seconds"
-        return self
-
-    def __exit__(self, *_):
-        self._stop.set()
-        self._thread.join(timeout=120)
-        return False
-
-
-def test_search_keeps_its_rate_while_one_insert_runs():
-    """A search thread keeps running at a real rate through a long insert.
-
-    `add` used to hold the interpreter lock for its whole duration, so no other
-    Python thread could start a search at all while one ran. That collapse was
-    measured at 97.6 to 98.4 percent of the reader's rate, and the cause was the
-    interpreter lock rather than any lock inside the index.
-
-    The bound is a share of the rate this same thread reaches over a window of
-    the same length with a second search thread beside it in place of the
-    insert. Both windows therefore hold two threads working the index, and both
-    are the same length, so neither the machine's speed nor its core count sits
-    in the comparison. The arms alternate round by round and the rounds are
-    reduced by a median, which is the only form a timing claim takes here.
-
-    Each round's insert is one call, so the window measured is exactly one `add`
-    and there are no gaps between calls to hide in. The rounds together are
-    asserted to be long enough to sample, so a machine that finished them too
-    fast to measure fails rather than passing on a handful of samples.
-    """
-    index, _ = build_raw(n=GIL_BASE, dim=GIL_DIM, seed=17)
-    queries = query_set(GIL_DIM, 64, seed=808)
-    batches = [
-        {
-            "ids": [f"bulk_{round_}_{i}" for i in range(GIL_BATCH)],
-            "embeddings": clustered(GIL_BATCH, GIL_DIM, seed=909 + round_),
-        }
-        for round_ in range(GIL_ROUNDS)
-    ]
-
-    # The control arm's thread. It searches only while the gate is open, so an
-    # insert's window holds the reader and the insert, a control window holds
-    # the reader and this, and neither holds three.
-    gate = threading.Event()
-    stop = threading.Event()
-    control_error = []
-
-    def control():
-        cursor = 0
-        try:
-            while not stop.is_set():
-                if not gate.wait(timeout=0.05):
-                    continue
-                index.search(queries[cursor], top_k=TOP_K)
-                cursor = cursor + 1 if cursor + 1 < len(queries) else 0
-        except BaseException as exc:  # noqa: BLE001 - re-raised on the main thread
-            control_error.append(exc)
-
-    control_thread = threading.Thread(target=control)
-    control_thread.start()
-    shares = []
-    inserted = 0
-    insert_seconds = 0.0
-    try:
-        with SearchCounter(index, queries) as reader:
-            for batch in batches:
-                before = reader.count
-                started = time.monotonic()
-                result = index.add(batch)
-                window = time.monotonic() - started
-                during_rate = (reader.count - before) / window
-                inserted += result.total_inserted
-                insert_seconds += window
-
-                gate.set()
-                before = reader.count
-                started = time.monotonic()
-                time.sleep(window)
-                control_window = time.monotonic() - started
-                control_rate = (reader.count - before) / control_window
-                gate.clear()
-
-                shares.append(
-                    during_rate / control_rate if control_rate else float("inf")
-                )
-    finally:
-        stop.set()
-        gate.set()
-        control_thread.join(timeout=120)
-
-    assert not control_thread.is_alive(), "the control thread hung"
-    assert not control_error, control_error[0]
-    assert reader.error is None, reader.error
-    assert inserted == GIL_ROUNDS * GIL_BATCH
-    assert insert_seconds >= MIN_ADD_WINDOW_S, (
-        f"the inserts took {insert_seconds:.3f}s together, too short to sample "
-        f"a rate against"
-    )
-    shares.sort()
-    share = shares[len(shares) // 2]
-    assert share >= MIN_SEARCH_SHARE, (
-        f"the reader ran at a paired median {share:.3f} of its own rate during "
-        f"an insert, against a bound of {MIN_SEARCH_SHARE}. Rounds: "
-        f"{[round(s, 3) for s in shares]}"
     )
 
 
@@ -766,21 +495,16 @@ def test_sustained_mixed_workload_leaves_the_index_exact():
 def test_training_completes_under_a_concurrent_search_load():
     """Product quantization training fires mid-workload without breaking it.
 
-    Training is the longest thing an insert can do. It runs k-means over the
-    collected vectors and then rebuilds the whole graph from quantized codes, and
-    all of it now happens with the interpreter lock released. This checks that
-    the transition is safe while searches are in flight, and that searches keep
-    completing through it.
+    Training runs k-means over the collected vectors and then rebuilds the
+    whole graph from quantized codes. Four threads search the index through
+    every batch, the one that trains among them, and a search that raises
+    fails the test. That the training runs with the interpreter released is
+    held in `tests/test_interpreter.py`.
 
     Nothing here depends on a duration. Training fires on a record count, so the
     test asserts the index was not quantized before the crossing batch and is
     quantized after it. A run where training did not fire fails on that pair
     rather than passing without exercising anything.
-
-    The overlap is proved by counting. The reader pool's completed reads are
-    sampled either side of the batch that crosses the threshold, and the test
-    asserts reads landed inside that window. A build that held the interpreter
-    lock through training records none.
     """
     vectors = clustered(TRAIN_PRELOAD, TRAIN_DIM, seed=31)
     index = VectorDatabase().create(
@@ -801,13 +525,11 @@ def test_training_completes_under_a_concurrent_search_load():
 
     read_batch = query_set(TRAIN_DIM, READ_BATCH, seed=707)
     total = TRAIN_PRELOAD
-    crossing_reads = 0
     quantized_before_crossing = None
 
     with ReadLoad(index, read_batch) as load:
         for round_ in range(TRAIN_BATCHES):
             quantized_before = index.is_quantized()
-            before = load.reads
             index.add(
                 {
                     "ids": [f"t_{round_}_{i}" for i in range(TRAIN_BATCH)],
@@ -818,14 +540,12 @@ def test_training_completes_under_a_concurrent_search_load():
             load.check()
             if not quantized_before and index.is_quantized():
                 quantized_before_crossing = quantized_before
-                crossing_reads = load.reads - before
         load.check()
 
     assert quantized_before_crossing is False, (
         "training never completed, so the transition was not exercised"
     )
     assert index.is_quantized()
-    assert crossing_reads > 0, "no search completed while training ran"
     assert index.get_vector_count() == total
 
     # The index still answers after the rebuild the training triggered.
@@ -841,27 +561,20 @@ def test_training_completes_under_a_concurrent_search_load():
 # get_stats against concurrent mutation
 # ------------------------------------------------------------
 
-# get_stats used to hold the vectors read guard and then take id_map, while
-# remove_point_internal holds id_map and then takes vectors, so the two in
-# flight together deadlocked with the stats thread holding the interpreter
-# lock and the whole process froze. It also re-read training_ids inside its
-# own training_ids hold, which deadlocks the moment a writer queues between
-# the two reads, because the standard library queues readers behind waiting
-# writers. Each mode below isolates one mechanism: "removal" runs on a
-# trained index, where the recursive read cannot happen, and
-# "training_collection" runs pure adds against an unreachable training_size,
-# where no remove ever holds two guards.
+# get_stats takes every guard alone and in the declared order, so it holds no
+# guard while it waits for another, and it reads training_ids once. Each mode
+# below runs it beside one kind of mutation. "removal" runs on a trained index
+# beside adds and removals, which take the id store and then the index, and
+# "training_collection" runs beside adds against an unreachable training_size,
+# which collect training ids. The lock rank registry of a build with debug
+# assertions refuses an inverted or repeated acquisition at once on every path
+# the probe runs, and the child reports it as a failure of its loop.
 #
-# The probe runs in a subprocess because the failure mode is a frozen
-# interpreter. No assertion can run inside the deadlocked process, so the
-# parent's timeout is the detector. On a build where every stats guard is
-# taken alone the workload finishes in a few seconds regardless of
-# scheduling; the wide budget absorbs a loaded machine rather than tuning a
-# race, and a regression hangs the child outright rather than making it slow,
-# so this cannot flake red on good code. What one pass cannot promise is
-# sensitivity, since a single clean run proves the loop completed rather than
-# that no window exists. The window itself froze seven of seven twenty second
-# runs on the build that carried it.
+# The probe runs in a subprocess, since on a build without the registry the
+# failure is a frozen interpreter, and no assertion can run inside a deadlocked
+# process. The parent's timeout is the detector, and its words name a hang.
+# The child churns until it has run for PROBE_CHURN_SECONDS and every count has
+# reached its target, so it does the same work on a machine of any speed.
 
 PROBE_CHURN_SECONDS = 8.0
 PROBE_TIMEOUT_S = 150.0
@@ -880,6 +593,9 @@ seconds = float(sys.argv[2])
 DIM = 16
 BATCH = 200
 rng = np.random.default_rng(11)
+# Every loop runs until the churn has lasted `seconds` and every count has
+# reached its target.
+TARGETS = {"stats": 101, "adds": 2, "removes": 11 if mode == "removal" else 0}
 
 index = VectorDatabase().create(
     "hnsw",
@@ -900,8 +616,19 @@ assert index.is_quantized() == (mode == "removal"), index.get_storage_mode()
 
 stop = threading.Event()
 counts = {"stats": 0, "adds": 0, "removes": 0}
+failures = []
 pending = deque()
 pending_lock = threading.Lock()
+
+
+def guarded(name, body):
+    def run():
+        try:
+            body()
+        except BaseException as exc:
+            failures.append(f"{name}: {type(exc).__name__}: {exc}")
+            stop.set()
+    return run
 
 
 def stats_loop():
@@ -911,11 +638,9 @@ def stats_loop():
 
 
 def add_loop():
-    # Long detached batch inserts keep the writers mutex busy, so the remove
-    # thread wakes from the writers queue at a point uncorrelated with the
-    # stats loop. The two thread version of this probe never reproduced the
-    # deadlock, because a remove entered at a GIL hand-off always cleared its
-    # guard window before get_stats reached the vulnerable span.
+    # Batch inserts with the interpreter released keep the mutation lock
+    # busy, so the remove thread wakes from its wait for that lock at a point
+    # the stats loop does not choose.
     batch = rng.standard_normal((BATCH, DIM)).astype(np.float32)
     n = 0
     while not stop.is_set():
@@ -939,27 +664,36 @@ def remove_loop():
 
 
 threads = [
-    threading.Thread(target=stats_loop, daemon=True),
-    threading.Thread(target=add_loop, daemon=True),
+    threading.Thread(target=guarded("stats", stats_loop), daemon=True),
+    threading.Thread(target=guarded("add", add_loop), daemon=True),
 ]
 if mode == "removal":
-    threads.append(threading.Thread(target=remove_loop, daemon=True))
+    threads.append(threading.Thread(target=guarded("remove", remove_loop), daemon=True))
 for t in threads:
     t.start()
-deadline = time.monotonic() + seconds
-while time.monotonic() < deadline:
+started = time.monotonic()
+while not stop.is_set() and (
+    time.monotonic() - started < seconds
+    or any(counts[name] < target for name, target in TARGETS.items())
+):
     time.sleep(0.2)
 stop.set()
 for t in threads:
     t.join(timeout=30)
 assert not any(t.is_alive() for t in threads), "a worker never came back"
+assert not failures, "; ".join(failures)
+assert all(counts[name] >= target for name, target in TARGETS.items()), counts
 print(f"OK {counts['stats']} {counts['adds']} {counts['removes']}")
 '''
 
 
 @pytest.mark.parametrize("probe_mode", ["removal", "training_collection"])
 def test_get_stats_never_deadlocks_against_mutation(tmp_path, probe_mode):
-    """get_stats loops beside mutation without freezing the process."""
+    """get_stats loops beside mutation without freezing the process.
+
+    The child churns until each loop has reached its target, and a failure
+    of any loop fails the child, so a pass is a run of the whole load.
+    """
     script = tmp_path / "stats_deadlock_probe.py"
     script.write_text(PROBE_SCRIPT, encoding="utf-8")
     try:
@@ -974,14 +708,14 @@ def test_get_stats_never_deadlocks_against_mutation(tmp_path, probe_mode):
             f"get_stats deadlocked against {probe_mode}: the probe froze and "
             f"was killed after {PROBE_TIMEOUT_S:.0f}s"
         )
-    assert result.returncode == 0, result.stderr
+    assert result.returncode == 0, result.stdout[-4000:] + result.stderr[-4000:]
 
-    # The run must have exercised both sides, not idled to a quiet pass.
+    # The child's own targets, which it runs until it reaches.
     stats_calls, add_calls, remove_calls = map(int, result.stdout.split()[1:4])
-    assert stats_calls > 100, "the stats loop barely ran"
-    assert add_calls > 1, "the churn loop barely ran"
+    assert stats_calls > 100, "the stats loop stopped short of its target"
+    assert add_calls > 1, "the churn loop stopped short of its target"
     if probe_mode == "removal":
-        assert remove_calls > 10, "no removal pressure was generated"
+        assert remove_calls > 10, "the remove loop stopped short of its target"
 
 
 # ============================================================================
@@ -990,105 +724,101 @@ def test_get_stats_never_deadlocks_against_mutation(tmp_path, probe_mode):
 #
 # The dense index keeps a bitmap of the records it holds, which is what an
 # unfiltered traversal runs its predicate against, and the collection keeps the
-# same set beside its reverse map. They are one set held twice, and `get_stats`
-# checks them against each other on a build with debug assertions.
+# same set in its id store. They are one set held twice, and `get_stats` checks
+# them against each other on a build with debug assertions.
 #
-# Two paths wrote one of them and then the other under a separate acquisition,
-# so the invariant was false for the whole gap between the two writes, and
-# `get_stats` takes no mutation lock and lands in that gap.
+# The insertion writes both under one acquisition of its four write guards, and
+# the clear trades both under one acquisition, so a reader that takes no
+# mutation lock, which `get_stats` is, finds them agree wherever it lands. The
+# index crate's tests hold a reader at every place an insertion or a clear lets
+# its guards go.
 #
-# **The insertion.** `add` wrote `id_map` and `rev_map`, released both, ran
-# phase one of the insertion, which is the descent at `ef_construction` and the
-# whole cost of an insertion, and only then took the index write guard and set
-# the live bit. A `get_stats` entering after the map write and before the index
-# write saw the collection holding a record the index did not. The gap was not a
-# hairline: on a release build one stats call in seven landed inside it.
-#
-# **The clear.** `clear` emptied `id_map` and `rev_map` under the storage
-# guards, released them, built the replacement index and only then swapped it
-# in. A `get_stats` between the two saw an empty collection and an index still
-# holding every record, which is the same disagreement the other way round.
-#
-# Both arms are work bounded rather than time bounded, so a slow machine does
-# the same number of interleavings as a fast one and neither passes by idling.
-# The budget is the ceiling for a machine that cannot reach the work at all,
-# and reaching it fails the arm rather than passing it.
+# Here two readers run `get_stats` beside a writer on the wheel's own paths. The
+# writer makes LIVE_SET_WRITES writes, and after each one it waits until each
+# reader has completed a call begun after the write began, so the reads keep
+# pace with the writes on a machine of any speed. LIVE_SET_LIMIT_S bounds the
+# whole run, and reaching it fails the arm with words that name a hang.
 
-LIVE_SET_BUDGET_S = 20.0
 LIVE_SET_WRITES = 40
+LIVE_SET_LIMIT_S = 120.0
 
 
 @pytest.mark.parametrize("path", ["insert", "clear"])
 def test_the_two_live_sets_agree_under_a_concurrent_reader(path):
     """get_stats beside a write never sees the two live sets disagree.
 
-    The reader runs in its own thread and takes no mutation lock, so it
-    lands wherever the writer happens to be. On a build with debug
-    assertions a disagreement raises out of `get_stats` into this thread,
-    and the arm reports it rather than letting the traceback pass by.
+    Each reader runs in its own thread and takes no mutation lock. On a build
+    with debug assertions a disagreement raises out of `get_stats` into the
+    reader, and the arm reports it rather than letting the traceback pass by.
+    After each write the writer waits until every reader has completed a call
+    begun after the write began.
     """
     dim = 8
     fill = 100
+    readers = 2
     rng = np.random.default_rng(136)
     vectors = rng.standard_normal((fill, dim)).astype(np.float32)
     ids = [f"live_{i}" for i in range(fill)]
     index = VectorDatabase().create("hnsw", dim=dim, expected_size=fill * 4)
     if path == "insert":
-        # A seed so the descent in phase one has a graph to descend, which is
-        # what makes the gap wide enough to land in.
+        # A seed, so the first phase of each insertion has a graph to descend.
         index.add({"ids": ids, "embeddings": vectors})
 
     stop = threading.Event()
-    counts = {"reads": 0, "writes": 0}
+    # How many calls each reader has begun, and the number of the last call
+    # it has finished.
+    begun = [0] * readers
+    done = [0] * readers
     raised = []
 
-    def reader():
+    def reader(k):
         while not stop.is_set():
+            begun[k] += 1
             try:
                 index.get_stats()
             except BaseException as exc:  # noqa: BLE001
                 raised.append(f"{type(exc).__name__}: {exc}")
                 stop.set()
                 return
-            counts["reads"] += 1
+            done[k] = begun[k]
 
-    def writer():
-        n = 0
-        while not stop.is_set():
+    threads = [
+        threading.Thread(target=reader, args=(k,), daemon=True) for k in range(readers)
+    ]
+    for thread in threads:
+        thread.start()
+    deadline = time.monotonic() + LIVE_SET_LIMIT_S
+    writes = 0
+    try:
+        for n in range(LIVE_SET_WRITES):
+            marks = list(begun)
             if path == "insert":
                 batch = [f"churn_{n}_{i}" for i in range(fill)]
                 index.add({"ids": batch, "embeddings": vectors})
             else:
                 index.add({"ids": ids, "embeddings": vectors})
                 index.clear()
-            counts["writes"] += 1
-            n += 1
+            writes += 1
+            while not stop.is_set() and any(done[k] <= marks[k] for k in range(readers)):
+                assert time.monotonic() < deadline, (
+                    f"the readers completed no call beside write {n} within "
+                    f"{LIVE_SET_LIMIT_S:.0f} seconds, so a reader hung"
+                )
+                time.sleep(0.001)
+            if stop.is_set():
+                break
+    finally:
+        stop.set()
+        for thread in threads:
+            thread.join(timeout=30)
 
-    threads = [
-        threading.Thread(target=reader, daemon=True),
-        threading.Thread(target=reader, daemon=True),
-        threading.Thread(target=writer, daemon=True),
-    ]
-    for thread in threads:
-        thread.start()
-    deadline = time.monotonic() + LIVE_SET_BUDGET_S
-    while (
-        not stop.is_set()
-        and counts["writes"] < LIVE_SET_WRITES
-        and time.monotonic() < deadline
-    ):
-        time.sleep(0.01)
-    stop.set()
-    for thread in threads:
-        thread.join(timeout=30)
-
+    assert not any(thread.is_alive() for thread in threads), "a reader hung"
     assert not raised, (
         f"get_stats saw the two live sets disagree during a {path}: {raised[0]}"
     )
-    # Both loops have to have run, or the arm proves nothing.
-    assert counts["reads"] > 500, f"the reader barely ran: {counts['reads']}"
-    assert counts["writes"] >= LIVE_SET_WRITES // 2, (
-        f"the writer barely ran: {counts['writes']}"
+    assert writes == LIVE_SET_WRITES
+    assert min(done) >= LIVE_SET_WRITES, (
+        f"each reader completes a call beside each write, and they completed {done}"
     )
 
 
@@ -1096,47 +826,25 @@ def test_the_two_live_sets_agree_under_a_concurrent_reader(path):
 # save() against concurrent mutation
 # ============================================================================
 #
-# Nothing in this file mentioned `save` at all, and a lock order inversion lived
-# in that path once: `save_manifest` held the `vectors` and `pq_codes` read
-# guards across a `get_storage_mode` call, which takes the graph's read guard,
-# acquiring the three in the reverse of the documented `hnsw < vectors <
-# pq_codes` order. It could not deadlock, because a save holds the mutation lock
-# and so does every path taking the graph's write guard, but that is the same
-# reasoning that failed for the three inversions found before it, and nothing in
-# the suite would have caught it if the mutation lock ever stopped covering one
-# of them.
+# A save holds the mutation lock across its four phases and takes no guard a
+# reader waits for, so every mutation of what it writes is ordered against it
+# and a search answers while it runs. Each guard it reads is taken in the
+# declared order, which the lock rank registry of a build with debug
+# assertions checks at every acquisition on every path the probe runs.
 #
 # The shape is the get_stats probe's: a subprocess with a parent timeout, since
-# the failure mode is a frozen interpreter that no in-process assertion can
-# report. Saves run in a loop beside adds, removes and searches.
+# on a build without the registry the failure is a frozen interpreter that no
+# in-process assertion can report. Saves run in a loop beside adds, removes and
+# searches, and every directory a save finished writing must load as one
+# instant of the index.
 #
-# # Why the assertions count overlaps rather than operations
-#
-# The three mutating loops share one mutex, so they cannot be given independent
-# throughput floors. Measured on one machine over 8 seconds at 9,600 records,
-# `save` costs 37.8 ms uncontended and `remove_point` costs 0.001 ms, so a round
-# of the mutation lock is dominated by the save and each round serves one save,
-# one add and one removal. The three counts come out at 190, 176 and 203 in raw
-# mode and 95, 94 and 124 in quantized mode, pinned to a 1:1:1 ratio, and a
-# contended `remove_point` measures 39.3 ms against 0.001 ms of work, so it is
-# 99.997 percent lock wait.
-#
-# A floor of 10 on removals was therefore a floor of 10 on **saves**, which is a
-# statement about how many rounds of that mutex the machine completes in 8
-# seconds and not about whether removal happened. A slower machine completing 5
-# rounds reads 5 removals, 5 saves and 5 adds, and only the removal floor fails,
-# because the other two were set at 1. The counts were consistent and the floor
-# was the wrong kind of assertion.
-#
-# What the test needs is that every loop ran and that the interleaving it exists
-# to create actually occurred. `save` holds the mutation lock for essentially the
-# whole run, so a removal requested during a save is a removal queued behind it,
-# which is the ordering an inversion between the two paths needs. The remove loop
-# waits for a save to be in flight before removing, so that this is deliberate
-# rather than left to how many rounds the machine got through, and a search
-# completing during a save is the assertion that a save takes the mutation lock
-# and no reader lock. Neither count scales with machine speed, and both go to
-# zero if their loop stops.
+# The child churns until it has run for SAVE_PROBE_SECONDS and every loop has
+# completed an operation. The three mutating loops share the mutation lock, so
+# no loop is held to a count above one. The remove loop waits, for a second at
+# most, until a save is in flight before it removes, so its removals queue
+# behind saves. That a search answers inside a held save, and that a removal
+# and an add wait for it, is held at a pause in `collection::persist_tests` in
+# the index crate.
 
 SAVE_PROBE_SECONDS = 8.0
 SAVE_PROBE_TIMEOUT_S = 180.0
@@ -1177,14 +885,12 @@ index.add({"ids": [f"seed_{i}" for i in range(seed_count)], "embeddings": seeds}
 assert index.is_quantized() == (mode == "quantized"), index.get_storage_mode()
 
 stop = threading.Event()
-counts = {"saves": 0, "adds": 0, "removes": 0, "searches": 0,
-          "removes_during_save": 0, "searches_during_save": 0}
+counts = {"saves": 0, "adds": 0, "removes": 0, "searches": 0}
 failures = []
 pending = deque()
 pending_lock = threading.Lock()
 queries = rng.standard_normal((32, DIM)).astype(np.float32)
-# Set while index.save() is running, which is how the other two loops learn
-# that their operation met one.
+# Set while index.save() is running, which is what the remove loop waits for.
 save_active = threading.Event()
 
 
@@ -1232,34 +938,24 @@ def remove_loop():
         if rid is None:
             time.sleep(0.001)
             continue
-        # Line the removal up behind a running save on purpose. The two share
-        # the mutation lock, so they never execute at the same instant, and what
-        # an inversion between them needs is one waiting on the other. The add
-        # loop keeps this queue oversupplied by two orders of magnitude, at
-        # 26,400 ids queued against 203 removed, so the wait here is on the save
-        # and never on the queue. Bounded, so a save loop that has died leaves
-        # this counting removals rather than spinning.
-        during = save_active.wait(timeout=1.0)
+        # The removal lines up behind a running save. The two share the
+        # mutation lock, so they never run at the same instant, and what an
+        # inversion between them needs is one waiting on the other. Bounded,
+        # so a save loop that has stopped leaves this removing.
+        save_active.wait(timeout=1.0)
         index.remove_point(rid)
         counts["removes"] += 1
-        if during:
-            counts["removes_during_save"] += 1
 
 
 def search_loop():
-    # A save holds the mutation lock and no reader lock, so searches must keep
-    # answering throughout. This also puts a reader on the storage guards while
-    # the save is reading them.
+    # A save holds the mutation lock and no reader lock, so searches keep
+    # answering throughout, and a search reads the storage guards beside the
+    # save's reads of them.
     n = 0
     while not stop.is_set():
-        during = save_active.is_set()
         page = index.search(queries[n % len(queries)], top_k=5)
         assert isinstance(page, list)
         counts["searches"] += 1
-        if during and save_active.is_set():
-            # Entered and left with a save still in flight, so this one was
-            # answered while a save held the mutation lock.
-            counts["searches_during_save"] += 1
         n += 1
 
 
@@ -1271,14 +967,19 @@ threads = [
 ]
 for t in threads:
     t.start()
-deadline = time.monotonic() + seconds
-while time.monotonic() < deadline and not stop.is_set():
+# Every loop runs until the churn has lasted `seconds` and each has completed
+# an operation.
+started = time.monotonic()
+while not stop.is_set() and (
+    time.monotonic() - started < seconds or min(counts.values()) < 1
+):
     time.sleep(0.2)
 stop.set()
 for t in threads:
     t.join(timeout=60)
 assert not any(t.is_alive() for t in threads), "a worker never came back"
 assert not failures, "; ".join(failures)
+assert min(counts.values()) >= 1, counts
 
 # Every directory a save finished writing must load, and what it holds must be
 # one instant of the index rather than a mixture of two. A save takes the
@@ -1304,8 +1005,7 @@ for n in (0, 1):
 assert checked > 0, "no snapshot was written"
 
 print("OK " + " ".join(str(counts[k]) for k in
-                       ("saves", "adds", "removes", "searches",
-                        "removes_during_save", "searches_during_save")))
+                       ("saves", "adds", "removes", "searches")))
 '''
 
 
@@ -1314,10 +1014,12 @@ def test_save_never_deadlocks_or_tears_against_mutation(tmp_path, probe_mode):
     """save loops beside adds, removes and searches without freezing or tearing.
 
     Two failures are in scope. A lock order inversion in the save path would
-    hang the child, which the parent timeout detects. A save reading the
-    mappings and the stores at different instants would write a directory whose
-    id map names records the stores do not hold, which the child's reload
-    assertions detect.
+    hang the child, which the parent timeout detects, and the registry of a
+    build with debug assertions refuses at once. A save reading the mappings
+    and the stores at different instants would write a directory whose id
+    map names records the stores do not hold, which the child's reload
+    assertions detect. The child churns until every loop has completed an
+    operation.
     """
     script = tmp_path / "save_concurrency_probe.py"
     script.write_text(SAVE_PROBE_SCRIPT, encoding="utf-8")
@@ -1349,37 +1051,15 @@ def test_save_never_deadlocks_or_tears_against_mutation(tmp_path, probe_mode):
     # to the same stream.
     summary = [line for line in result.stdout.splitlines() if line.startswith("OK ")]
     assert len(summary) == 1, result.stdout[-2000:]
-    saves, adds, removes, searches, removes_during_save, searches_during_save = map(
-        int, summary[0].split()[1:7]
-    )
-    seen = (f"saves={saves} adds={adds} removes={removes} searches={searches} "
-            f"removes_during_save={removes_during_save} "
-            f"searches_during_save={searches_during_save}")
+    saves, adds, removes, searches = map(int, summary[0].split()[1:5])
+    seen = f"saves={saves} adds={adds} removes={removes} searches={searches}"
 
-    # Liveness. Every loop got at least one operation through. These are not
-    # throughput floors. The three mutating loops share one mutex and run at a
-    # 1:1:1 ratio, so any number above one would be a floor on how many rounds
-    # of that mutex the machine completes, which is what the note above the
-    # probe records.
+    # The child's own targets, which it runs until it reaches. The three
+    # mutating loops share one mutex, so none is held to more than one.
     assert saves >= 1, f"the save loop never completed a save. {seen}"
     assert adds >= 1, f"the add loop never completed an add. {seen}"
     assert removes >= 1, f"the remove loop never removed a record. {seen}"
     assert searches >= 1, f"the search loop never completed a search. {seen}"
-
-    # The interleaving this test exists to create. A removal requested while a
-    # save held the mutation lock is a removal queued behind that save. Zero
-    # here means the two never met, so a clean run proved nothing about them.
-    assert removes_during_save >= 1, (
-        f"no removal overlapped a save, so the interleaving under test never "
-        f"occurred. {seen}"
-    )
-
-    # A save takes the mutation lock and no reader lock, so a search has to be
-    # answerable while one runs. Zero here means saves are excluding readers,
-    # which is a regression whatever the totals say.
-    assert searches_during_save >= 1, (
-        f"no search completed while a save held the mutation lock. {seen}"
-    )
 
 
 # ============================================================================
@@ -1421,10 +1101,12 @@ def test_save_never_deadlocks_or_tears_against_mutation(tmp_path, probe_mode):
 # the test. A record removed between the search and the fetch simply does not
 # come back, which is not a failure.
 #
-# Overlap is measured rather than assumed. The writer sets a flag around each
-# mutation and the search loop counts the searches that both began and ended
-# inside one, so a run where the two never met fails rather than passing on an
-# exercise that did not happen.
+# The child churns until it has run for COLUMN_PROBE_SECONDS and every loop has
+# completed an operation, a filtered search having returned a page and a record
+# of it having been checked against the filter. That a filtered search answers
+# inside a held write, under each of the three paths, and that every record it
+# returns matches its filter, is held at a pause in `collection::close_up_tests`
+# in the index crate.
 
 COLUMN_PROBE_SECONDS = 8.0
 COLUMN_PROBE_TIMEOUT_S = 180.0
@@ -1488,9 +1170,12 @@ def admits(record):
 
 
 stop = threading.Event()
-write_active = threading.Event()
 counts = {"searches": 0, "pages": 0, "hits": 0, "adds": 0, "removes": 0,
-          "rebuilds": 0, "searches_during_write": 0}
+          "rebuilds": 0}
+# The counts each loop runs until it reaches, the writer's being its own.
+TARGETS = ["searches", "pages", "hits"] + (
+    ["rebuilds"] if mode == "rebuild" else ["adds", "removes"]
+)
 failures = []
 pending = deque()
 pending_lock = threading.Lock()
@@ -1512,11 +1197,8 @@ def search_loop():
     while not stop.is_set():
         query = queries[n % len(queries)]
         n += 1
-        during = write_active.is_set()
         page = index.search(query, top_k=10, filter=FILTERS[mode])
         counts["searches"] += 1
-        if during and write_active.is_set():
-            counts["searches_during_write"] += 1
         if not page:
             continue
         counts["pages"] += 1
@@ -1540,13 +1222,11 @@ def add_loop():
         base = SEED_COUNT + n * BATCH
         ids = ["churn_%d" % (base + i) for i in range(BATCH)]
         vectors = rng.standard_normal((BATCH, DIM)).astype(np.float32)
-        write_active.set()
         index.add({
             "ids": ids,
             "embeddings": vectors,
             "metadatas": [meta(base + i) for i in range(BATCH)],
         })
-        write_active.clear()
         with pending_lock:
             pending.extend(ids)
         counts["adds"] += 1
@@ -1562,9 +1242,7 @@ def remove_loop():
         if rid is None:
             time.sleep(0.001)
             continue
-        write_active.set()
         index.remove_point(rid)
-        write_active.clear()
         counts["removes"] += 1
 
 
@@ -1574,9 +1252,7 @@ def rebuild_loop():
     degree = 12
     while not stop.is_set():
         degree = 16 if degree == 12 else 12
-        write_active.set()
         index.rebuild(m=degree)
-        write_active.clear()
         counts["rebuilds"] += 1
 
 
@@ -1588,18 +1264,23 @@ else:
     threads.append(threading.Thread(target=guarded("remove", remove_loop), daemon=True))
 for t in threads:
     t.start()
-deadline = time.monotonic() + seconds
-while time.monotonic() < deadline and not stop.is_set():
+# Every loop runs until the churn has lasted `seconds` and each of its counts
+# has reached one.
+started = time.monotonic()
+while not stop.is_set() and (
+    time.monotonic() - started < seconds or min(counts[k] for k in TARGETS) < 1
+):
     time.sleep(0.2)
 stop.set()
 for t in threads:
     t.join(timeout=30)
 assert not any(t.is_alive() for t in threads), "a worker never came back"
 assert not failures, failures[:4]
+assert min(counts[k] for k in TARGETS) >= 1, counts
 
 print("OK " + " ".join(str(counts[k]) for k in
                        ("searches", "pages", "hits", "adds", "removes",
-                        "rebuilds", "searches_during_write")))
+                        "rebuilds")))
 '''
 
 
@@ -1637,15 +1318,15 @@ def test_a_filtered_search_never_deadlocks_against_a_writer(tmp_path, probe_mode
 
     summary = [line for line in result.stdout.splitlines() if line.startswith("OK ")]
     assert len(summary) == 1, result.stdout[-2000:]
-    searches, pages, hits, adds, removes, rebuilds, during = map(
-        int, summary[0].split()[1:8]
+    searches, pages, hits, adds, removes, rebuilds = map(
+        int, summary[0].split()[1:7]
     )
     seen = (f"searches={searches} pages={pages} hits={hits} adds={adds} "
-            f"removes={removes} rebuilds={rebuilds} during={during}")
+            f"removes={removes} rebuilds={rebuilds}")
 
-    # Liveness. Not throughput floors: the writer holds one mutex and the search
-    # loop runs beside it, so any number above one would be a statement about
-    # the machine.
+    # The child's own targets, which it runs until it reaches. The writer holds
+    # one mutex and the search loop runs beside it, so none is held to more
+    # than one.
     assert searches >= 1, f"the search loop never completed a search. {seen}"
     assert pages >= 1, f"no filtered search returned anything. {seen}"
     assert hits >= 1, f"no returned record was checked against the filter. {seen}"
@@ -1654,10 +1335,3 @@ def test_a_filtered_search_never_deadlocks_against_a_writer(tmp_path, probe_mode
     else:
         assert adds >= 1, f"the add loop never completed an add. {seen}"
         assert removes >= 1, f"the remove loop never removed a record. {seen}"
-
-    # The interleaving the probe exists to create. Zero here means the search
-    # and the writer never met, so a clean run proved nothing about them.
-    assert during >= 1, (
-        f"no filtered search overlapped a write, so the interleaving under test "
-        f"never occurred. {seen}"
-    )

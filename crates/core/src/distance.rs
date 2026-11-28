@@ -100,7 +100,7 @@
 // The graph crate's trait, taken from the seam that owns that crate rather than
 // from the crate itself. ZeusDB implements it, so the name has to be visible
 // here; see the note at the top of `graph.rs`.
-use crate::graph::Distance;
+use crate::graph::{Distance, Path};
 use crate::int8::{decode, Int8Codec};
 use crate::pq::PQ;
 use std::cell::RefCell;
@@ -170,6 +170,19 @@ pub enum PqMetric {
     /// of it. Measured reconstruction norms run 0.85 to 0.96 at the shipped
     /// dbpedia default against a stored norm of 1.0.
     Cosine,
+}
+
+impl PqMetric {
+    /// The metric a product quantized graph over `space` orders and scores
+    /// by, which is the choice `VectorGraph::new_pq` makes with the variant:
+    /// squared L2 for `l2` and `l1`, and cosine for `cosine` and for a name
+    /// it does not recognise.
+    pub fn of_space(space: &str) -> PqMetric {
+        match space {
+            "l2" | "l1" => PqMetric::SquaredL2,
+            _ => PqMetric::Cosine,
+        }
+    }
 }
 
 /// A query's tables, in the shape the metric being served needs
@@ -399,6 +412,48 @@ impl Distance<u8> for DistPQ {
     }
 }
 
+/// One query's table over a codebook, held on the calling thread, with the
+/// score a product quantized graph over that codebook gives a code for the
+/// query.
+///
+/// The table is the one [`DistPQ::install_query_lut`] installs for a
+/// traversal and [`CodeKernel::score`] is [`DistPQ::eval`] over it, so a
+/// code scores the bits a traversal gives the node that holds it. The table
+/// leaves the thread when this value is dropped, and the value stays on the
+/// thread that made it, since the table is that thread's.
+pub struct CodeKernel {
+    distance: DistPQ,
+    /// The code slice the kernel takes in the query's place, as a traversal
+    /// hands it one.
+    dummy: Vec<u8>,
+    _table: QueryLut,
+    _on_this_thread: std::marker::PhantomData<*const ()>,
+}
+
+impl CodeKernel {
+    /// The kernel of a graph over `pq` under `metric`, with the table for
+    /// `query` installed on the calling thread. Refused where the codebook
+    /// is not trained or the query is not its width.
+    pub fn new(pq: Arc<PQ>, metric: PqMetric, query: &[f32]) -> Result<Self, String> {
+        let distance = DistPQ::new(pq, metric);
+        let table = distance.install_query_lut(query)?;
+        let dummy = vec![0u8; distance.subvectors()];
+        Ok(CodeKernel {
+            distance,
+            dummy,
+            _table: table,
+            _on_this_thread: std::marker::PhantomData,
+        })
+    }
+
+    /// The score a traversal gives a node holding `codes`, on the scale the
+    /// kernel returns.
+    #[inline]
+    pub fn score(&self, codes: &[u8]) -> f32 {
+        self.distance.eval(&self.dummy, codes)
+    }
+}
+
 /// Independent accumulators each kernel carries.
 ///
 /// Eight, which is one AVX register of `f32` and two SSE2 registers, so the
@@ -550,7 +605,9 @@ macro_rules! avx_lane_loop {
 ///
 /// # Safety
 ///
-/// The caller must have detected `avx`; [`dot`] is the only caller and it does.
+/// The caller must have detected `avx`. [`dot`] checks it before the call,
+/// and the other caller is the kernel of an [`Avx`] value, which exists only
+/// where it was detected.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx")]
 unsafe fn dot_avx(a: &[f32], b: &[f32]) -> f32 {
@@ -565,7 +622,9 @@ unsafe fn dot_avx(a: &[f32], b: &[f32]) -> f32 {
 ///
 /// # Safety
 ///
-/// The caller must have detected `avx`; [`l1`] is the only caller and it does.
+/// The caller must have detected `avx`. [`l1`] checks it before the call,
+/// and the other caller is the kernel of an [`Avx`] value, which exists only
+/// where it was detected.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx")]
 unsafe fn l1_avx(a: &[f32], b: &[f32]) -> f32 {
@@ -585,7 +644,9 @@ unsafe fn l1_avx(a: &[f32], b: &[f32]) -> f32 {
 ///
 /// # Safety
 ///
-/// The caller must have detected `avx`; [`l2`] is the only caller and it does.
+/// The caller must have detected `avx`. [`l2_squared`] checks it before the call,
+/// and the other caller is the kernel of an [`Avx`] value, which exists only
+/// where it was detected.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx")]
 unsafe fn l2_squared_avx(a: &[f32], b: &[f32]) -> f32 {
@@ -637,6 +698,8 @@ mod feature {
 
     #[inline(always)]
     pub(super) fn avx() -> bool {
+        #[cfg(test)]
+        super::checks::count();
         match AVX.load(Ordering::Relaxed) {
             PRESENT => true,
             ABSENT => false,
@@ -648,6 +711,275 @@ mod feature {
     #[cfg(test)]
     pub(super) fn avx_detected() -> bool {
         avx()
+    }
+}
+
+/// The three kernels as one path of a processor computes them.
+///
+/// A value of an implementing type names one path. A caller that evaluates
+/// many distances takes one from [`resolve`] once, for a search, a build step
+/// or a scan, and every distance it then evaluates runs that path's kernel
+/// with no check of the processor. Every path returns the same bits for the
+/// same slices, which `every_kernel_path_returns_the_scalar_bits` holds.
+pub(crate) trait Kernels: Copy {
+    /// Inner product of two vectors.
+    fn dot(self, a: &[f32], b: &[f32]) -> f32;
+    /// Sum of absolute differences.
+    fn l1(self, a: &[f32], b: &[f32]) -> f32;
+    /// Sum of squared differences, before the square root.
+    fn l2_squared(self, a: &[f32], b: &[f32]) -> f32;
+}
+
+/// The path every processor takes: the block loop over `f32x8`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Baseline;
+
+impl Kernels for Baseline {
+    #[inline(always)]
+    fn dot(self, a: &[f32], b: &[f32]) -> f32 {
+        debug_assert_eq!(a.len(), b.len());
+        dot_baseline(a, b)
+    }
+
+    #[inline(always)]
+    fn l1(self, a: &[f32], b: &[f32]) -> f32 {
+        debug_assert_eq!(a.len(), b.len());
+        l1_baseline(a, b)
+    }
+
+    #[inline(always)]
+    fn l2_squared(self, a: &[f32], b: &[f32]) -> f32 {
+        debug_assert_eq!(a.len(), b.len());
+        l2_squared_baseline(a, b)
+    }
+}
+
+/// The path a processor with AVX takes: the block loop in 256-bit intrinsics.
+///
+/// A value exists only where the feature was detected: [`Avx::detected`]
+/// makes one after the check, and [`Avx::assumed`] makes one for a function
+/// that is reached only after the check. So a kernel called through a value
+/// runs on a processor that has the feature.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Avx(());
+
+#[cfg(target_arch = "x86_64")]
+impl Avx {
+    /// The path, where this processor has AVX.
+    #[inline(always)]
+    pub(crate) fn detected() -> Option<Avx> {
+        feature::avx().then_some(Avx(()))
+    }
+
+    /// The path, with no check of the processor.
+    ///
+    /// # Safety
+    ///
+    /// The caller is reached only where [`Avx::detected`] answered a value.
+    #[inline(always)]
+    unsafe fn assumed() -> Avx {
+        Avx(())
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Kernels for Avx {
+    #[inline(always)]
+    fn dot(self, a: &[f32], b: &[f32]) -> f32 {
+        debug_assert_eq!(a.len(), b.len());
+        // SAFETY: an `Avx` exists only where the feature was detected.
+        unsafe { dot_avx(a, b) }
+    }
+
+    #[inline(always)]
+    fn l1(self, a: &[f32], b: &[f32]) -> f32 {
+        debug_assert_eq!(a.len(), b.len());
+        // SAFETY: an `Avx` exists only where the feature was detected.
+        unsafe { l1_avx(a, b) }
+    }
+
+    #[inline(always)]
+    fn l2_squared(self, a: &[f32], b: &[f32]) -> f32 {
+        debug_assert_eq!(a.len(), b.len());
+        // SAFETY: an `Avx` exists only where the feature was detected.
+        unsafe { l2_squared_avx(a, b) }
+    }
+}
+
+/// The kernel path of this processor.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Resolved {
+    /// The processor takes the baseline path.
+    Baseline(Baseline),
+    /// The processor has AVX and takes that path.
+    #[cfg(target_arch = "x86_64")]
+    Avx(Avx),
+}
+
+/// Resolve the kernel path of this processor, by one read of the cached
+/// feature byte on x86-64 and by no read anywhere else.
+///
+/// A search, a build step, a scan and a timing run each call this once and
+/// evaluate every distance on the path it answers.
+#[inline(always)]
+pub(crate) fn resolve() -> Resolved {
+    #[cfg(target_arch = "x86_64")]
+    {
+        #[cfg(test)]
+        if checks::baseline_forced() {
+            return Resolved::Baseline(Baseline);
+        }
+        if let Some(avx) = Avx::detected() {
+            return Resolved::Avx(avx);
+        }
+    }
+    Resolved::Baseline(Baseline)
+}
+
+/// What the tests read and set of the kernel path on their own thread: how
+/// many times the cached feature byte was read, and whether [`resolve`]
+/// answers the baseline path whatever the processor has.
+#[cfg(test)]
+pub(crate) mod checks {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COUNT: Cell<usize> = const { Cell::new(0) };
+        static BASELINE_FORCED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Count one read of the feature byte on this thread.
+    #[cfg(target_arch = "x86_64")]
+    pub(super) fn count() {
+        COUNT.with(|count| count.set(count.get() + 1));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    pub(super) fn baseline_forced() -> bool {
+        BASELINE_FORCED.with(Cell::get)
+    }
+
+    /// Reads of the feature byte this thread has made since the last call,
+    /// which resets the count. Zero on every target but x86-64, which reads
+    /// no byte.
+    pub(crate) fn take() -> usize {
+        COUNT.with(|count| count.replace(0))
+    }
+
+    /// Run `body` with every resolution on this thread answering the
+    /// baseline path, and put the setting back afterwards.
+    pub(crate) fn on_baseline<R>(body: impl FnOnce() -> R) -> R {
+        struct Restore(bool);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                BASELINE_FORCED.with(|forced| forced.set(self.0));
+            }
+        }
+        let _restore = Restore(BASELINE_FORCED.with(|forced| forced.replace(true)));
+        body()
+    }
+}
+
+/// Cosine distance on unit vectors, on the kernel path `K`.
+///
+/// The value [`CosineDist`] returns for the same pair, bit for bit.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CosineOn<K>(pub(crate) K);
+
+impl<K: Kernels> Distance<f32> for CosineOn<K> {
+    #[inline]
+    fn eval(&self, va: &[f32], vb: &[f32]) -> f32 {
+        cosine_from_dot(self.0.dot(va, vb))
+    }
+}
+
+/// Euclidean distance, on the kernel path `K`.
+///
+/// The value [`L2Dist`] returns for the same pair, bit for bit.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct L2On<K>(pub(crate) K);
+
+impl<K: Kernels> Distance<f32> for L2On<K> {
+    #[inline]
+    fn eval(&self, va: &[f32], vb: &[f32]) -> f32 {
+        self.0.l2_squared(va, vb).sqrt()
+    }
+}
+
+/// Sum of absolute differences, on the kernel path `K`.
+///
+/// The value [`L1Dist`] returns for the same pair, bit for bit.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct L1On<K>(pub(crate) K);
+
+impl<K: Kernels> Distance<f32> for L1On<K> {
+    #[inline]
+    fn eval(&self, va: &[f32], vb: &[f32]) -> f32 {
+        self.0.l1(va, vb)
+    }
+}
+
+/// One less the inner product, on the kernel path `K`.
+///
+/// The value [`DotDist`] returns for the same pair, bit for bit.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DotOn<K>(pub(crate) K);
+
+impl<K: Kernels> Distance<f32> for DotOn<K> {
+    #[inline]
+    fn eval(&self, va: &[f32], vb: &[f32]) -> f32 {
+        1.0 - self.0.dot(va, vb)
+    }
+}
+
+/// Each raw distance takes its scorer from a kernel path.
+macro_rules! raw_path {
+    ($distance:ty, $scorer:ident) => {
+        impl<K: Kernels> Path<f32, $distance> for K {
+            type Scorer<'a> = $scorer<K>;
+
+            #[inline(always)]
+            fn scorer(self, _distance: &$distance) -> $scorer<K> {
+                $scorer(self)
+            }
+        }
+    };
+}
+
+raw_path!(CosineDist, CosineOn);
+raw_path!(L2Dist, L2On);
+raw_path!(L1Dist, L1On);
+raw_path!(DotDist, DotOn);
+
+/// The raw distance of `space` as one function on this processor's kernel
+/// path, resolved here once.
+///
+/// For a caller that scores many vectors through one function: an exact
+/// scan, a rerank and a calibration. The function returns the bits the
+/// space's distance type returns for the same pair. An unrecognised name is
+/// cosine, as it is where a graph is built.
+pub fn raw_distance(space: &str) -> fn(&[f32], &[f32]) -> f32 {
+    match resolve() {
+        Resolved::Baseline(_) => match space {
+            "l2" => |a: &[f32], b: &[f32]| L2On(Baseline).eval(a, b),
+            "l1" => |a: &[f32], b: &[f32]| L1On(Baseline).eval(a, b),
+            "dot" => |a: &[f32], b: &[f32]| DotOn(Baseline).eval(a, b),
+            _ => |a: &[f32], b: &[f32]| CosineOn(Baseline).eval(a, b),
+        },
+        // Each function of this arm is handed out here alone, and the arm is
+        // reached only where the feature was detected.
+        #[cfg(target_arch = "x86_64")]
+        Resolved::Avx(_) => match space {
+            // SAFETY: see the arm.
+            "l2" => |a: &[f32], b: &[f32]| L2On(unsafe { Avx::assumed() }).eval(a, b),
+            // SAFETY: see the arm.
+            "l1" => |a: &[f32], b: &[f32]| L1On(unsafe { Avx::assumed() }).eval(a, b),
+            // SAFETY: see the arm.
+            "dot" => |a: &[f32], b: &[f32]| DotOn(unsafe { Avx::assumed() }).eval(a, b),
+            // SAFETY: see the arm.
+            _ => |a: &[f32], b: &[f32]| CosineOn(unsafe { Avx::assumed() }).eval(a, b),
+        },
     }
 }
 
@@ -729,6 +1061,102 @@ pub(crate) fn cosine_normalized(a: &[f32], b: &[f32]) -> f32 {
     } else {
         d
     }
+}
+
+/// The largest Euclidean norm, 2^62, of a vector an index under `l2`, `dot`
+/// or `l1` takes, and of a query such an index searches for.
+///
+/// Within it every value those metrics compute in `f32` from vectors within
+/// it stays finite: a squared distance is at most 2^126, a dot product at
+/// most 2^124, an `l1` distance at most 2^71 at the widest dimension, the sum
+/// a k-means step takes over a cluster of fewer than 2^24 members at most
+/// 2^86, and 254 times a scale the scalar codec trains at most 2^63. A cosine
+/// index normalizes every vector, so the bound does not apply to it.
+pub const NORM_BOUND: f64 = 4_611_686_018_427_387_904.0;
+
+/// [`NORM_BOUND`] in `f32`, where 2^62 is exact, which bounds every value of
+/// a vector within it and so every value a codebook or a scalar codec fitted
+/// to such vectors holds.
+pub(crate) const NORM_BOUND_F32: f32 = f32::from_bits(0x5E80_0000);
+
+/// 2^123, the sum of squares in `f32` at or below which [`screen`] admits a
+/// vector of up to [`SCREEN_WIDTH`] values in one pass.
+const SQUARES_WITHIN: f32 = f32::from_bits(0x7D00_0000);
+
+/// The widest vector [`screen`] admits in one pass. Over this many values the
+/// rounding of a sum of squares in `f32`, taken in eight lanes, is below one
+/// part in 2^10, so a sum at most [`SQUARES_WITHIN`] is a sum below 2^124 in
+/// `f64` as well, being a norm below [`NORM_BOUND`].
+const SCREEN_WIDTH: usize = 1 << 16;
+
+/// What [`screen`] finds in the values of a vector.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Screen {
+    /// Every value is finite, and the Euclidean norm is within
+    /// [`NORM_BOUND`] where the bound applies.
+    Admitted,
+    /// The first value that is not finite, and its position.
+    NotFinite { index: usize, value: f32 },
+    /// The Euclidean norm, taken in `f64`, past [`NORM_BOUND`].
+    PastBound { norm: f64 },
+}
+
+/// Hold every value of `values` finite and, where `bounded`, its Euclidean
+/// norm, taken in `f64`, to [`NORM_BOUND`].
+///
+/// One pass takes the sum of squares in `f32` with the dot kernel. A sum at
+/// most 2^123 admits the vector: every value is finite and the norm is within
+/// the bound. A NaN, an infinity and a sum past 2^123 take a second pass,
+/// which finds the first value that is not finite, and then, where
+/// `bounded`, takes the norm in `f64`, where the square of every `f32` is
+/// exact.
+pub fn screen(values: &[f32], bounded: bool) -> Screen {
+    if values.len() <= SCREEN_WIDTH && dot(values, values) <= SQUARES_WITHIN {
+        return Screen::Admitted;
+    }
+    if let Some((index, &value)) = values
+        .iter()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Screen::NotFinite { index, value };
+    }
+    if bounded {
+        let norm = norm_f64(values);
+        if norm > NORM_BOUND {
+            return Screen::PastBound { norm };
+        }
+    }
+    Screen::Admitted
+}
+
+/// The Euclidean norm of `values`, taken in `f64`, where the square of every
+/// `f32` is exact and no sum of them overflows.
+pub fn norm_f64(values: &[f32]) -> f64 {
+    values
+        .iter()
+        .map(|&value| f64::from(value) * f64::from(value))
+        .sum::<f64>()
+        .sqrt()
+}
+
+/// The words a refusal names a component with that the check of a vector
+/// found not finite: the value the caller gave, where it is finite and a
+/// float32 holds it as an infinity, and the value the check read otherwise.
+pub fn not_finite_words(value: f32, given: Option<f64>) -> String {
+    match given {
+        Some(given) if given.is_finite() => format!("{given:e}, which a float32 holds as {value}"),
+        _ => value.to_string(),
+    }
+}
+
+/// What a refusal for a norm past [`NORM_BOUND`] says after it names the
+/// vector, in the form of the refusal of a value that is not finite.
+pub fn past_bound_words(norm: f64) -> String {
+    format!(
+        "has a Euclidean norm of {:e} (must be at most 2^62, {:e}, under l2, dot or l1)",
+        norm, NORM_BOUND
+    )
 }
 
 /// Cosine distance on vectors that are already unit length.
@@ -1120,7 +1548,7 @@ impl Int8Dist {
 }
 
 /// Bytes a cosine row carries after its codes, being one `f32`.
-const INV_NORM_BYTES: usize = 4;
+pub(crate) const INV_NORM_BYTES: usize = 4;
 
 impl Distance<i8> for Int8Dist {
     #[inline]
@@ -2852,6 +3280,61 @@ mod tests {
         assert_eq!(dist.eval(&[1, 1], &[1, 1]), 0.0);
     }
 
+    /// A code scores, through [`CodeKernel`] under [`PqMetric::of_space`], the
+    /// bits a traversal of a graph over the same codebook gives the node that
+    /// holds it, on a graph made by `VectorGraph::new_pq` for each space it
+    /// takes and for a name it does not recognise, so the kernel's metric is
+    /// the one each such graph scores by.
+    #[test]
+    fn a_code_kernel_scores_a_code_as_a_traversal_scores_the_node_holding_it() {
+        let (count, dim) = (300usize, 16usize);
+        let unit = |v: &[f32]| -> Vec<f32> {
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            v.iter().map(|x| x / norm).collect()
+        };
+        let vectors: Vec<Vec<f32>> = crate::test_support::clustered(count + 8, dim, 0x0226)
+            .iter()
+            .map(|v| unit(v))
+            .collect();
+        let (records, queries) = vectors.split_at(count);
+        let pq = Arc::new(PQ::new(dim, 4, 4, 128, None));
+        pq.train(records).unwrap();
+        let refs: Vec<&[f32]> = records.iter().map(Vec::as_slice).collect();
+        let codes = pq.quantize_batch(&refs).unwrap();
+        let batch: Vec<(&Vec<u8>, usize, crate::Position)> = codes
+            .iter()
+            .enumerate()
+            .map(|(k, code)| (code, k + 1, crate::Position::from_slot(k)))
+            .collect();
+        let layers = crate::NB_LAYER_MAX as usize;
+        for space in ["cosine", "l2", "l1", "angular"] {
+            let mut graph = crate::VectorGraph::new_pq(space, 8, count, layers, 50, pq.clone());
+            graph.insert_batch_pq(&batch).unwrap();
+            for (q, query) in queries.iter().enumerate() {
+                // Each code through the kernel, with its table dropped before
+                // the graph installs its own on this thread.
+                let kernel: Vec<u32> = {
+                    let kernel =
+                        CodeKernel::new(pq.clone(), PqMetric::of_space(space), query).unwrap();
+                    (0..count as u32)
+                        .map(|node| kernel.score(graph.codes_at(node).unwrap()).to_bits())
+                        .collect()
+                };
+                let scores = graph.code_scores(query).unwrap().unwrap();
+                for (node, &bits) in kernel.iter().enumerate() {
+                    let traversed = scores.at(node as u32).unwrap();
+                    assert_eq!(
+                        bits,
+                        traversed.to_bits(),
+                        "{space} query {q} node {node}: the kernel scores {:e} and the \
+                         traversal {traversed:e}",
+                        f32::from_bits(bits)
+                    );
+                }
+            }
+        }
+    }
+
     /// A reconstruction of no length is at distance one from everything
     ///
     /// Where `cosine_normalized` puts a zero vector too. The alternative is a
@@ -2881,6 +3364,427 @@ mod tests {
         // A zero query has no direction either.
         let _lut2 = dist.install_query_lut(&[0.0f32; 4]).expect("query lut");
         assert_eq!(dist.eval(&[0u8; 2], &[1, 1]), 1.0);
+    }
+
+    /// 2^62 as an `f32`, and the next `f32` above it.
+    const AT_BOUND: f32 = f32::from_bits(0x5E80_0000);
+    const PAST_BOUND: f32 = f32::from_bits(0x5E80_0001);
+
+    /// The screen admits a vector whose norm is the bound and refuses the
+    /// next `f32` above it, refuses two values each below the bound whose
+    /// norm passes it, takes the norm in `f64` past the range of an `f32`
+    /// square, finds the first value that is not finite, holds nothing to the
+    /// bound where `bounded` is false, and takes the exact path past
+    /// `SCREEN_WIDTH`.
+    #[test]
+    fn the_screen_holds_a_vector_to_the_bound_on_its_norm() {
+        assert_eq!(f64::from(AT_BOUND), NORM_BOUND);
+        assert_eq!(f64::from(NORM_BOUND_F32), NORM_BOUND);
+        assert_eq!(screen(&[AT_BOUND, 0.0, 0.0], true), Screen::Admitted);
+        assert_eq!(screen(&[0.0, -AT_BOUND], true), Screen::Admitted);
+        assert_eq!(
+            screen(&[PAST_BOUND, 0.0], true),
+            Screen::PastBound {
+                norm: f64::from(PAST_BOUND)
+            }
+        );
+        // 1.5 * 2^61 twice is a norm of about 1.06 * 2^62.
+        let three_quarters = f32::from_bits(0x5E40_0000);
+        assert!(matches!(
+            screen(&[three_quarters, three_quarters], true),
+            Screen::PastBound { norm } if norm > NORM_BOUND
+        ));
+        assert_eq!(
+            screen(&[three_quarters, three_quarters], false),
+            Screen::Admitted
+        );
+
+        let largest = vec![f32::MAX; 8];
+        match screen(&largest, true) {
+            Screen::PastBound { norm } => {
+                // Each square is exact in f64, and so is their sum of eight.
+                let square = f64::from(f32::MAX) * f64::from(f32::MAX);
+                assert_eq!(norm, (8.0 * square).sqrt());
+            }
+            other => panic!("the largest values gave {other:?}"),
+        }
+        assert_eq!(screen(&largest, false), Screen::Admitted);
+
+        for bounded in [true, false] {
+            assert!(matches!(
+                screen(&[1.0, f32::NAN, f32::INFINITY], bounded),
+                Screen::NotFinite { index: 1, value } if value.is_nan()
+            ));
+            assert_eq!(
+                screen(&[f32::MAX, f32::NEG_INFINITY], bounded),
+                Screen::NotFinite {
+                    index: 1,
+                    value: f32::NEG_INFINITY
+                }
+            );
+        }
+
+        let wide = vec![1.0f32; SCREEN_WIDTH + 1];
+        assert_eq!(screen(&wide, true), Screen::Admitted);
+        let mut wide_past = wide;
+        wide_past[SCREEN_WIDTH] = PAST_BOUND;
+        assert!(matches!(screen(&wide_past, true), Screen::PastBound { .. }));
+    }
+
+    /// The one pass in `f32` admits no vector the norm in `f64` refuses and
+    /// refuses none it admits, for vectors whose norms lie either side of the
+    /// bound, at every width the grid runs and at the widest one.
+    #[test]
+    fn the_screen_agrees_with_the_norm_in_f64_either_side_of_the_bound() {
+        let mut generator = rng(0x5C2E_E400);
+        let mut widths = DIMS.to_vec();
+        widths.push(SCREEN_WIDTH);
+        for &dim in &widths {
+            for case in 0..64 {
+                let vector = random_vector(&mut generator, dim);
+                let norm = norm_f64(&vector);
+                // A scale that puts the norm within a factor of two of the
+                // bound on either side.
+                let target = NORM_BOUND * (0.5 + f64::from(case) / 42.0);
+                let scaled: Vec<f32> = vector
+                    .iter()
+                    .map(|&x| (f64::from(x) * target / norm) as f32)
+                    .collect();
+                let past = norm_f64(&scaled) > NORM_BOUND;
+                match screen(&scaled, true) {
+                    Screen::Admitted => assert!(!past, "dim {dim} case {case} admitted"),
+                    Screen::PastBound { norm } => {
+                        assert!(past, "dim {dim} case {case} refused");
+                        assert_eq!(norm, norm_f64(&scaled));
+                    }
+                    other => panic!("dim {dim} case {case} gave {other:?}"),
+                }
+            }
+        }
+    }
+
+    /// The words a refusal of a norm past the bound gives after it names the
+    /// vector.
+    #[test]
+    fn a_norm_past_the_bound_is_named_with_the_bound() {
+        assert_eq!(
+            past_bound_words(1e19),
+            "has a Euclidean norm of 1e19 (must be at most 2^62, 4.611686018427388e18, under \
+             l2, dot or l1)"
+        );
+    }
+
+    /// The widths the path tests run at. Every width from 0 to 136 holds
+    /// every tail of 0 to 7 values after every count of blocks from 0 to 17,
+    /// which reaches every remainder of a loop that takes 1, 2 or 4 blocks a
+    /// turn, and 768 and 1,536 are widths the measured sets hold.
+    fn path_widths() -> Vec<usize> {
+        (0..=136).chain([768, 1536]).collect()
+    }
+
+    /// A metric by the name a space declares, with its distance.
+    type NamedDistance = (&'static str, fn(&[f32], &[f32]) -> f32);
+
+    /// The four metrics by the name a space declares, each with its distance
+    /// on the scalar path, which accumulates eight lanes one value at a time
+    /// and adds the tail one value at a time.
+    fn scalar_paths() -> [NamedDistance; 4] {
+        [
+            ("cosine", previous::cosine_normalized),
+            ("l2", previous::l2),
+            ("l1", previous::l1),
+            ("dot", |a, b| 1.0 - previous::dot(a, b)),
+        ]
+    }
+
+    /// Every way the engine evaluates one raw distance of `space`, by name:
+    /// the distance type's own call, the scorer of each kernel path this
+    /// processor runs, the scorer a graph takes from each path, and the
+    /// function `raw_distance` resolves, on the processor's path and with the
+    /// baseline path forced.
+    fn every_evaluation(space: &str, a: &[f32], b: &[f32]) -> Vec<(String, f32)> {
+        let mut got: Vec<(String, f32)> = Vec::new();
+        macro_rules! of {
+            ($dist:expr, $on:ident) => {{
+                got.push(("the distance's own call".into(), $dist.eval(a, b)));
+                got.push(("the baseline scorer".into(), $on(Baseline).eval(a, b)));
+                got.push((
+                    "the baseline path's scorer of the distance".into(),
+                    Path::scorer(Baseline, &$dist).eval(a, b),
+                ));
+                #[cfg(target_arch = "x86_64")]
+                if let Some(avx) = Avx::detected() {
+                    got.push(("the avx scorer".into(), $on(avx).eval(a, b)));
+                    got.push((
+                        "the avx path's scorer of the distance".into(),
+                        Path::scorer(avx, &$dist).eval(a, b),
+                    ));
+                }
+                got.push((
+                    "the held path's scorer of the distance".into(),
+                    Path::scorer(crate::graph::Held, &$dist).eval(a, b),
+                ));
+            }};
+        }
+        match space {
+            "cosine" => of!(CosineDist {}, CosineOn),
+            "l2" => of!(L2Dist {}, L2On),
+            "l1" => of!(L1Dist {}, L1On),
+            _ => of!(DotDist {}, DotOn),
+        }
+        got.push(("the resolved function".into(), raw_distance(space)(a, b)));
+        got.push((
+            "the resolved function with the baseline forced".into(),
+            checks::on_baseline(|| raw_distance(space))(a, b),
+        ));
+        got
+    }
+
+    /// Every path of every raw distance returns the bits the scalar path
+    /// returns, at every width of [`path_widths`], over five magnitudes, and
+    /// for zero vectors, a lone value, a NaN and an infinity.
+    #[test]
+    fn every_kernel_path_returns_the_scalar_bits() {
+        let mut r = rng(225);
+        let mut compared = 0usize;
+        let mut hold = |dim: usize, what: &str, a: &[f32], b: &[f32], ua: &[f32], ub: &[f32]| {
+            for (space, scalar) in scalar_paths() {
+                // Cosine takes unit vectors, as the index hands it them.
+                let (x, y) = if space == "cosine" { (ua, ub) } else { (a, b) };
+                let want = scalar(x, y);
+                for (path, got) in every_evaluation(space, x, y) {
+                    compared += 1;
+                    assert_eq!(
+                        got.to_bits(),
+                        want.to_bits(),
+                        "{space} at width {dim}, {what}: {path} returned {got:e} and the scalar \
+                         path {want:e}"
+                    );
+                }
+            }
+        };
+
+        for scale in [1.0e-15f32, 1.0e-6, 1.0, 1.0e6, 1.0e15] {
+            for dim in path_widths() {
+                let pairs = if dim <= 136 { 12 } else { 40 };
+                for _ in 0..pairs {
+                    let a: Vec<f32> = random_vector(&mut r, dim)
+                        .iter()
+                        .map(|x| x * scale)
+                        .collect();
+                    let b: Vec<f32> = random_vector(&mut r, dim)
+                        .iter()
+                        .map(|x| x * scale)
+                        .collect();
+                    let (ua, ub) = (normalize(&a), normalize(&b));
+                    hold(dim, &format!("scale {scale:e}"), &a, &b, &ua, &ub);
+                }
+            }
+        }
+
+        for dim in path_widths().into_iter().filter(|&dim| dim > 0) {
+            let zeros = vec![0.0f32; dim];
+            let mut lone = vec![0.0f32; dim];
+            lone[dim - 1] = 3.0;
+            let mut nan = vec![0.1f32; dim];
+            nan[0] = f32::NAN;
+            let mut infinite = vec![0.1f32; dim];
+            infinite[0] = f32::INFINITY;
+            let tenths = vec![0.1f32; dim];
+            for (what, u, v) in [
+                ("two zero vectors", &zeros, &zeros),
+                ("a lone value", &lone, &zeros),
+                ("a NaN", &nan, &tenths),
+                ("an infinity", &infinite, &tenths),
+            ] {
+                hold(dim, what, u, v, u, v);
+            }
+        }
+        println!("every kernel path against the scalar path  compared {compared}  differing 0");
+    }
+
+    /// A raw graph of `space` over `data`, built by the seam's own insertion.
+    fn seam_graph(space: &str, data: &[Vec<f32>]) -> crate::graph::VectorGraph {
+        let mut graph =
+            crate::graph::VectorGraph::new_raw(space, data[0].len(), 16, data.len(), 16, 200);
+        for (id, vector) in data.iter().enumerate() {
+            graph.insert(vector, id, crate::space::Position::from_slot(id));
+        }
+        graph
+    }
+
+    /// The bytes of the dump `graph` writes.
+    fn dump_bytes(graph: &crate::graph::VectorGraph) -> Vec<u8> {
+        let dir = tempfile::tempdir().unwrap();
+        graph
+            .dump(
+                &crate::storage::FsDir::new(dir.path()),
+                crate::graph::dump::DUMP_FILENAME,
+            )
+            .unwrap();
+        std::fs::read(dir.path().join(crate::graph::dump::DUMP_FILENAME)).unwrap()
+    }
+
+    /// A graph the seam builds on the baseline path is the graph it builds on
+    /// the processor's path, dump byte for dump byte, and each answers every
+    /// query with the same page, ids and score bits, under no predicate and
+    /// under one, for every raw space.
+    #[test]
+    fn the_seam_builds_and_searches_alike_on_every_kernel_path() {
+        const N: usize = 1200;
+        const DIM: usize = 43;
+        let mut r = rng(2250);
+        let data: Vec<Vec<f32>> = (0..N)
+            .map(|_| normalize(&random_vector(&mut r, DIM)))
+            .collect();
+        let queries: Vec<Vec<f32>> = (0..150)
+            .map(|_| normalize(&random_vector(&mut r, DIM)))
+            .collect();
+        let even = |at: &usize| at.is_multiple_of(2);
+
+        for space in ["cosine", "l2", "l1", "dot"] {
+            let resolved = seam_graph(space, &data);
+            let baseline = checks::on_baseline(|| seam_graph(space, &data));
+            assert!(
+                dump_bytes(&resolved) == dump_bytes(&baseline),
+                "{space}: the two paths built different graphs"
+            );
+            for (q, query) in queries.iter().enumerate() {
+                let page =
+                    |graph: &crate::graph::VectorGraph, filtered: bool| -> Vec<(usize, u32)> {
+                        let hits = if filtered {
+                            graph.search(query, 10, 100, Some(&even))
+                        } else {
+                            graph.search(query, 10, 100, None::<&fn(&usize) -> bool>)
+                        };
+                        hits.unwrap()
+                            .into_iter()
+                            .map(|hit| (hit.position, hit.distance.to_bits()))
+                            .collect()
+                    };
+                for filtered in [false, true] {
+                    let on_resolved = page(&resolved, filtered);
+                    let on_baseline = checks::on_baseline(|| page(&resolved, filtered));
+                    let of_baseline = page(&baseline, filtered);
+                    assert_eq!(
+                        on_resolved, on_baseline,
+                        "{space}, query {q}, filtered {filtered}: the paths returned different pages"
+                    );
+                    assert_eq!(
+                        on_resolved, of_baseline,
+                        "{space}, query {q}, filtered {filtered}: the graphs returned different pages"
+                    );
+                    assert_eq!(on_resolved.len(), 10, "{space}, query {q}: a full page");
+                }
+            }
+        }
+    }
+
+    /// A search, each phase of an insertion, a timing run and a resolved
+    /// function each read the processor's feature once on a raw graph,
+    /// whatever number of distances they evaluate, and the function a
+    /// resolution hands back reads it never. A graph over scalar codes reads
+    /// it never. A target with one kernel path reads it never.
+    #[test]
+    fn a_search_and_a_build_step_resolve_the_kernel_path_once() {
+        const N: usize = 300;
+        const DIM: usize = 24;
+        // One read of the cached feature byte a resolution, on the one
+        // target that chooses between two kernel paths at run time.
+        let once = usize::from(cfg!(target_arch = "x86_64"));
+        let mut r = rng(22500);
+        let data: Vec<Vec<f32>> = (0..N)
+            .map(|_| normalize(&random_vector(&mut r, DIM)))
+            .collect();
+        let query = normalize(&random_vector(&mut r, DIM));
+        let extra = normalize(&random_vector(&mut r, DIM));
+
+        for space in ["cosine", "l2", "l1", "dot"] {
+            let mut graph = seam_graph(space, &data);
+            checks::take();
+
+            let hits = graph
+                .search(&query, 10, 100, None::<&fn(&usize) -> bool>)
+                .unwrap();
+            assert_eq!(hits.len(), 10);
+            assert_eq!(
+                checks::take(),
+                once,
+                "{space}: the reads of the feature a search with no predicate makes"
+            );
+
+            let every = |_: &usize| true;
+            graph.search(&query, 10, 100, Some(&every)).unwrap();
+            assert_eq!(
+                checks::take(),
+                once,
+                "{space}: the reads of the feature a search under a predicate makes"
+            );
+
+            let level = graph.draw_level();
+            let planned = graph
+                .plan_at_level(crate::graph::Record::Raw(&extra), level)
+                .unwrap();
+            assert_eq!(
+                checks::take(),
+                once,
+                "{space}: the reads of the feature an insertion's plan makes"
+            );
+            graph.install(
+                crate::graph::Record::Raw(&extra),
+                N,
+                crate::space::Position::from_slot(N),
+                planned,
+            );
+            assert_eq!(
+                checks::take(),
+                once,
+                "{space}: the reads of the feature an insertion's install makes"
+            );
+
+            graph.time_distance_ns(500, 2, &|_| true).unwrap();
+            assert_eq!(
+                checks::take(),
+                once,
+                "{space}: the reads of the feature a timing run makes"
+            );
+
+            let distance = raw_distance(space);
+            assert_eq!(
+                checks::take(),
+                once,
+                "{space}: the reads of the feature a resolution makes"
+            );
+            let mut sum = 0.0f32;
+            for vector in &data {
+                sum += distance(&query, vector);
+            }
+            assert!(sum.is_finite());
+            assert_eq!(
+                checks::take(),
+                0,
+                "{space}: the reads of the feature the resolved function makes over {N} calls"
+            );
+        }
+
+        // A scalar quantized graph evaluates with the distance it holds.
+        let codec = std::sync::Arc::new(Int8Codec::fit(DIM, &data).unwrap());
+        let mut int8 = crate::graph::VectorGraph::new_int8("l2", 16, N, 16, 200, codec);
+        let rows: Vec<Vec<i8>> = data.iter().map(|v| int8.int8_encode(v).unwrap()).collect();
+        let batch: Vec<(&[i8], usize, crate::space::Position)> = rows
+            .iter()
+            .enumerate()
+            .map(|(id, row)| (row.as_slice(), id, crate::space::Position::from_slot(id)))
+            .collect();
+        checks::take();
+        int8.insert_batch_int8(&batch).unwrap();
+        int8.search(&query, 10, 100, None::<&fn(&usize) -> bool>)
+            .unwrap();
+        assert_eq!(
+            checks::take(),
+            0,
+            "the reads of the feature a graph over scalar codes makes"
+        );
     }
 }
 

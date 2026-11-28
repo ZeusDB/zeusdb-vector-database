@@ -92,7 +92,7 @@ use std::time::Instant;
 use tracing::{debug, error, instrument, trace, warn};
 use zeusdb_vector_core::{
     matches_filter, Admit, And, Bitmap, Budget, Candidates, ColumnStore, Error, FieldLookup,
-    Filter, Fusion, Hits, IdStore, IdfScope, MetadataStore, Position, Selection, SparseRef,
+    Filter, Fusion, Hits, IdStore, IdfScope, MetadataStore, Position, Screen, Selection, SparseRef,
     VectorIndex,
 };
 
@@ -690,7 +690,8 @@ impl Collection {
     /// reconstruction of its codes where the index keeps no raw vector, a
     /// candidate that has neither sorts last, and the best `top_k` are kept.
     /// The single space search and the query path both apply it, so a dense
-    /// arm inside a query returns the page the single space search returns.
+    /// arm inside a query returns the page the single space search returns
+    /// for its fetch.
     pub(super) fn rescore_page(
         &self,
         scored: &mut Vec<(Named<'_>, f32)>,
@@ -715,24 +716,12 @@ impl Collection {
         }
     }
 
-    /// Resolve the search arguments into the parameters every path reads.
+    /// The two bounds a search's arguments are held to, checked with no guard
+    /// taken, for a caller that refuses them before it reads anything else.
     ///
     /// Both bounds size the candidate heaps the traversal allocates before it
     /// visits a node, and neither allocation is fallible; see `MAX_TOP_K`.
-    /// Checked first, so a bad argument is a ValueError and not a dead
-    /// interpreter, and before `ef` is derived so the derivation cannot
-    /// overflow on a value the check would have refused.
-    ///
-    /// The rerank plan is resolved once here rather than per query, because it
-    /// locks the graph to read whether the index is quantized and the search
-    /// paths take that lock themselves.
-    pub fn search_params(
-        &self,
-        top_k: usize,
-        ef_search: Option<usize>,
-        return_vector: bool,
-        rerank: Option<usize>,
-    ) -> Result<SearchParams, Error> {
+    pub fn check_search_bounds(top_k: usize, ef_search: Option<usize>) -> Result<(), Error> {
         if top_k > MAX_TOP_K {
             return Err(Error::TopKTooLarge {
                 max: MAX_TOP_K,
@@ -747,6 +736,28 @@ impl Collection {
                 });
             }
         }
+        Ok(())
+    }
+
+    /// Resolve the search arguments into the parameters every path reads.
+    ///
+    /// The bounds of [`Collection::check_search_bounds`] are checked first,
+    /// so a bad argument is a ValueError and not a dead interpreter, and
+    /// before `ef` is derived so the derivation cannot overflow on a value
+    /// the check would have refused.
+    ///
+    /// The rerank plan is resolved once here rather than per query, because it
+    /// locks the graph to read whether the index is quantized and the search
+    /// paths take that lock themselves. So a caller holding the interpreter
+    /// asks this with the interpreter released.
+    pub fn search_params(
+        &self,
+        top_k: usize,
+        ef_search: Option<usize>,
+        return_vector: bool,
+        rerank: Option<usize>,
+    ) -> Result<SearchParams, Error> {
+        Self::check_search_bounds(top_k, ef_search)?;
 
         let ef = ef_search.unwrap_or_else(|| match self.dense().metric.to_lowercase().as_str() {
             "l1" | "l2" => std::cmp::max(2 * top_k, 150),
@@ -775,13 +786,18 @@ impl Collection {
 
     /// The budget every dense search hands the index.
     ///
-    /// The traversal width the parameters resolved, and the boundary tie
-    /// group, because the collection orders an exact page's ties by external
-    /// id and needs the whole group at the cut to do so.
+    /// The traversal width the parameters resolved, the boundary tie group,
+    /// because the collection orders an exact page's ties by external id and
+    /// needs the whole group at the cut to do so, and whether the page is
+    /// rescored against the raw vectors, which sets the scale an exact scan
+    /// scores a record of a `quantized_with_raw` index on: the raw vector's
+    /// under a rerank plan and the codes' with none, which is the scale the
+    /// page of a traversal takes in each case.
     pub(super) fn dense_budget(params: &SearchParams) -> Budget {
         Budget {
             ef: Some(params.ef),
             boundary_ties: true,
+            rescored: params.rerank.is_some(),
             ..Budget::default()
         }
     }
@@ -831,9 +847,10 @@ impl Collection {
     /// The batch search path, for query vectors that are not yet processed
     /// for the space.
     ///
-    /// Every vector is checked for its width and for non-finite values before
-    /// any is searched, so one bad vector is findable in a batch of thousands
-    /// and refuses the whole call. A batch of five or fewer runs in turn under
+    /// Every vector is checked for its width, for non-finite values and, under
+    /// l2, dot or l1, for a norm past `NORM_BOUND` before any is searched, so
+    /// one bad vector is findable in a batch of thousands and refuses the
+    /// whole call. A batch of five or fewer runs in turn under
     /// one set of guards and a larger one fans across rayon.
     #[instrument(target = LOG_TARGET, level = "debug", skip(self, vectors, filter_conditions, params), fields(
         batch_size = vectors.len(),
@@ -869,14 +886,18 @@ impl Collection {
                 });
             }
 
-            // The same value check the single query path applies. A non-finite
-            // component survives normalization, because the norm of a vector
-            // containing one is not greater than zero, and the search then
-            // returns hits whose scores carry no distance information. The
-            // message names the batch entry as well as the component, so one
-            // bad vector is findable in a batch of thousands.
-            for (component, &value) in vector.iter().enumerate() {
-                if !value.is_finite() {
+            // The same value check the single query path applies, with the
+            // bound on the norm under l2, dot or l1. A non-finite component
+            // would reach the traversal, and the search would then return hits
+            // whose scores carry no distance information. The message names
+            // the batch entry as well as the component, so one bad vector is
+            // findable in a batch of thousands.
+            match self.dense().screen(vector) {
+                Screen::Admitted => {}
+                Screen::NotFinite {
+                    index: component,
+                    value,
+                } => {
                     error!(
                         target: LOG_TARGET,
                         operation = "batch_search_validation",
@@ -889,7 +910,18 @@ impl Collection {
                         position: i,
                         index: component,
                         value,
+                        given: None,
                     });
+                }
+                Screen::PastBound { norm } => {
+                    error!(
+                        target: LOG_TARGET,
+                        operation = "batch_search_validation",
+                        vector_index = i,
+                        norm = norm,
+                        "Vector in batch has a norm past the bound"
+                    );
+                    return Err(Error::BatchVectorPastBound { position: i, norm });
                 }
             }
         }
@@ -1138,5 +1170,119 @@ mod tests {
         let traversed = Scored::traversed(items.clone()).cut(2);
         assert!(!traversed.exact);
         assert_eq!(traversed.items, items);
+    }
+
+    /// On a trained `quantized_with_raw` collection a record takes one score
+    /// for a query whichever path answers, being the scale of its page, under
+    /// cosine and under l2. With the rerank off, a filter admitting every
+    /// record takes the exact scan, and the scan gives each record a
+    /// traversal returns the traversal's bits. With the rerank on at one
+    /// candidate a result, the page the scan answers under that filter is the
+    /// ten records nearest the query by their raw vectors, each at its raw
+    /// distance, which is what a rescore of every admitted record gives.
+    #[test]
+    fn a_search_scores_a_record_keeping_its_raw_vector_on_its_pages_scale() {
+        use super::super::{Collection, Declaration, ParsedRecord, StorageMode};
+        use crate::raw_distance_fn;
+        use serde_json::json;
+        use std::collections::HashMap;
+        use zeusdb_vector_core::{compile_filter, test_support::clustered};
+
+        const RECORDS: usize = 1_500;
+        const DIM: usize = 32;
+        let every = compile_filter(&HashMap::from([("every".to_string(), json!("y"))])).unwrap();
+        for metric in ["cosine", "l2"] {
+            let declared =
+                Declaration::validate(DIM, metric, 16, 200, RECORDS, vec!["every".to_string()])
+                    .unwrap();
+            let quantization = declared
+                .quantization(8, 6, 1_000, None, StorageMode::QuantizedWithRaw)
+                .unwrap();
+            let collection = Collection::build(declared, Some(quantization));
+            // Each vector as the binding hands it over, processed for the
+            // space, which is what the index stores.
+            let stored: Vec<Vec<f32>> = clustered(RECORDS, DIM, 0x0226)
+                .into_iter()
+                .map(|vector| collection.process_vector_for_space(vector))
+                .collect();
+            let records: Vec<ParsedRecord> = stored
+                .iter()
+                .enumerate()
+                .map(|(i, vector)| ParsedRecord {
+                    id: format!("r{i:04}"),
+                    vector: vector.clone(),
+                    sparse: None,
+                    metadata: HashMap::from([("every".to_string(), json!("y"))]),
+                })
+                .collect();
+            let added = collection.add_records(records, vec![], false);
+            assert_eq!(added.total_errors, 0, "{metric}: {:?}", added.errors);
+            assert!(collection.is_quantized(), "{metric}");
+            let queries: Vec<Vec<f32>> = clustered(20, DIM, 0x2260)
+                .into_iter()
+                .map(|query| collection.process_vector_for_space(query))
+                .collect();
+
+            // The rerank off: the scan's bits are the traversal's.
+            let traversal = collection
+                .search_params(50, Some(400), false, Some(0))
+                .unwrap();
+            let scan = collection
+                .search_params(RECORDS, None, false, Some(0))
+                .unwrap();
+            let mut compared = 0usize;
+            for (q, query) in queries.iter().enumerate() {
+                let traversed = collection.search_one(query, None, traversal).unwrap();
+                assert_eq!(traversed.len(), 50, "{metric} query {q}");
+                let scanned: HashMap<String, f32> = collection
+                    .search_one(query, Some(&every), scan)
+                    .unwrap()
+                    .iter()
+                    .map(|hit| (hit.id().to_string(), hit.score()))
+                    .collect();
+                assert_eq!(scanned.len(), RECORDS, "{metric} query {q}");
+                for hit in traversed.iter() {
+                    let by_scan = scanned[hit.id()];
+                    compared += 1;
+                    assert_eq!(
+                        by_scan.to_bits(),
+                        hit.score().to_bits(),
+                        "{metric} query {q}: with the rerank off the scan scores {} as {by_scan:e} \
+                         and the traversal as {:e}",
+                        hit.id(),
+                        hit.score()
+                    );
+                }
+            }
+            assert_eq!(compared, 20 * 50, "{metric}");
+
+            // The rerank on at one candidate a result: the raw nearest ten.
+            let distance = raw_distance_fn(metric);
+            let reranked = collection.search_params(10, None, false, Some(1)).unwrap();
+            for (q, query) in queries.iter().enumerate() {
+                let page: Vec<(String, u32)> = collection
+                    .search_one(query, Some(&every), reranked)
+                    .unwrap()
+                    .iter()
+                    .map(|hit| (hit.id().to_string(), hit.score().to_bits()))
+                    .collect();
+                let mut raw: Vec<(String, f32)> = stored
+                    .iter()
+                    .enumerate()
+                    .map(|(i, vector)| (format!("r{i:04}"), distance(query, vector)))
+                    .collect();
+                raw.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+                let nearest: Vec<(String, u32)> = raw
+                    .into_iter()
+                    .take(10)
+                    .map(|(id, score)| (id, score.to_bits()))
+                    .collect();
+                assert_eq!(
+                    page, nearest,
+                    "{metric} query {q}: the rescored page under the filter is not the ten \
+                     records nearest by their raw vectors"
+                );
+            }
+        }
     }
 }

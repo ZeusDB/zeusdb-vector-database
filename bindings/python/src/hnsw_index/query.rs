@@ -1,6 +1,6 @@
 //! Reading a query out of Python, and writing its page and its plan back.
 //!
-//! A query is a list of arms, each a mapping naming one query on one space,
+//! A query is a list of arms, each a dict naming one query on one space,
 //! a filter every arm shares, the page size, the candidates each arm
 //! contributes and the fusion. What leaves `parse_query` is owned Rust
 //! holding no Python object, so the search runs with the interpreter lock
@@ -10,7 +10,7 @@
 
 use super::input::extract_sparse_vector;
 use super::HNSWIndex;
-use crate::conversion::{python_dict_to_value_map, value_map_to_python};
+use crate::conversion::{count_if_given, python_dict_to_value_map, value_map_to_python};
 use crate::PyEngineError;
 use numpy::{PyArray1, PyArrayMethods};
 use pyo3::prelude::*;
@@ -135,7 +135,7 @@ impl HNSWIndex {
     ) -> Result<ParsedQuery, PyEngineError> {
         let arms: Vec<Bound<PyAny>> = arms.extract().map_err(|_| {
             type_error(format!(
-                "arms must be a list of mappings, one per arm, got {}",
+                "arms must be a list of dicts, one per arm, got {}",
                 type_name(arms)
             ))
         })?;
@@ -160,12 +160,12 @@ impl HNSWIndex {
         })
     }
 
-    /// One arm: a mapping naming exactly one of `vector`, `sparse` or
+    /// One arm: a dict naming exactly one of `vector`, `sparse` or
     /// `text`, with the options that query takes and nothing else.
     fn parse_arm(&self, arm: &Bound<PyAny>, position: usize) -> Result<ParsedArm, PyEngineError> {
         let dict = arm.cast::<PyDict>().map_err(|_| {
             type_error(format!(
-                "arms[{}] must be a mapping naming one of 'vector', 'sparse' or 'text', \
+                "arms[{}] must be a dict naming one of 'vector', 'sparse' or 'text', \
                  got {}",
                 position,
                 type_name(arm)
@@ -222,12 +222,18 @@ impl HNSWIndex {
         match kind {
             "vector" => Ok(ParsedArm::Dense {
                 vector: dense_vector(&value, position)?,
-                ef: present(dict, "ef_search")?
-                    .map(|ef| ef.extract::<usize>())
-                    .transpose()?,
-                rerank: present(dict, "rerank")?
-                    .map(|rerank| rerank.extract::<usize>())
-                    .transpose()?,
+                ef: count_if_given(
+                    present(dict, "ef_search")?
+                        .map(|ef| ef.extract::<i64>())
+                        .transpose()?,
+                    "ef_search",
+                )?,
+                rerank: count_if_given(
+                    present(dict, "rerank")?
+                        .map(|rerank| rerank.extract::<i64>())
+                        .transpose()?,
+                    "rerank",
+                )?,
             }),
             "sparse" => {
                 let vector = extract_sparse_vector(&value)
@@ -237,10 +243,10 @@ impl HNSWIndex {
                 // term ids are the dictionary's to issue. The arm's own
                 // rules come first, the vector's as the engine applies
                 // them, so a malformed arm reads the same message on
-                // either kind of space, and then the space's, through an
-                // accessor that takes no guard where there is no layer.
-                if self.inner.term_count().is_some() {
-                    vector.as_ref().validate()?;
+                // either kind of space, and then the space's, which is
+                // read with no guard taken.
+                if self.inner.takes_text() {
+                    vector.as_ref().validate_bounded()?;
                     return Err(Error::SparseVectorOnTextSpace.into());
                 }
                 Ok(ParsedArm::Sparse { vector, idf })
@@ -270,10 +276,17 @@ impl HNSWIndex {
 /// either float width.
 fn dense_vector(value: &Bound<PyAny>, position: usize) -> Result<Vec<f32>, PyEngineError> {
     if let Ok(array) = value.cast::<PyArray1<f32>>() {
-        return Ok(array.readonly().as_slice()?.to_vec());
+        return Ok(super::input::c_ordered(array)?
+            .readonly()
+            .as_slice()?
+            .to_vec());
     }
     if let Ok(array) = value.cast::<PyArray1<f64>>() {
-        return Ok(array
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a value narrowed to the f32 the index stores, not an offset, a count, an index or an id"
+        )]
+        return Ok(super::input::c_ordered(array)?
             .readonly()
             .as_slice()?
             .iter()
@@ -306,15 +319,13 @@ fn parse_idf(dict: &Bound<PyDict>, position: usize) -> Result<IdfScope, PyEngine
         "corpus" => Ok(IdfScope::Corpus),
         "global" => Ok(IdfScope::Global),
         other => Err(value_error(format!(
-            "arms[{}]['idf'] is '{}', and it is 'corpus' to weight a term by its rarity \
-             over the records the filter admits, or 'global' to weight it over every live \
-             record.",
+            "arms[{}]['idf'] is '{}', and it is 'corpus' or 'global'.",
             position, other
         ))),
     }
 }
 
-/// The fusion a query names: nothing, the name, or a mapping with the name
+/// The fusion a query names: nothing, the name, or a dict with the name
 /// and the constant.
 fn parse_fusion(value: Option<&Bound<PyAny>>) -> Result<Fusion, PyEngineError> {
     let Some(value) = value.filter(|value| !value.is_none()) else {
@@ -338,13 +349,23 @@ fn parse_fusion(value: Option<&Bound<PyAny>>) -> Result<Fusion, PyEngineError> {
             .extract::<String>()
             .map_err(|_| type_error("fusion['type'] must be a str".to_string()))?;
         let k = present(dict, "k")?
-            .map(|k| k.extract::<f32>())
+            .map(|k| k.extract::<f64>())
             .transpose()
-            .map_err(|_| type_error("fusion['k'] must be a number".to_string()))?;
+            .map_err(|_| type_error("fusion['k'] must be a number".to_string()))?
+            .map(|k| {
+                super::input::narrowed_finite(&[k])
+                    .map(|held| held[0])
+                    .map_err(|(_, given, held)| {
+                        value_error(format!(
+                            "fusion['k'] is {given:e}, which a float32 holds as {held}"
+                        ))
+                    })
+            })
+            .transpose()?;
         (kind, k)
     } else {
         return Err(type_error(format!(
-            "fusion must be 'rrf' or a mapping {{'type': 'rrf', 'k': 60.0}}, got {}",
+            "fusion must be 'rrf' or a dict {{'type': 'rrf', 'k': 60.0}}, got {}",
             type_name(value)
         )));
     };

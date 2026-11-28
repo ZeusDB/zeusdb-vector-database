@@ -4,11 +4,24 @@
 //! # What lives here and what does not
 //!
 //! Every method here does four things and nothing else: it parses its
-//! arguments into owned Rust, it releases the interpreter lock, it calls one
-//! operation on the collection, and it converts what comes back. The
-//! collection and every operation on it are in `zeusdb_vector_hnsw`, which
-//! names nothing of Python, so what is left here is the Python-facing
-//! contract, being the signatures, the docstrings and the exception classes.
+//! arguments into owned Rust, it calls one operation on the collection
+//! through `Collection::run`, and it converts what comes back, with the
+//! interpreter lock released around any call that may wait for an engine
+//! guard or does more than a constant amount of work. A cheap read of a guard
+//! or two keeps the lock while every guard it takes is free, and releases it
+//! to wait where a writer holds one; see `HNSWIndex::cheap`. The collection
+//! and every operation on it are in `zeusdb_vector_hnsw`, which names nothing
+//! of Python, so what is left here is the Python-facing contract, being the
+//! signatures, the docstrings and the exception classes.
+//!
+//! # A panic inside the engine
+//!
+//! Every method and property makes its call through `Collection::run`, so a
+//! panic inside the engine stops the index and raises `RuntimeError`, and
+//! every later call on the index raises the same, naming the call that
+//! stopped it. No panic reaches PyO3's boundary, where it would raise
+//! `PanicException`, which `except Exception` does not catch. Index creation
+//! and a load have no index to stop and go through `run_without_index`.
 //! The `#[pymethods]` block cannot be split: PyO3 accepts a second one only
 //! under its `multiple-pymethods` feature, which would add a dependency this
 //! crate has removed.
@@ -40,20 +53,24 @@ mod input;
 mod query;
 
 use crate::conversion::{
-    batch_hits_to_python, hits_to_python, python_dict_to_value_map, value_map_to_python,
+    batch_hits_to_python, count, count_if_given, hits_to_python, python_dict_to_value_map,
+    value_map_to_python,
 };
 use crate::durability::parse_durability;
 use crate::PyEngineError;
 use input::{Parsed, SparseInput};
-use numpy::{PyArray1, PyArray2, PyArrayMethods, PyUntypedArrayMethods};
+use numpy::{PyArray1, PyArray2, PyArrayMethods, PyUntypedArray, PyUntypedArrayMethods};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use query::{page_to_python, plan_to_python};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
 use tracing::{debug, error, instrument, trace};
 use zeusdb_vector_core::{compile_filter, Error};
-use zeusdb_vector_hnsw::{Added, Collection, ParsedRecord, QuantizationScheme, SparseHalf};
+use zeusdb_vector_hnsw::{
+    run_without_index, Added, Collection, IdentityRecord, ParsedRecord, QuantizationScheme,
+    QueryHits, Recovery, SparseHalf,
+};
 
 /// `skip_from_py_object` because nothing extracts an `AddResult`. It is the
 /// return type of `add` and appears in no argument position, in this crate or
@@ -82,11 +99,14 @@ pub struct AddResult {
     ///
     /// **It lines up with `total_inserted` and with nothing else.**
     /// `len(ids) == total_inserted` on every result this crate produces. A
-    /// record rejected by parsing contributes no id, because none was ever
-    /// allocated for it, and a record rejected by insertion contributes none
-    /// either, because it is not in the index. So this is not positionally
-    /// aligned with the input, and a caller who needs that alignment reads
-    /// `errors`, which names each rejection by its id or by its position.
+    /// record rejected by parsing or by insertion contributes no id, because
+    /// it is not in the index. So this is not positionally aligned with the
+    /// input, and a caller who needs that alignment reads `errors`, which
+    /// names each rejection in a batch by its id or by its position. A record
+    /// given no id may take a generated id before its sparse half or its text
+    /// is refused, and the next generated id follows it. A generated id never
+    /// names a record the index holds, across a save and a load and a replay
+    /// of its journal.
     ///
     /// Why it exists. An `add` that is given no ids generates them, as
     /// `vec_{counter}`, and until this field the generated ids were
@@ -115,10 +135,16 @@ impl From<Added> for AddResult {
 
 #[pymethods]
 impl AddResult {
+    /// The two counts and the shape, the shape as Python writes the value
+    /// `vector_shape` holds: `(rows, dim)`, or `None`.
     fn __repr__(&self) -> String {
+        let shape = match self.vector_shape {
+            Some((rows, dim)) => format!("({}, {})", rows, dim),
+            None => "None".to_string(),
+        };
         format!(
-            "AddResult(inserted={}, errors={}, shape={:?})",
-            self.total_inserted, self.total_errors, self.vector_shape
+            "AddResult(inserted={}, errors={}, shape={})",
+            self.total_inserted, self.total_errors, shape
         )
     }
 
@@ -157,9 +183,36 @@ impl AddResult {
 /// searches are never serialised against writes by PyO3's borrow flag. The
 /// lock acquisition order, the registry that checks it and the reasoning
 /// behind both are documented on `Collection`.
+///
+/// `recovery` is what the load that built the index did, and `None` on an
+/// index created in this process.
 #[pyclass]
 pub struct HNSWIndex {
     inner: Collection,
+    recovery: Option<Recovery>,
+}
+
+/// `error` with the value the caller gave where it refuses a dense arm's
+/// value that is not finite, for its words to name. Any other error is
+/// returned as it is.
+fn arm_value_given(mut error: Error, arms: &Bound<PyAny>) -> Error {
+    if let Error::SearchVectorNotFinite { index, given, .. } = &mut error {
+        *given = input::refused_arm_value(arms, *index);
+    }
+    error
+}
+
+/// The queries a `search` call carries: one vector, processed for the space,
+/// or a batch of them.
+enum Queries {
+    One(Vec<f32>),
+    Batch(Vec<Vec<f32>>),
+}
+
+/// What a `search` call's queries returned, one page or one page a query.
+enum Pages {
+    One(QueryHits),
+    Batch(Vec<QueryHits>),
 }
 /// Build an `HNSWIndex`
 ///
@@ -167,37 +220,198 @@ pub struct HNSWIndex {
 /// disk. `HNSWIndex` carries no `#[new]`, so the class is importable for
 /// `isinstance` checks and type annotations while direct construction raises
 /// `TypeError`. Every rule that governs a valid index is enforced here, which
-/// is what makes the Python factory and this function agree.
+/// is what makes the Python factory and this function agree. The four counts
+/// are read as Python integers, and a negative one raises `ValueError`
+/// naming it. A panic inside the engine raises `RuntimeError`; see
+/// `run_without_index`.
 // The argument list is the Python signature, one value per keyword.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
 #[pyo3(name = "_create_hnsw_index")]
 #[pyo3(signature = (dim, space, m, ef_construction, expected_size, quantization_config = None, indexed_fields = None, sparse = None))]
 pub fn create_hnsw_index(
-    dim: usize,
+    dim: i64,
     space: String,
-    m: usize,
-    ef_construction: usize,
-    expected_size: usize,
+    m: i64,
+    ef_construction: i64,
+    expected_size: i64,
     quantization_config: Option<&Bound<PyDict>>,
     indexed_fields: Option<Vec<String>>,
     sparse: Option<&Bound<PyDict>>,
 ) -> Result<HNSWIndex, PyEngineError> {
-    construct::build(
-        dim,
-        space,
-        m,
-        ef_construction,
-        expected_size,
-        quantization_config,
-        indexed_fields.unwrap_or_default(),
-        sparse,
-    )
+    run_without_index("create()", || {
+        construct::build(
+            count(dim, "dim")?,
+            space,
+            count(m, "m")?,
+            count(ef_construction, "ef_construction")?,
+            count(expected_size, "expected_size")?,
+            quantization_config,
+            indexed_fields.unwrap_or_default(),
+            sparse,
+        )
+    })
 }
 impl HNSWIndex {
-    /// Wrap a collection the index crate built or loaded.
+    /// Wrap a collection the index crate built.
     pub(crate) fn wrap(inner: Collection) -> Self {
-        HNSWIndex { inner }
+        HNSWIndex {
+            inner,
+            recovery: None,
+        }
+    }
+
+    /// Wrap a collection a load built, with what the load did.
+    pub(crate) fn wrap_loaded(inner: Collection, recovery: Recovery) -> Self {
+        HNSWIndex {
+            inner,
+            recovery: Some(recovery),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // The four ways a method calls the collection. Every method and every
+    // property goes through one of them, so every call is made through
+    // `Collection::run`: a stopped index refuses it before it runs, and a
+    // panic inside it stops the index and raises `RuntimeError` rather than
+    // crossing into Python.
+    // ------------------------------------------------------------------
+
+    /// `call` through the rule a panic keeps, with the interpreter held. For
+    /// a call that takes no engine guard, and for a body that reads Python
+    /// objects around a call it makes with the interpreter released.
+    fn held<T>(
+        &self,
+        operation: &'static str,
+        call: impl FnOnce(&Collection) -> Result<T, PyEngineError>,
+    ) -> Result<T, PyEngineError> {
+        self.inner.run(operation, || call(&self.inner))
+    }
+
+    /// `call` through the rule a panic keeps, with the interpreter released.
+    /// For a call that does more than a constant amount of work, or that may
+    /// wait for the mutation guard or for a writer's storage guard.
+    fn released<T: Send>(
+        &self,
+        py: Python<'_>,
+        operation: &'static str,
+        call: impl FnOnce(&Collection) -> Result<T, Error> + Send,
+    ) -> Result<T, PyEngineError> {
+        let inner = &self.inner;
+        run_released!(py, inner, operation, call(inner))
+    }
+
+    /// A read of an engine guard or two through the rule a panic keeps, with
+    /// the interpreter held where `now` finds every guard free, and with it
+    /// released for `wait` where a writer holds one or a panic poisoned one.
+    /// A cheap call so pays no hand-off of the interpreter when nothing is
+    /// writing, and never waits for a writer with the interpreter held.
+    fn cheap<T: Send>(
+        &self,
+        py: Python<'_>,
+        operation: &'static str,
+        now: impl FnOnce(&Collection) -> Option<T>,
+        wait: impl FnOnce(&Collection) -> T + Send,
+    ) -> Result<T, PyEngineError> {
+        let inner = &self.inner;
+        if let Some(value) = inner.run(operation, || Ok::<_, Error>(now(inner)))? {
+            return Ok(value);
+        }
+        run_released!(py, inner, operation, Ok::<_, Error>(wait(inner)))
+    }
+
+    /// What `read` gives where the index is not stopped and every guard it
+    /// takes is free now, and `None` otherwise. For a log field, which is
+    /// read with the interpreter held before a method's body runs, so it
+    /// neither waits nor meets a poisoned guard, and records nothing in
+    /// either case.
+    fn peek<T>(&self, read: impl FnOnce(&Collection) -> Option<T>) -> Option<T> {
+        if self.inner.is_stopped() {
+            None
+        } else {
+            read(&self.inner)
+        }
+    }
+
+    /// An identity as `identity` and `backup` return it.
+    fn identity_dict(py: Python<'_>, record: &IdentityRecord) -> PyResult<Py<PyAny>> {
+        let hex = |id: u128| format!("{:032x}", id);
+        let identity = &record.identity;
+        let dict = PyDict::new(py);
+        dict.set_item("collection_id", hex(identity.collection_id))?;
+        dict.set_item("generation", identity.generation)?;
+        dict.set_item("snapshot", identity.snapshot.map(hex))?;
+        dict.set_item("parent", identity.parent.map(hex))?;
+        dict.set_item("saved_at", record.saved_at.as_deref())?;
+        dict.set_item("sequence", record.sequence)?;
+        Ok(dict.into())
+    }
+
+    /// What a load did, as `recovery` returns it.
+    fn recovery_dict(py: Python<'_>, recovery: &Recovery) -> PyResult<Py<PyAny>> {
+        let dict = PyDict::new(py);
+        dict.set_item("format_version", &recovery.format_version)?;
+        dict.set_item("journaled", recovery.journaled)?;
+        dict.set_item("checkpoint_sequence", recovery.checkpoint_sequence)?;
+        dict.set_item("first_sequence", recovery.first_sequence)?;
+        dict.set_item("records_in_journal", recovery.records_in_journal)?;
+        dict.set_item("replayed", recovery.replayed)?;
+        dict.set_item("withdrawn", recovery.withdrawn)?;
+        dict.set_item("skipped", recovery.skipped)?;
+        dict.set_item("segments", recovery.segments)?;
+        let damage = match &recovery.damage {
+            Some(damage) => {
+                let entry = PyDict::new(py);
+                entry.set_item("kind", damage.kind)?;
+                entry.set_item("segment", &damage.segment)?;
+                entry.set_item("at", damage.at)?;
+                entry.set_item("sequence", damage.sequence)?;
+                entry.set_item("detail", damage.detail.as_deref())?;
+                Some(entry)
+            }
+            None => None,
+        };
+        dict.set_item("damage", damage)?;
+        dict.set_item("restored_from_aside", recovery.restored_from_aside)?;
+        dict.set_item("graph_rebuilt", recovery.graph_rebuilt)?;
+        dict.set_item("upgraded_from", recovery.upgraded_from.as_deref())?;
+        dict.set_item(
+            "checkpoint_taken",
+            recovery.checkpoint_taken.map(|taken| taken.name()),
+        )?;
+        dict.set_item("read_only", recovery.read_only.is_some())?;
+        dict.set_item("read_only_reason", recovery.read_only.as_deref())?;
+        let repair = match &recovery.repair {
+            Some(repair) => {
+                let entry = PyDict::new(py);
+                entry.set_item("kept_through", repair.kept_through)?;
+                entry.set_item("discarded_from", repair.discarded_from)?;
+                entry.set_item("records_discarded", repair.records_discarded)?;
+                entry.set_item("bytes_discarded", repair.bytes_discarded)?;
+                entry.set_item(
+                    "quarantine",
+                    repair
+                        .quarantine
+                        .as_ref()
+                        .map(|path| path.display().to_string()),
+                )?;
+                Some(entry)
+            }
+            None => None,
+        };
+        dict.set_item("repair", repair)?;
+        let replaced = PyList::empty(py);
+        for value in recovery.replaced() {
+            let entry = PyDict::new(py);
+            entry.set_item("file", &value.file)?;
+            entry.set_item("field", &value.field)?;
+            entry.set_item("recorded", &value.recorded)?;
+            entry.set_item("taken", &value.taken)?;
+            entry.set_item("detail", &value.detail)?;
+            replaced.append(entry)?;
+        }
+        dict.set_item("replaced", replaced)?;
+        Ok(dict.into())
     }
 
     /// The shape rule for a 2-D query array
@@ -255,64 +469,79 @@ impl HNSWIndex {
     /// Get quantization configuration and status
     ///
     /// `type` is `pq` or `int8`. Under `pq` the mapping carries `subvectors`
-    /// and `bits`, and once trained the codebook's `total_centroids`,
-    /// `sdc_memory_mb` and `centroid_norm_memory_mb`. Under `int8` it carries
-    /// `scale` instead and none of the codebook's keys. `training_size`,
-    /// `max_training_vectors` where set, `is_trained`, `memory_mb`, being
-    /// the codebook or the scales, and `compression_ratio`, being the code
-    /// against the vector, are present under both.
-    pub fn get_quantization_info(&self, py: Python<'_>) -> Option<Py<PyAny>> {
-        let report = self.inner.quantization_report()?;
+    /// and `bits`, and the codebook's `total_centroids`, `sdc_memory_mb` and
+    /// `centroid_norm_memory_mb`, the last two 0.0 until training fits the
+    /// codebook. Under `int8` it carries `scale` instead and none of the
+    /// codebook's keys. `training_size`, `max_training_vectors` where set,
+    /// `is_trained`, `memory_mb`, being the codebook or the scales, and
+    /// `compression_ratio`, being the code against the vector, are present
+    /// under both. `None` on an index declared without quantization.
+    pub fn get_quantization_info(
+        &self,
+        py: Python<'_>,
+    ) -> Result<Option<Py<PyAny>>, PyEngineError> {
+        let report = self.cheap(
+            py,
+            "get_quantization_info()",
+            Collection::try_quantization_report,
+            Collection::quantization_report,
+        )?;
+        let Some(report) = report else {
+            return Ok(None);
+        };
         let dict = PyDict::new(py);
-        dict.set_item("type", report.scheme.type_name()).ok()?;
+        dict.set_item("type", report.scheme.type_name())?;
         match &report.scheme {
             QuantizationScheme::Pq { subvectors, bits } => {
-                dict.set_item("subvectors", *subvectors).ok()?;
-                dict.set_item("bits", *bits).ok()?;
+                dict.set_item("subvectors", *subvectors)?;
+                dict.set_item("bits", *bits)?;
             }
             QuantizationScheme::Int8 { scale } => {
-                dict.set_item("scale", scale.name()).ok()?;
+                dict.set_item("scale", scale.name())?;
             }
         }
-        dict.set_item("training_size", report.training_size).ok()?;
+        dict.set_item("training_size", report.training_size)?;
 
         if let Some(max_training) = report.max_training_vectors {
-            dict.set_item("max_training_vectors", max_training).ok()?;
+            dict.set_item("max_training_vectors", max_training)?;
         }
 
         if let Some(quantizer) = report.quantizer {
-            dict.set_item("is_trained", quantizer.is_trained).ok()?;
-            dict.set_item("memory_mb", quantizer.memory_mb).ok()?;
+            dict.set_item("is_trained", quantizer.is_trained)?;
+            dict.set_item("memory_mb", quantizer.memory_mb)?;
             if let Some(total_centroids) = quantizer.total_centroids {
-                dict.set_item("total_centroids", total_centroids).ok()?;
+                dict.set_item("total_centroids", total_centroids)?;
             }
             if let Some(sdc_memory_mb) = quantizer.sdc_memory_mb {
-                dict.set_item("sdc_memory_mb", sdc_memory_mb).ok()?;
+                dict.set_item("sdc_memory_mb", sdc_memory_mb)?;
             }
             if let Some(norm_memory_mb) = quantizer.centroid_norm_memory_mb {
-                dict.set_item("centroid_norm_memory_mb", norm_memory_mb)
-                    .ok()?;
+                dict.set_item("centroid_norm_memory_mb", norm_memory_mb)?;
             }
-            dict.set_item("compression_ratio", quantizer.compression_ratio)
-                .ok()?;
+            dict.set_item("compression_ratio", quantizer.compression_ratio)?;
         }
 
-        Some(dict.into())
+        Ok(Some(dict.into()))
     }
 
     /// Check if quantization is enabled
-    pub fn has_quantization(&self) -> bool {
-        self.inner.has_quantization()
+    pub fn has_quantization(&self) -> Result<bool, PyEngineError> {
+        self.held("has_quantization()", |inner| Ok(inner.has_quantization()))
     }
 
     /// Get current vector count (for monitoring training trigger)
-    pub fn get_vector_count(&self) -> usize {
-        self.inner.vector_count()
+    pub fn get_vector_count(&self, py: Python<'_>) -> Result<usize, PyEngineError> {
+        self.cheap(
+            py,
+            "get_vector_count()",
+            Collection::try_vector_count,
+            Collection::vector_count,
+        )
     }
 
     /// Get the distance space configuration
-    pub fn get_space(&self) -> String {
-        self.inner.metric().to_string()
+    pub fn get_space(&self) -> Result<String, PyEngineError> {
+        self.held("get_space()", |inner| Ok(inner.metric().to_string()))
     }
 
     /// Rebuild the HNSW index over its codes after training is complete
@@ -320,41 +549,53 @@ impl HNSWIndex {
     /// Re-encodes whatever raw vectors the index still holds through the
     /// trained quantizer and rebuilds the graph from the stored codes, being
     /// the product quantized codes or the scalar rows. It never retrains the
-    /// quantizer; training runs exactly once, on the `add` that reaches
-    /// `training_size`. A trained `quantized_only` index holds no raw
-    /// vectors, so there the rebuild proceeds from the codes alone, and under
-    /// either mode nothing is lost by calling it. Returns false when there is
-    /// no trained quantizer or nothing stored to rebuild from.
+    /// quantizer. A trained `quantized_only` index holds no raw vectors, so
+    /// there the rebuild proceeds from the codes alone, and under either mode
+    /// nothing is lost by calling it. Returns false when there is no trained
+    /// quantizer, or when a product quantized index holds nothing to rebuild
+    /// from.
     #[instrument(level = "info", skip(self, py), fields(
-        vector_count = self.inner.vector_count(),
-        has_quantization = self.inner.has_quantization()
+        vector_count = self.peek(Collection::try_vector_count),
+        has_quantization = self.peek(|inner| Some(inner.has_quantization()))
     ), err)]
     pub fn rebuild_with_quantization(&self, py: Python<'_>) -> Result<bool, PyEngineError> {
         // The whole rebuild runs with the interpreter lock released, the mutation
         // guard included. Waiting for another writer while holding the lock would
         // stall every Python thread in the process for the length of that writer,
         // which is the failure `add` releasing the lock would otherwise create.
-        Ok(py.detach(|| self.inner.rebuild_with_quantization())?)
+        self.released(py, "rebuild_with_quantization()", |inner| {
+            inner.rebuild_with_quantization()
+        })
     }
 
     /// Check if the index is using quantized search
-    pub fn is_quantized(&self) -> bool {
-        self.inner.is_quantized()
+    pub fn is_quantized(&self, py: Python<'_>) -> Result<bool, PyEngineError> {
+        self.cheap(
+            py,
+            "is_quantized()",
+            Collection::try_is_quantized,
+            Collection::is_quantized,
+        )
     }
 
     /// Check if quantization can be used (the codebook or the scales are fitted)
-    pub fn can_use_quantization(&self) -> bool {
-        self.inner.can_use_quantization()
+    pub fn can_use_quantization(&self, py: Python<'_>) -> Result<bool, PyEngineError> {
+        self.cheap(
+            py,
+            "can_use_quantization()",
+            Collection::try_can_use_quantization,
+            Collection::can_use_quantization,
+        )
     }
 
-    /// Add records, in any of the five shapes, each filling the sparse
-    /// space as well where the index declares one.
+    /// Add records, in any of the five shapes.
     ///
     /// A record fills the sparse space under the key the space takes.
-    /// `sparse` is a mapping `{"dims": [...], "values": [...]}` of term ids
+    /// `sparse` is a dict `{"dims": [...], "values": [...]}` of term ids
     /// and weights, parallel, the dims strictly increasing and the values
-    /// finite, and whole numbers above zero on a space weighted by term
-    /// frequency; a space that takes term ids alone takes it, and a space
+    /// finite and at most 2^40 in magnitude, and whole numbers above zero on
+    /// a space weighted by term frequency; a space that takes term ids alone
+    /// takes it, and a space
     /// with a text layer refuses it, since that space's term ids are its
     /// dictionary's to issue. `text` is a string the space's text layer
     /// splits with the tokenizer it was declared with and counts into term
@@ -370,10 +611,29 @@ impl HNSWIndex {
     ///
     /// A record refused for its sparse half is counted and named in
     /// `errors`, and the records around it are inserted, as a record with a
-    /// malformed vector is treated. That covers a malformed mapping, a
+    /// malformed vector is treated. That covers a malformed `sparse`, a
     /// sparse vector or a text on an index whose space does not take it,
     /// the engine's rules on the vector, and an exception the tokenizer
     /// raised, which is named with its class in the record's error.
+    ///
+    /// Under `l2`, `dot` or `l1` a record whose vector has a Euclidean norm
+    /// past 2^62 is counted and named the same way, with its norm and the
+    /// bound, so no distance the index takes overflows. Under `cosine` no
+    /// vector is held to that bound, and one whose sum of squares overflows
+    /// or underflows a float32 is normalized in float64 and stored at unit
+    /// length.
+    ///
+    /// Every shape reads a record's metadata entry the same way. A dict is
+    /// the record's metadata, a string is kept under `text`, any other value
+    /// is kept under `value`, and `None` is no metadata. A value is None, a
+    /// bool, an integer from -2^63 to 2^63 - 1, a finite float that a float64
+    /// holds exactly, a string, a list of values or a dict with string keys,
+    /// nested at most 128 levels deep, counting the record's metadata as the
+    /// first, and comes back as the value it was. A record
+    /// whose metadata holds anything else, or a key that is not a string, is
+    /// counted and named the same way as a malformed vector, after the words
+    /// `Metadata error`, which say where the value sits, or that it nests
+    /// deeper than 128 levels.
     ///
     /// # Where the interpreter lock is held
     ///
@@ -387,136 +647,157 @@ impl HNSWIndex {
     #[pyo3(signature = (data, overwrite = true))]
     #[instrument(level = "info", skip(self, data), fields(
         overwrite = overwrite,
-        has_quantization = self.inner.has_quantization(),
-        is_quantized = self.inner.is_quantized()
+        has_quantization = self.peek(|inner| Some(inner.has_quantization())),
+        is_quantized = self.peek(Collection::try_is_quantized)
     ), err)]
     pub fn add(&self, data: Bound<PyAny>, overwrite: bool) -> Result<AddResult, PyEngineError> {
-        // Input validation
-        if data.is_none() {
-            error!(
-                operation = "add_vectors",
-                error = "data_is_none",
-                "Data cannot be None"
-            );
-            return Err(
-                PyErr::new::<pyo3::exceptions::PyValueError, _>("Data cannot be None").into(),
-            );
-        }
+        self.held("add()", |inner| {
+            // Input validation
+            if data.is_none() {
+                error!(
+                    operation = "add_vectors",
+                    error = "data_is_none",
+                    "Data cannot be None"
+                );
+                return Err(
+                    PyErr::new::<pyo3::exceptions::PyValueError, _>("Data cannot be None").into(),
+                );
+            }
 
-        // Use error-collecting parsing
-        let (parsed, mut errors) = self.parse_input_data(&data)?;
+            // Use error-collecting parsing
+            let (parsed, mut errors) = self.parse_input_data(&data)?;
 
-        // The texts, tokenized with the lock held and no guard taken. A
-        // tokenizer that fails on a record is that record's error, and so
-        // is a supplied vector on a space with a text layer, whose term
-        // ids are the dictionary's to issue. Whether the space has one is
-        // read once per call, through an accessor that takes no guard
-        // where there is none and the dictionary's read guard alone, for
-        // a length, where there is.
-        let takes_text_alone = self.inner.term_count().is_some();
-        let mut records: Vec<ParsedRecord> = Vec::with_capacity(parsed.len());
-        for Parsed {
-            id,
-            vector,
-            metadata,
-            sparse,
-        } in parsed
-        {
-            let sparse = match sparse {
-                SparseInput::None => None,
-                SparseInput::Vector(vector) => {
-                    if takes_text_alone {
-                        // The vector's own rules first, as the engine
-                        // applies them, so a malformed vector reads the
-                        // same message on either kind of space, and then
-                        // the space's.
-                        let refused = match vector.as_ref().validate() {
-                            Err(rule) => rule,
-                            Ok(()) => Error::SparseVectorOnTextSpace,
-                        };
-                        errors.push(format!(
-                            "Vector {}: {}: {}",
-                            id,
-                            refused.exception().name(),
-                            refused
-                        ));
-                        continue;
-                    }
-                    Some(SparseHalf::Vector(vector))
-                }
-                SparseInput::Text(text) => match self.inner.tokenize(&text) {
-                    Ok(terms) => Some(SparseHalf::Terms(terms)),
-                    Err(e) => {
-                        errors.push(format!("Vector {}: {}: {}", id, e.exception().name(), e));
-                        continue;
-                    }
-                },
-            };
-            records.push(ParsedRecord {
+            // The texts, tokenized with the lock held and no guard taken. A
+            // tokenizer that fails on a record is that record's error, and so
+            // is a supplied vector on a space with a text layer, whose term
+            // ids are the dictionary's to issue. Whether the space has one is
+            // read once per call, with no guard taken.
+            let takes_text_alone = inner.takes_text();
+            let mut records: Vec<ParsedRecord> = Vec::with_capacity(parsed.len());
+            let mut generated: Vec<bool> = Vec::with_capacity(parsed.len());
+            for Parsed {
                 id,
                 vector,
-                sparse,
                 metadata,
-            });
-        }
+                sparse,
+                generated: id_generated,
+            } in parsed
+            {
+                let sparse = match sparse {
+                    SparseInput::None => None,
+                    SparseInput::Vector(vector) => {
+                        if takes_text_alone {
+                            // The vector's own rules first, as the engine
+                            // applies them, so a malformed vector reads the
+                            // same message on either kind of space, and then
+                            // the space's.
+                            let refused = match vector.as_ref().validate_bounded() {
+                                Err(rule) => rule,
+                                Ok(()) => Error::SparseVectorOnTextSpace,
+                            };
+                            errors.push(format!(
+                                "Vector {}: {}: {}",
+                                id,
+                                refused.exception().name(),
+                                refused
+                            ));
+                            continue;
+                        }
+                        Some(SparseHalf::Vector(vector))
+                    }
+                    SparseInput::Text(text) => match inner.tokenize(&text) {
+                        Ok(terms) => Some(SparseHalf::Terms(terms)),
+                        Err(e) => {
+                            errors.push(format!("Vector {}: {}: {}", id, e.exception().name(), e));
+                            continue;
+                        }
+                    },
+                };
+                records.push(ParsedRecord {
+                    id,
+                    vector,
+                    sparse,
+                    metadata,
+                });
+                generated.push(id_generated);
+            }
 
-        // Parsing and tokenizing are the whole of what reads Python objects,
-        // and both are done. Everything below works on owned Rust, so the
-        // interning and the insertion run with the interpreter lock
-        // released. The mutation guard is taken inside that region rather
-        // than above it, so a caller waiting for another writer waits
-        // without the lock. Holding it while waiting would stall every
-        // Python thread in the process for the length of the writer ahead.
-        //
-        // `Collection::add_records` carries the proof that nothing inside
-        // touches Python. A record's terms travel as strings and are counted
-        // into ids there, under the mutation guard, so nothing this thread
-        // holds across the boundary is an id the dictionary issued.
-        let py = data.py();
-        let added: Added = py.detach(|| self.inner.add_records(records, errors, overwrite));
+            // Parsing and tokenizing are the whole of what reads Python objects,
+            // and both are done. Everything below works on owned Rust, so the
+            // interning and the insertion run with the interpreter lock
+            // released. The mutation guard is taken inside that region rather
+            // than above it, so a caller waiting for another writer waits
+            // without the lock. Holding it while waiting would stall every
+            // Python thread in the process for the length of the writer ahead.
+            //
+            // `Collection::add_generated_records` carries the proof that nothing
+            // inside touches Python. A record's terms travel as strings and are
+            // counted into ids there, under the mutation guard, so nothing this
+            // thread holds across the boundary is an id the dictionary issued.
+            let py = data.py();
+            let added: Added =
+                py.detach(|| inner.add_generated_records(records, generated, errors, overwrite));
 
-        Ok(AddResult::from(added))
+            Ok(AddResult::from(added))
+        })
     }
 
-    pub fn get_training_progress(&self) -> f32 {
-        self.inner.training_progress()
+    pub fn get_training_progress(&self, py: Python<'_>) -> Result<f32, PyEngineError> {
+        self.cheap(
+            py,
+            "get_training_progress()",
+            Collection::try_training_progress,
+            Collection::training_progress,
+        )
     }
 
     /// Get number of training vectors still needed
-    pub fn training_vectors_needed(&self) -> usize {
-        self.inner.training_vectors_needed()
+    pub fn training_vectors_needed(&self, py: Python<'_>) -> Result<usize, PyEngineError> {
+        self.cheap(
+            py,
+            "training_vectors_needed()",
+            Collection::try_training_vectors_needed,
+            Collection::training_vectors_needed,
+        )
     }
 
     /// Check if training is ready to be triggered
-    pub fn is_training_ready(&self) -> bool {
-        self.inner.is_training_ready()
+    pub fn is_training_ready(&self) -> Result<bool, PyEngineError> {
+        self.held("is_training_ready()", |inner| Ok(inner.is_training_ready()))
     }
 
     /// Get current storage mode description
-    pub fn get_storage_mode(&self) -> String {
-        self.inner.storage_mode()
+    pub fn get_storage_mode(&self, py: Python<'_>) -> Result<String, PyEngineError> {
+        self.cheap(
+            py,
+            "get_storage_mode()",
+            Collection::try_storage_mode,
+            Collection::storage_mode,
+        )
     }
 
     /// Enhanced search method with automatic ADC usage
     ///
     /// `rerank` controls how far a quantized search over-fetches before it
-    /// rescores the candidates against raw vectors. Omitted, the fetch is
-    /// derived from the live record count; see `SearchParams::fetch_k`. An
-    /// integer of 1 or more pulls that many candidates per requested result,
-    /// which is a fixed multiple of the page and does not move with the corpus.
-    /// Zero turns rerank off and restores the ADC scores and ordering. It has
-    /// no effect on a raw index or on a `quantized_only` one, both of which
-    /// never rerank; see `rerank_plan`.
+    /// rescores the candidates against raw vectors. Omitted, the index
+    /// chooses the fetch. An integer of 1 or more pulls that many candidates
+    /// per requested result. Zero turns rerank off and restores the ADC
+    /// scores and ordering. It has no effect on a raw index or on a
+    /// `quantized_only` one, both of which never rerank.
     ///
-    /// `ef_search` has no effect on a reranked quantized search. Below the
-    /// fetch it is discarded, because `Hnsw::search_filter` raises the
-    /// traversal width to the number of neighbours asked for and cannot return
-    /// more results than its candidate list holds. Above the fetch it buys no
-    /// recall, because the candidates a fetch returns are limited by the ADC
-    /// ordering rather than by the traversal, and quadrupling it moves recall
-    /// at 10 by at most 0.008. The default fetch is at least 250 and the
-    /// default `ef_search` is 100, so changing `ef_search` alone changes
-    /// nothing on a reranked search at the defaults.
+    /// `ef_search` takes effect on a reranked quantized search only where it
+    /// is larger than the fetch. The default `ef_search` is the larger of
+    /// twice `top_k` and 150 under `l1` and `l2`, or 100 under `cosine` and
+    /// `dot`.
+    ///
+    /// `vector` is one query, as a list, a tuple or a one dimensional array,
+    /// or a batch, as a list of lists or a two dimensional array. An empty
+    /// list, tuple or one dimensional array raises `ValueError` as an empty
+    /// search vector, and a two dimensional array with no rows as an empty
+    /// batch. Under `l2`, `dot` or `l1` a query whose Euclidean norm passes
+    /// 2^62 raises `ValueError` naming its norm and the bound, alone or in a
+    /// batch. `top_k`, `ef_search` and `rerank` are Python integers, and a
+    /// negative one raises `ValueError` naming it.
     // The argument list is the Python signature, so it is not free to be
     // bundled the way the internal batch paths bundle theirs.
     #[allow(clippy::too_many_arguments)]
@@ -526,205 +807,234 @@ impl HNSWIndex {
         ef_search = ef_search,
         return_vector = return_vector,
         rerank = rerank,
-        is_quantized = self.inner.is_quantized()
+        is_quantized = self.peek(Collection::try_is_quantized)
     ), err)]
     pub fn search(
         &self,
         py: Python<'_>,
         vector: Bound<PyAny>,
         filter: Option<&Bound<PyDict>>,
-        top_k: usize,
-        ef_search: Option<usize>,
+        top_k: i64,
+        ef_search: Option<i64>,
         return_vector: bool,
-        rerank: Option<usize>,
+        rerank: Option<i64>,
     ) -> Result<Py<PyAny>, PyEngineError> {
-        let start_time = Instant::now();
+        self.held("search()", |inner| {
+            let start_time = Instant::now();
+            let top_k = count(top_k, "top_k")?;
+            let ef_search = count_if_given(ef_search, "ef_search")?;
+            let rerank = count_if_given(rerank, "rerank")?;
 
-        // The bounds on both arguments, the `ef` default and the rerank plan,
-        // resolved once here rather than per query. See `search_params`.
-        let params = self
-            .inner
-            .search_params(top_k, ef_search, return_vector, rerank)?;
+            // The two bounds, refused before anything else is read and with no
+            // guard taken. The parameters are resolved once, inside the
+            // released region below, since the rerank plan reads the graph's
+            // guard on a trained quantized index. See `search_params`.
+            Collection::check_search_bounds(top_k, ef_search)?;
 
-        // Compiled once per search, however many queries the call carries, and
-        // before any record is examined. Rejecting an unrecognised operator or a
-        // malformed group per record would make the error depend on the data,
-        // because a record that lacks the field never reaches the operator at
-        // all. What comes back cannot fail against any record, which is why the
-        // traversal predicate has no error channel.
-        let filter_conditions = filter
-            .map(python_dict_to_value_map)
-            .transpose()?
-            .as_ref()
-            .map(compile_filter)
-            .transpose()?;
-        let dim = self.inner.dim();
+            // Compiled once per search, however many queries the call carries, and
+            // before any record is examined. Rejecting an unrecognised operator or a
+            // malformed group per record would make the error depend on the data,
+            // because a record that lacks the field never reaches the operator at
+            // all. What comes back cannot fail against any record, which is why the
+            // traversal predicate has no error channel.
+            let filter_conditions = filter
+                .map(python_dict_to_value_map)
+                .transpose()?
+                .as_ref()
+                .map(compile_filter)
+                .transpose()?;
+            let dim = inner.dim();
 
-        // Detect batch vs single query with comprehensive input support.
-        //
-        // # Why `cast` runs before `extract`
-        //
-        // `extract::<Vec<Vec<f32>>>` succeeds on a 2-D NumPy array, because an
-        // array satisfies the sequence protocol and each row satisfies it in
-        // turn. Tried first, it therefore consumed exactly the input the
-        // zero-copy arm below it was written for, and that arm was unreachable
-        // for every array of every dtype. Measured on a one record index at
-        // dimension 1,536 with a batch of 32, where the traversal is negligible
-        // and the marshalling is the whole cost, it took 101.96 microseconds a
-        // query against 21.54 for a list of lists, so the general path was
-        // paying 4.7 times the list path to read the one input it could read
-        // without copying at all.
-        //
-        // `cast` is a type check rather than a conversion attempt, so it
-        // cannot claim an input that is not an array of that dtype, and it is
-        // safe above `extract` in a way `extract` is not above it. `add`
-        // already dispatches this way at every arm.
-        //
-        // The `f64` arm sits between them. NumPy's default dtype is `f64`, so
-        // `np.random.rand(32, 1536)` is the common shape rather than an unusual
-        // one, and without an arm of its own it falls to `extract` and is read
-        // one Python float at a time. The conversion is the same rounding
-        // `extract::<f32>` performs per element, so the values are identical.
-        let result: Py<PyAny> = if let Ok(np_array) = vector.cast::<PyArray2<f32>>() {
-            // Format: NumPy 2-D array (N, dims), read without copying.
-            let readonly = np_array.readonly();
-            let shape = readonly.shape();
+            // Detect batch vs single query with comprehensive input support.
+            //
+            // # Why `cast` runs before `extract`
+            //
+            // `extract::<Vec<Vec<f32>>>` succeeds on a 2-D NumPy array, because an
+            // array satisfies the sequence protocol and each row satisfies it in
+            // turn. Tried first, it therefore consumed exactly the input the
+            // zero-copy arm below it was written for, and that arm was unreachable
+            // for every array of every dtype. Measured on a one record index at
+            // dimension 1,536 with a batch of 32, where the traversal is negligible
+            // and the marshalling is the whole cost, it took 101.96 microseconds a
+            // query against 21.54 for a list of lists, so the general path was
+            // paying 4.7 times the list path to read the one input it could read
+            // without copying at all.
+            //
+            // `cast` is a type check rather than a conversion attempt, so it
+            // cannot claim an input that is not an array of that dtype, and it is
+            // safe above `extract` in a way `extract` is not above it. `add`
+            // already dispatches this way at every arm.
+            //
+            // The `f64` arm sits between them. NumPy's default dtype is `f64`, so
+            // `np.random.rand(32, 1536)` is the common shape rather than an unusual
+            // one, and without an arm of its own it falls to `extract` and is read
+            // one Python float at a time. The conversion is the same rounding
+            // `extract::<f32>` performs per element, so the values are identical.
+            let queries = if let Ok(np_array) = vector.cast::<PyArray2<f32>>() {
+                // Format: NumPy 2-D array (N, dims), read by rows, in place
+                // where it is C-ordered; see `input::c_ordered`.
+                let readonly = input::c_ordered(np_array)?.readonly();
+                let shape = readonly.shape();
 
-            Self::validate_batch_array_shape(shape, dim)?;
+                Self::validate_batch_array_shape(shape, dim)?;
 
-            let flat = readonly.as_slice()?;
-            let batch: Vec<Vec<f32>> = flat.chunks(dim).map(|chunk| chunk.to_vec()).collect();
-            debug!(
-                operation = "batch_search_numpy",
-                batch_size = batch.len(),
-                "Starting NumPy batch search"
-            );
-            let hits = py.detach(|| {
-                self.inner
-                    .search_batch(&batch, filter_conditions.as_ref(), params)
-            })?;
-            PyList::new(py, batch_hits_to_python(hits, py)?)?.into()
-        } else if let Ok(np_array) = vector.cast::<PyArray2<f64>>() {
-            // Format: NumPy 2-D array of f64, narrowed in one pass.
-            let readonly = np_array.readonly();
-            let shape = readonly.shape();
-
-            Self::validate_batch_array_shape(shape, dim)?;
-
-            let flat = readonly.as_slice()?;
-            let batch: Vec<Vec<f32>> = flat
-                .chunks(dim)
-                .map(|chunk| chunk.iter().map(|&value| value as f32).collect())
-                .collect();
-            debug!(
-                operation = "batch_search_numpy",
-                batch_size = batch.len(),
-                dtype = "f64",
-                "Starting NumPy batch search"
-            );
-            let hits = py.detach(|| {
-                self.inner
-                    .search_batch(&batch, filter_conditions.as_ref(), params)
-            })?;
-            PyList::new(py, batch_hits_to_python(hits, py)?)?.into()
-        } else if let Ok(list_vec) = vector.extract::<Vec<Vec<f32>>>() {
-            // Format: List of vectors [[0.1, 0.2], [0.3, 0.4]]
-
-            // Validation for empty batch or empty vectors in batch
-            if list_vec.is_empty() {
-                error!(
-                    operation = "search",
-                    error = "empty_batch",
-                    "Batch cannot be empty"
+                let flat = readonly.as_slice()?;
+                let batch: Vec<Vec<f32>> = flat.chunks(dim).map(|chunk| chunk.to_vec()).collect();
+                debug!(
+                    operation = "batch_search_numpy",
+                    batch_size = batch.len(),
+                    "Starting NumPy batch search"
                 );
-                return Err(Error::BatchEmpty.into());
-            }
+                Queries::Batch(batch)
+            } else if let Ok(np_array) = vector.cast::<PyArray2<f64>>() {
+                // Format: NumPy 2-D array of f64, read by rows and narrowed in
+                // one pass.
+                let readonly = input::c_ordered(np_array)?.readonly();
+                let shape = readonly.shape();
 
-            // Check for empty vectors within the batch
-            for (i, vec) in list_vec.iter().enumerate() {
-                if vec.is_empty() {
+                Self::validate_batch_array_shape(shape, dim)?;
+
+                let flat = readonly.as_slice()?;
+                #[expect(clippy::cast_possible_truncation, reason = "a value narrowed to the f32 the index stores, not an offset, a count, an index or an id")]
+                let batch: Vec<Vec<f32>> = flat
+                    .chunks(dim)
+                    .map(|chunk| chunk.iter().map(|&value| value as f32).collect())
+                    .collect();
+                debug!(
+                    operation = "batch_search_numpy",
+                    batch_size = batch.len(),
+                    dtype = "f64",
+                    "Starting NumPy batch search"
+                );
+                Queries::Batch(batch)
+            } else if let Ok(list_vec) = vector.extract::<Vec<Vec<f32>>>() {
+                // Format: List of vectors [[0.1, 0.2], [0.3, 0.4]]
+
+                // An empty list, tuple or one dimensional array extracts as a
+                // batch of none, and is an empty query. A two dimensional array
+                // with no rows of another dtype is an empty batch, as one of
+                // `f32` or `f64` is above.
+                if list_vec.is_empty() {
+                    let batch_of_none = vector
+                        .cast::<PyUntypedArray>()
+                        .is_ok_and(|array| array.ndim() == 2);
+                    if batch_of_none {
+                        error!(
+                            operation = "search",
+                            error = "empty_batch",
+                            "Batch cannot be empty"
+                        );
+                        return Err(Error::BatchEmpty.into());
+                    }
                     error!(
                         operation = "search",
-                        error = "empty_vector_in_batch",
-                        vector_index = i,
-                        "Vector in batch cannot be empty"
+                        error = "empty_vector",
+                        "Search vector cannot be empty"
                     );
-                    return Err(Error::BatchVectorEmpty { position: i }.into());
+                    return Err(Error::SearchVectorEmpty.into());
                 }
-            }
 
-            debug!(
-                operation = "batch_search",
-                batch_size = list_vec.len(),
-                "Starting batch search"
-            );
-            let hits = py.detach(|| {
-                self.inner
-                    .search_batch(&list_vec, filter_conditions.as_ref(), params)
-            })?;
-            PyList::new(py, batch_hits_to_python(hits, py)?)?.into()
-        } else {
-            // Single vector path - enhanced with NumPy 1D support.
-            //
-            // Already `cast` before `extract`, so there is no reordering to
-            // make here. The `f64` arm is the same addition as on the batch
-            // path and for the same reason: without it a `float64` query, which
-            // is what NumPy hands back by default, was read one Python float at
-            // a time. Measured on a one record index at dimension 1,536 that
-            // was 84.41 microseconds a query against 8.43 for `float32`.
-            let query_vector = if let Ok(array1d) = vector.cast::<PyArray1<f32>>() {
-                array1d.readonly().as_slice()?.to_vec()
-            } else if let Ok(array1d) = vector.cast::<PyArray1<f64>>() {
-                array1d
-                    .readonly()
-                    .as_slice()?
-                    .iter()
-                    .map(|&value| value as f32)
-                    .collect()
+                // Check for empty vectors within the batch
+                for (i, vec) in list_vec.iter().enumerate() {
+                    if vec.is_empty() {
+                        error!(
+                            operation = "search",
+                            error = "empty_vector_in_batch",
+                            vector_index = i,
+                            "Vector in batch cannot be empty"
+                        );
+                        return Err(Error::BatchVectorEmpty { position: i }.into());
+                    }
+                }
+
+                debug!(
+                    operation = "batch_search",
+                    batch_size = list_vec.len(),
+                    "Starting batch search"
+                );
+                Queries::Batch(list_vec)
             } else {
-                vector.extract::<Vec<f32>>()?
+                // Single vector path - enhanced with NumPy 1D support.
+                //
+                // Already `cast` before `extract`, so there is no reordering to
+                // make here. The `f64` arm is the same addition as on the batch
+                // path and for the same reason: without it a `float64` query, which
+                // is what NumPy hands back by default, was read one Python float at
+                // a time. Measured on a one record index at dimension 1,536 that
+                // was 84.41 microseconds a query against 8.43 for `float32`.
+                #[expect(clippy::cast_possible_truncation, reason = "a value narrowed to the f32 the index stores, not an offset, a count, an index or an id")]
+                let query_vector = if let Ok(array1d) = vector.cast::<PyArray1<f32>>() {
+                    input::c_ordered(array1d)?.readonly().as_slice()?.to_vec()
+                } else if let Ok(array1d) = vector.cast::<PyArray1<f64>>() {
+                    input::c_ordered(array1d)?
+                        .readonly()
+                        .as_slice()?
+                        .iter()
+                        .map(|&value| value as f32)
+                        .collect()
+                } else {
+                    vector.extract::<Vec<f32>>()?
+                };
+
+                // The width and value checks, then the processing every stored
+                // vector had. See `Collection::validate_query`.
+                let processed_query = inner
+                    .validate_query(query_vector)
+                    .map_err(|error| input::with_given(error, &vector))?;
+
+                trace!(
+                    operation = "single_search",
+                    query_dim = processed_query.len(),
+                    "Starting single vector search"
+                );
+                Queries::One(processed_query)
             };
 
-            // The width and value checks, then the processing every stored
-            // vector had. See `Collection::validate_query`.
-            let processed_query = self.inner.validate_query(query_vector)?;
+            let pages = detach_paused!(py, "search()", || -> Result<Pages, Error> {
+                let params = inner.search_params(top_k, ef_search, return_vector, rerank)?;
+                Ok(match &queries {
+                    Queries::One(query) => {
+                        Pages::One(inner.search_one(query, filter_conditions.as_ref(), params)?)
+                    }
+                    Queries::Batch(batch) => Pages::Batch(inner.search_batch(
+                        batch,
+                        filter_conditions.as_ref(),
+                        params,
+                    )?),
+                })
+            })
+            .map_err(|error| input::with_given(error, &vector))?;
+            let result: Py<PyAny> = match pages {
+                Pages::One(hits) => PyList::new(py, hits_to_python(hits, py)?)?.into(),
+                Pages::Batch(batches) => {
+                    PyList::new(py, batch_hits_to_python(batches, py)?)?.into()
+                }
+            };
 
-            trace!(
-                operation = "single_search",
-                query_dim = processed_query.len(),
-                "Starting single vector search"
+            // ✅ ENTERPRISE: Add duration timing to hot path with actual result count
+            let duration_ms = start_time.elapsed().as_millis();
+            let results_count = {
+                let any = result.bind(py);
+                match any.cast::<PyList>() {
+                    Ok(list) => list.len(),
+                    Err(_) => 0,
+                }
+            };
+
+            debug!(
+                operation = "search_complete",
+                results_count = results_count,
+                duration_ms = duration_ms,
+                "Search completed"
             );
 
-            let hits = py.detach(|| {
-                self.inner
-                    .search_one(&processed_query, filter_conditions.as_ref(), params)
-            })?;
-            PyList::new(py, hits_to_python(hits, py)?)?.into()
-        };
-
-        // ✅ ENTERPRISE: Add duration timing to hot path with actual result count
-        let duration_ms = start_time.elapsed().as_millis();
-        let results_count = {
-            let any = result.bind(py);
-            match any.cast::<PyList>() {
-                Ok(list) => list.len(),
-                Err(_) => 0,
-            }
-        };
-
-        debug!(
-            operation = "search_complete",
-            results_count = results_count,
-            duration_ms = duration_ms,
-            "Search completed"
-        );
-
-        Ok(result)
+            Ok(result)
+        })
     }
 
     /// Search one or more spaces with one query and return one page.
     ///
-    /// `arms` is a list of mappings, one per arm, each asking one space with
+    /// `arms` is a list of dicts, one per arm, each asking one space with
     /// one query. `{"vector": [...]}` asks the dense space, with the
     /// vector on the caller's scale as `search` takes it, and takes
     /// `ef_search` and `rerank` as `search` does. `{"sparse": {"dims":
@@ -733,9 +1043,10 @@ impl HNSWIndex {
     /// it, since that space's term ids are its dictionary's. `{"text":
     /// "..."}` asks a space with a text layer, with a string the layer
     /// splits and counts as it counted the records; a space without one
-    /// refuses it. Either takes `idf`: `"corpus"`, the default, weights a
-    /// term by its rarity over the records the filter admits, and
-    /// `"global"` over every live record. A query names one to eight arms.
+    /// refuses it. Either takes `idf`, which a space weighted by `bm25`
+    /// reads: `"corpus"`, the default, weights a term by its rarity over the
+    /// records the filter admits, and `"global"` over every live record. A
+    /// query names one to eight arms.
     ///
     /// Every arm runs under the one admit set the `filter` decides, which
     /// is the filter `search` takes and selects the same records. `top_k`
@@ -743,21 +1054,20 @@ impl HNSWIndex {
     /// fusion, which is the page for one arm and five times it for several
     /// unless set; a record just outside one arm's page cannot be lifted by
     /// its rank on another, so a deeper fetch gives the fusion more to work
-    /// with, and the dense arm's traversal widens once the fetch passes
-    /// half its default width. `fusion` is how the arms' pages become one,
+    /// with. `fusion` is how the arms' pages become one,
     /// `"rrf"` or `{"type": "rrf", "k": 60.0}`, being reciprocal rank
     /// fusion: a record's fused score is the sum over the pages it appears
     /// on of `1 / (k + rank)`, rank counted from one, reading no score,
     /// because a dense distance and a sparse similarity are not comparable.
-    /// It is read where there is more than one arm.
+    /// It applies where there is more than one arm, and a malformed one is
+    /// refused on a query of one arm too.
     ///
     /// The page is a list of dicts, best first and cut to `top_k`, and may
     /// be shorter, since a sparse arm returns no record sharing no term
     /// with the query and a filter may admit fewer records than asked for.
     /// Each carries `id`, `score`, `metadata` and `contributions`. For one
     /// arm the score is the arm's own, being the dense distance or the
-    /// sparse similarity, and a one arm dense query is `search` id for id
-    /// and score for score. For several it is the fused score, higher
+    /// sparse similarity. For several it is the fused score, higher
     /// better and comparable only with the other fused scores of the same
     /// query, and `contributions` is what it was made from: one entry per
     /// arm's page the record appeared on, in arm order, each carrying the
@@ -766,9 +1076,8 @@ impl HNSWIndex {
     /// orders the page, so a query returns the same page from one run to
     /// the next.
     ///
-    /// Every rule is checked before any guard is taken, so a refused query
-    /// changes nothing. `explain` returns the plan the same query runs
-    /// under without running it.
+    /// `explain` returns the plan the same query runs under without
+    /// running it.
     ///
     /// # Where the interpreter lock is held
     ///
@@ -776,6 +1085,9 @@ impl HNSWIndex {
     /// with no engine guard taken. The lock is released for the search,
     /// which takes the spaces' guards without it, and taken back to build
     /// the page.
+    ///
+    /// `top_k`, `fetch` and an arm's `ef_search` and `rerank` are Python
+    /// integers, and a negative one raises `ValueError` naming it.
     #[pyo3(signature = (arms, filter=None, top_k=10, fetch=None, fusion=None))]
     #[instrument(level = "debug", skip(self, py, arms, filter, fusion), fields(
         top_k = top_k,
@@ -786,26 +1098,32 @@ impl HNSWIndex {
         py: Python<'_>,
         arms: &Bound<PyAny>,
         filter: Option<&Bound<PyDict>>,
-        top_k: usize,
-        fetch: Option<usize>,
+        top_k: i64,
+        fetch: Option<i64>,
         fusion: Option<&Bound<PyAny>>,
     ) -> Result<Py<PyAny>, PyEngineError> {
-        let start_time = Instant::now();
-        let parsed = self.parse_query(arms, filter, top_k, fetch, fusion)?;
-        let page = py.detach(|| {
-            let arms = parsed.arms();
-            self.inner.query(&parsed.query(&arms))
-        })?;
-        let results_count = page.hits.len();
-        let result = page_to_python(page.hits, py)?;
-        debug!(
-            operation = "query_complete",
-            arms = page.plan.arms.len(),
-            results_count = results_count,
-            duration_ms = start_time.elapsed().as_millis(),
-            "Query completed"
-        );
-        Ok(result)
+        self.held("query()", |inner| {
+            let start_time = Instant::now();
+            let top_k = count(top_k, "top_k")?;
+            let fetch = count_if_given(fetch, "fetch")?;
+            let parsed = self.parse_query(arms, filter, top_k, fetch, fusion)?;
+            let page = py
+                .detach(|| {
+                    let arms = parsed.arms();
+                    inner.query(&parsed.query(&arms))
+                })
+                .map_err(|error| arm_value_given(error, arms))?;
+            let results_count = page.hits.len();
+            let result = page_to_python(page.hits, py)?;
+            debug!(
+                operation = "query_complete",
+                arms = page.plan.arms.len(),
+                results_count = results_count,
+                duration_ms = start_time.elapsed().as_millis(),
+                "Query completed"
+            );
+            Ok(result)
+        })
     }
 
     /// The plan a query would run under, without running it.
@@ -818,22 +1136,22 @@ impl HNSWIndex {
     /// metadata, and not the search.
     ///
     /// `admit` is the shape of the admit set: `{"shape": "all"}` for no
-    /// filter or a filter admitting every live record above the dense scan
-    /// threshold, `{"shape": "bitmap", "admitted": n}` for a filter every
-    /// field of which is declared, `{"shape": "sorted", "admitted": n}` for
-    /// a metadata walk that finished, `{"shape": "bounded", "bound": n}`
-    /// for a walk that gave up inside the bound the declared fields left,
-    /// and `{"shape": "predicate"}` for one that gave up over every record.
+    /// filter or a filter on declared fields admitting every live record
+    /// above the dense scan threshold, `{"shape": "bitmap", "admitted": n}`
+    /// for a filter every field of which is declared,
+    /// `{"shape": "sorted", "admitted": n}` for a metadata walk that
+    /// finished, `{"shape": "bounded", "bound": n}` for a walk that gave up
+    /// inside the bound the declared fields left, and
+    /// `{"shape": "predicate"}` for one that gave up over every record.
     ///
     /// `arms` is one dict per arm, in arm order: `space` and `kind` name
-    /// the space the arm asks, `fetch` is the candidates it was asked for,
+    /// the space the arm asks, `fetch` is the candidates it asks the space for,
     /// `exact` says whether its page is exact by construction, being a
     /// scan rather than a graph traversal, and `cost_ns` is the arm's own
     /// estimate of its work, in nanoseconds.
     ///
     /// **`cost_ns` is an estimate of the arm's own work and nothing more.**
-    /// It is priced from unit costs the space timed on itself when it was
-    /// built or loaded, and it leaves out what the collection pays around
+    /// It leaves out what the collection pays around
     /// the arm, being the filter's evaluation over the columns and the
     /// page's assembly, which measured near seventy microseconds a query at
     /// fifty thousand records under a filter admitting every record. A
@@ -851,16 +1169,22 @@ impl HNSWIndex {
         py: Python<'_>,
         arms: &Bound<PyAny>,
         filter: Option<&Bound<PyDict>>,
-        top_k: usize,
-        fetch: Option<usize>,
+        top_k: i64,
+        fetch: Option<i64>,
         fusion: Option<&Bound<PyAny>>,
     ) -> Result<Py<PyDict>, PyEngineError> {
-        let parsed = self.parse_query(arms, filter, top_k, fetch, fusion)?;
-        let plan = py.detach(|| {
-            let arms = parsed.arms();
-            self.inner.explain(&parsed.query(&arms))
-        })?;
-        plan_to_python(&plan, py)
+        self.held("explain()", |inner| {
+            let top_k = count(top_k, "top_k")?;
+            let fetch = count_if_given(fetch, "fetch")?;
+            let parsed = self.parse_query(arms, filter, top_k, fetch, fusion)?;
+            let plan = py
+                .detach(|| {
+                    let arms = parsed.arms();
+                    inner.explain(&parsed.query(&arms))
+                })
+                .map_err(|error| arm_value_given(error, arms))?;
+            plan_to_python(&plan, py)
+        })
     }
 
     /// Enhanced Save method to include HNSW Graph
@@ -868,97 +1192,107 @@ impl HNSWIndex {
     /// On a journaled index the directory is the journal's own and no other,
     /// and the save is a checkpoint; see `journal_to` and `checkpoint`.
     ///
-    /// The whole save runs with the interpreter lock released. `save` reaches
-    /// `save_config`, `save_mappings`, `save_metadata`,
-    /// `save_quantization_config`, `save_pq_centroids`, `save_pq_codes`,
-    /// `save_int8_scales`, `save_int8_rows` and `save_vectors`, and every one
-    /// of them speaks only to `serde_json`, the engine's frame and the storage
-    /// seam. `save_hnsw_graph` reaches `graph::dump::write_dump`,
-    /// which names PyO3 nowhere, and `save_manifest` and `Staged::commit`
-    /// after it speak only to `serde_json` and the storage seam. Nothing in
-    /// the index crate names Python at all.
+    /// The whole save runs with the interpreter lock released.
     #[instrument(level = "info", skip(self, py), fields(
-        vector_count = self.inner.vector_count(),
-        has_quantization = self.inner.has_quantization(),
-        is_quantized = self.inner.is_quantized()
+        vector_count = self.peek(Collection::try_vector_count),
+        has_quantization = self.peek(|inner| Some(inner.has_quantization())),
+        is_quantized = self.peek(Collection::try_is_quantized)
     ), err)]
     pub fn save(&self, py: Python<'_>, path: &str) -> Result<(), PyEngineError> {
-        Ok(py.detach(|| self.inner.save(path))?)
+        self.released(py, "save()", |inner| inner.save(path))
     }
 
     /// Open a journal beside `path` and record every mutation to it from now on.
     ///
-    /// The journal is a file, `<path>.zdbwal`, beside the directory at `path`.
-    /// It holds every add, removal, metadata change, clear, compaction, rebuild
-    /// and training since the directory was last saved, and `load(path)`
-    /// replays it over the directory, so a process that stops without saving,
-    /// however it stops, loses nothing that a call had returned from.
+    /// The journal is a directory of segments, `<path>.zdbjournal`, beside the
+    /// directory at `path`. It holds every add, removal, metadata change,
+    /// clear, compaction, rebuild and training since the directory was last
+    /// saved, each call closed by a commit record, and `load(path)` replays
+    /// it over the directory, so a process that stops without saving, however
+    /// it stops, loses nothing that a call had returned from.
     ///
-    /// Opening it saves the index into `path` first, as `save(path)` would, so
-    /// the file has a checkpoint to replay onto. From then on `save` on this
-    /// index takes `path` and no other directory, `checkpoint()` is `save`
-    /// with the path taken from the journal, and `journal_path` is the file.
-    /// An index is journaled once.
+    /// Opening it takes the directory's lock, `<path>.zdblock`, which the
+    /// index holds until it is dropped, so a second index in this process or
+    /// another that loads, saves into or journals the directory is refused
+    /// with `RuntimeError` (`CollectionLocked`). It then saves the index into
+    /// `path`, as `save(path)` would, so the journal has a checkpoint to
+    /// replay onto.
+    /// From then on `save` on this index takes `path` and no other directory,
+    /// `checkpoint()` is `save` with the path taken from the journal, and
+    /// `journal_path` is the journal's directory. An index is journaled once.
     ///
     /// `durability` is what a call promises about its records once it has
     /// returned. A process that stops loses nothing under any of the three;
     /// they differ in what an operating system crash or a power loss costs.
     ///
     /// - `"call"`, the default: every record of a call is on the device before
-    ///   the call returns, or the call raised. One flush per call, about a
-    ///   millisecond, which a caller adding in batches does not notice and a
-    ///   caller adding one record at a time pays on every record.
+    ///   the call returns, or the call reported or raised the failure. A call
+    ///   that records anything flushes, about a millisecond a flush, which a
+    ///   caller adding in batches does not notice and a caller adding one
+    ///   record at a time pays on every record.
     /// - `"interval"`: every record is in the kernel when the call returns, and
-    ///   a thread of the index's own flushes the file within `interval_ms`
-    ///   milliseconds, 10 by default, of the first call that dirtied it. The
-    ///   thread stops with the index. What is traded is the calls that
-    ///   returned inside the last interval, which a crash of the operating
-    ///   system loses; a stopped process loses none of them.
-    /// - `"none"`: every record is in the kernel when the call returns and
-    ///   nothing flushes the file until the next checkpoint. For a bulk load
-    ///   that calls `checkpoint()` at the end.
+    ///   a thread of the index's own flushes the file after `interval_ms`
+    ///   milliseconds, 10 by default, have passed since the first call that
+    ///   dirtied it. The thread stops with the index. What is traded is the
+    ///   calls not yet flushed, which a crash of the operating system loses; a
+    ///   stopped process loses none of them.
+    /// - `"none"`: every record is in the kernel when the call returns, and on
+    ///   the device by the next checkpoint. For a bulk load that calls
+    ///   `checkpoint()` at the end.
     ///
-    /// A call whose flush fails raises, or under `add` reports every record of
-    /// the batch in `AddResult.errors`, installs none of them, and the index
-    /// then refuses every mutation until `checkpoint()` succeeds, because the
-    /// refused records may have reached the file and a replay would install
-    /// them. See `checkpoint`.
+    /// A call whose flush fails raises, or under `add` reports every record not
+    /// yet installed in `AddResult.errors`, and installs none of them. The journal
+    /// withdraws those records, by an abort record or by cutting them off, so
+    /// a replay does not install them, and the message says which, or says
+    /// that neither landed and the records may come back after a crash until
+    /// a checkpoint. The index then refuses every mutation until
+    /// `checkpoint()` succeeds, because a failed flush may also have lost
+    /// records of earlier calls that the device had not written. See
+    /// `checkpoint`.
     ///
     /// A directory saved with a journal lists `journal` among the features its
     /// manifest records, and opens on this release or later. The checkpoint
     /// this writes is a save, so it moves `identity`'s generation on by one,
-    /// and the journal's header names `identity`'s collection id. `load` holds
-    /// the journal open until the index is dropped, and a file deleted or moved
-    /// under a live index is one the directory can no longer replay, so drop
-    /// the index before touching the file. A record whose journal entry would
-    /// exceed 65 MiB is refused on a journaled index and accepted on one
-    /// without a journal.
+    /// and every segment names `identity`'s collection id and the checkpoint
+    /// it follows. The index holds the journal open until it is dropped, and a
+    /// segment deleted or moved under a live index is one the directory can no
+    /// longer replay, so drop the index before touching the journal. A record
+    /// whose journal entry would exceed 65 MiB is refused on a journaled index
+    /// and accepted on one without a journal. When the process that opened
+    /// the journal forks while no call on the index runs, every mutation in
+    /// the child is refused with `RuntimeError` (`JournalForked`), which
+    /// `add()` reports in `errors`.
     ///
     /// Raises ValueError for a durability that is not one of the three, for
-    /// `interval_ms` under any other durability, or for `interval_ms` of 0, and
-    /// RuntimeError for an index that already has a journal.
+    /// `interval_ms` under any other durability or of 0 or below, and for a
+    /// path with no name of its own. Raises RuntimeError for an index that
+    /// already has a journal or was opened read only, and for a path that
+    /// cannot be locked or written as an index's directory.
     #[pyo3(signature = (path, durability = "call", interval_ms = None))]
     #[instrument(level = "info", skip(self, py), fields(
         path = path,
         durability = durability,
-        vector_count = self.inner.vector_count()
+        vector_count = self.peek(Collection::try_vector_count)
     ), err)]
     pub fn journal_to(
         &self,
         py: Python<'_>,
         path: &str,
         durability: &str,
-        interval_ms: Option<u64>,
+        interval_ms: Option<i64>,
     ) -> Result<(), PyEngineError> {
-        let durability = parse_durability(durability, interval_ms)?;
-        Ok(py.detach(|| self.inner.journal_to(path, durability))?)
+        self.held("journal_to()", |inner| {
+            let interval_ms = count_if_given(interval_ms, "interval_ms")?.map(|ms| ms as u64);
+            let durability = parse_durability(durability, interval_ms)?;
+            Ok(py.detach(|| inner.journal_to(path, durability))?)
+        })
     }
 
-    /// Save the index into the directory its journal sits beside and empty the
-    /// journal.
+    /// Save the index into the directory its journal sits beside and start the
+    /// journal again after it.
     ///
     /// What `save(path)` does on a journaled index, with the path taken from
-    /// the journal. Nothing runs it for you. An index that is never
+    /// the journal. Nothing runs it on an open index. An index that is never
     /// checkpointed opens by replaying every record in its journal, each at the
     /// cost of the `add` that wrote it, so a directory with a million records
     /// in the journal takes minutes to open where its checkpoint takes seconds.
@@ -968,34 +1302,39 @@ impl HNSWIndex {
     /// checkpoint holds writes for the length of the save.
     ///
     /// After a call whose flush failed, this is what lets the index take
-    /// mutations again: the flush is tried once more, the records the failed
-    /// call refused are put behind the sequence the directory names so a
-    /// replay skips them, and the journal is emptied.
+    /// mutations again. The flush is tried once more and a failure is logged
+    /// and passed, since the directory is written from memory and holds every
+    /// record the index holds.
     ///
-    /// Raises RuntimeError on an index with no journal.
+    /// Raises RuntimeError on an index with no journal or opened read only, in
+    /// a child forked from the process that opened the journal, and where the
+    /// save or the journal fails.
     #[instrument(level = "info", skip(self, py), fields(
-        vector_count = self.inner.vector_count()
+        vector_count = self.peek(Collection::try_vector_count)
     ), err)]
     pub fn checkpoint(&self, py: Python<'_>) -> Result<(), PyEngineError> {
-        Ok(py.detach(|| self.inner.checkpoint())?)
+        self.released(py, "checkpoint()", |inner| inner.checkpoint())
     }
 
     /// Python property: `index.journal_path`
     ///
-    /// The file this index records its mutations to, or `None` where it has
-    /// no journal. `journal_to` sets it and `load` of a journaled directory
-    /// finds it.
+    /// The journal this index records its mutations to, being the directory
+    /// of its segments, `<path>.zdbjournal`, or `None` where it has no
+    /// journal. `journal_to` sets it and `load` of a journaled directory finds
+    /// it. An index a load opened read only or with `checkpoint_only=True` has
+    /// none.
     #[getter]
-    pub fn journal_path(&self) -> Option<String> {
-        self.inner
-            .journal_status()
-            .map(|status| status.path.display().to_string())
+    pub fn journal_path(&self, py: Python<'_>) -> Result<Option<String>, PyEngineError> {
+        let path = self.cheap(py, "journal_path", Collection::try_journal_path, |inner| {
+            inner.journal_status().map(|status| status.path)
+        })?;
+        Ok(path.map(|path| path.display().to_string()))
     }
 
     /// Python property: `index.identity`
     ///
-    /// What this index is, as every directory it saves records it under
-    /// `identity` in `manifest.json`. A dict of four keys.
+    /// What this index is, as every directory it saves records it. A dict of
+    /// six keys.
     ///
     /// - `collection_id`: the index's id, 32 hexadecimal digits, drawn when
     ///   the index is created and kept through every save and load. The
@@ -1006,27 +1345,128 @@ impl HNSWIndex {
     /// - `snapshot`: the id of the directory the index last saved or read,
     ///   drawn at that save, or `None`.
     /// - `parent`: the snapshot that directory was saved from, or `None`.
+    /// - `saved_at`: the time that directory's manifest records as its
+    ///   save, which a save writes in RFC 3339, or `None` where `snapshot` is
+    ///   `None` or that manifest records no time a load reads.
+    /// - `sequence`: the journal sequence that directory's manifest records
+    ///   under `identity`, or 0 where it records none.
     ///
-    /// Of two directories of one index the higher generation is the later
-    /// save, and a directory whose `parent` is another's `snapshot` was saved
-    /// from that one. Two directories naming one parent under two snapshots
-    /// were saved from one state twice. `clear()` keeps all four.
+    /// `clear()` keeps all six.
     #[getter]
-    pub fn identity(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        let identity = self.inner.identity();
-        let hex = |id: u128| format!("{:032x}", id);
-        let dict = PyDict::new(py);
-        dict.set_item("collection_id", hex(identity.collection_id))?;
-        dict.set_item("generation", identity.generation)?;
-        dict.set_item("snapshot", identity.snapshot.map(hex))?;
-        dict.set_item("parent", identity.parent.map(hex))?;
-        Ok(dict.into())
+    pub fn identity(&self, py: Python<'_>) -> Result<Py<PyAny>, PyEngineError> {
+        let record = self.cheap(
+            py,
+            "identity",
+            Collection::try_identity_record,
+            Collection::identity_record,
+        )?;
+        Ok(Self::identity_dict(py, &record)?)
+    }
+
+    /// Python property: `index.recovery`
+    ///
+    /// What the load that built this index did, as a dict, or `None` on an
+    /// index created in this process.
+    ///
+    /// - `format_version`: the format the directory declared when it was
+    ///   read.
+    /// - `journaled`: whether a journal was read.
+    /// - `checkpoint_sequence`: the sequence the directory's checkpoint
+    ///   holds, or 0 where its manifest names no journal.
+    /// - `first_sequence`: the first sequence above the checkpoint, or 0
+    ///   where no journal was read.
+    /// - `records_in_journal`: the operation records above the checkpoint
+    ///   the load kept.
+    /// - `replayed`, `withdrawn`, `skipped`: the records applied, the records
+    ///   of calls withdrawn after a failed commit, and the records the
+    ///   checkpoint already held.
+    /// - `segments`: the segments the journal held, or 0 for a journal of
+    ///   format version 1, which is one file.
+    /// - `damage`: what stopped the reader or what a repair cut the journal
+    ///   for, as a dict of `kind`, `segment`, `at`, `sequence` and `detail`,
+    ///   or `None`. `kind` is one of `"torn_tail"`, `"corrupt"`, `"header"`,
+    ///   `"structure"`, `"decode"` and `"apply"`, `segment` the file's name,
+    ///   and `detail` `None` for a torn tail.
+    /// - `restored_from_aside`: whether the directory was put back from
+    ///   `<path>.zdbold`.
+    /// - `graph_rebuilt`: whether the graph was rebuilt rather than read from
+    ///   its dump.
+    /// - `upgraded_from`: the format an upgraded directory was read at, or
+    ///   `None`.
+    /// - `checkpoint_taken`: why the load took a checkpoint, `"upgrade"`,
+    ///   `"abort"` or `"repair"`, or `None`.
+    /// - `read_only`, `read_only_reason`: whether the index was opened read
+    ///   only, and why: the system's refusal, the features the directory
+    ///   holds that this build does not know and its manifest marks
+    ///   `read_only`, the largest generation a journaled directory below
+    ///   format 5.0.0 records, or a value the directory holds past the bound
+    ///   on a vector's norm or on a sparse value with its file and the bound,
+    ///   the last two in the words every save of it is refused in.
+    /// - `repair`: where a load with `repair=True` found the journal to cut or
+    ///   a stale segment to set aside, a dict of `kept_through`,
+    ///   `discarded_from`, `records_discarded`, `bytes_discarded` and
+    ///   `quarantine`, being the last sequence kept, the first left out past
+    ///   the checkpoint or `None` where only a stale segment was set aside, the
+    ///   whole records and the bytes left out, and the folder they were copied
+    ///   into, or `None` where nothing was copied. `None` otherwise.
+    /// - `replaced`: each value the directory records that a load of format
+    ///   5.0.0 refuses and the load took another in place of, as a dict of
+    ///   `file`, `field`, `recorded`, `taken` and `detail`, being the file,
+    ///   the field, the value the file records, the value the load took and
+    ///   why, in the order the load met them. The next save writes `taken`.
+    ///   Empty where the load replaced nothing.
+    #[getter]
+    pub fn recovery(&self, py: Python<'_>) -> Result<Option<Py<PyAny>>, PyEngineError> {
+        self.held("recovery", |_| {
+            Ok(self
+                .recovery
+                .as_ref()
+                .map(|recovery| Self::recovery_dict(py, recovery))
+                .transpose()?)
+        })
+    }
+
+    /// Write a copy of the index into the directory `path` and return the
+    /// copy's identity, a dict of the six keys `identity` returns.
+    ///
+    /// The copy is a directory of its own at format 5.0.0 that names no
+    /// journal and opens with `load()` like any saved index. It holds every
+    /// record the index holds, its generation is the next, its `snapshot` is
+    /// its own, its `parent` is this index's `snapshot`, and its `sequence`
+    /// is the sequence the journal has reached, or the index's own where it
+    /// has none. Neither this index's identity nor its journal moves, so its
+    /// next checkpoint names the same parent.
+    ///
+    /// Writes wait for it as they wait for a checkpoint, and searches run
+    /// throughout. On a journaled index the journal is synced first, and a
+    /// sync that fails is logged and leaves the index refusing changes until
+    /// a checkpoint, while the copy is still written. It works on an index
+    /// with no journal and on one a load opened read only because the medium
+    /// refused writes.
+    ///
+    /// Raises ValueError for a path with no name of its own. Raises
+    /// RuntimeError before anything is written for the directory the index's
+    /// journal sits beside or a read-only index was read from
+    /// (BackupIntoOwnDirectory), for a directory with a journal beside it
+    /// (BackupTargetJournaled), for a path holding a file or a folder of
+    /// other files (TargetNotAnIndex), for a directory another holder locks
+    /// (CollectionLocked), and for an index opened read only for a feature
+    /// this build does not know (FeatureReadOnly). It raises RuntimeError as
+    /// well for a lock it cannot take and for an index it cannot save. A
+    /// directory an earlier save or backup wrote at that path, of any format,
+    /// is replaced whole.
+    #[instrument(level = "info", skip(self, py), fields(
+        vector_count = self.peek(Collection::try_vector_count)
+    ), err)]
+    pub fn backup(&self, py: Python<'_>, path: &str) -> Result<Py<PyAny>, PyEngineError> {
+        let record = self.released(py, "backup()", |inner| inner.backup(path))?;
+        Ok(Self::identity_dict(py, &record)?)
     }
 
     /// Python property: `index.dim`
     #[getter]
-    pub fn dim(&self) -> usize {
-        self.inner.dim()
+    pub fn dim(&self) -> Result<usize, PyEngineError> {
+        self.held("dim", |inner| Ok(inner.dim()))
     }
 
     /// Python property: `index.space`
@@ -1053,8 +1493,8 @@ impl HNSWIndex {
     /// prefix, so a getter written as `space` collides with the existing
     /// `get_space` method. `#[getter(space)]` names the Python property.
     #[getter(space)]
-    pub fn space_property(&self) -> String {
-        self.inner.metric().to_string()
+    pub fn space_property(&self) -> Result<String, PyEngineError> {
+        self.held("space", |inner| Ok(inner.metric().to_string()))
     }
 
     /// Python property: `index.m`
@@ -1069,8 +1509,8 @@ impl HNSWIndex {
     /// would describe a graph that does not exist. Changing it for real is
     /// `rebuild(m=...)`, which builds the graph again at the new degree.
     #[getter]
-    pub fn m(&self) -> usize {
-        self.inner.m()
+    pub fn m(&self) -> Result<usize, PyEngineError> {
+        self.held("m", |inner| Ok(inner.m()))
     }
 
     /// Python property: `index.ef_construction`
@@ -1082,8 +1522,8 @@ impl HNSWIndex {
     /// is `rebuild(ef_construction=...)`, which re-inserts every record at the
     /// new width and so makes the number true again.
     #[getter]
-    pub fn ef_construction(&self) -> usize {
-        self.inner.ef_construction()
+    pub fn ef_construction(&self) -> Result<usize, PyEngineError> {
+        self.held("ef_construction", |inner| Ok(inner.ef_construction()))
     }
 
     /// Python property: `index.expected_size`
@@ -1096,8 +1536,8 @@ impl HNSWIndex {
     /// `len(index)` is the actual count and this is the declaration. The two
     /// disagreeing is ordinary.
     #[getter]
-    pub fn expected_size(&self) -> usize {
-        self.inner.expected_size()
+    pub fn expected_size(&self) -> Result<usize, PyEngineError> {
+        self.held("expected_size", |inner| Ok(inner.expected_size()))
     }
 
     /// `len(index)`, the number of live records.
@@ -1109,32 +1549,34 @@ impl HNSWIndex {
     /// maintained separately as a counter.
     ///
     /// Zero on an empty index, which is the only edge case a length has.
-    pub fn __len__(&self) -> usize {
-        self.inner.len()
+    pub fn __len__(&self, py: Python<'_>) -> Result<usize, PyEngineError> {
+        self.cheap(py, "len()", Collection::try_len, Collection::len)
     }
 
     /// `id in index`, which is `contains(id)`.
     ///
     /// `contains()` stays, because removing it would break every caller using
     /// it. This is the same read of the same map and cannot answer differently.
-    pub fn __contains__(&self, id: String) -> bool {
-        self.inner.contains(&id)
+    pub fn __contains__(&self, py: Python<'_>, id: String) -> Result<bool, PyEngineError> {
+        self.cheap(
+            py,
+            "contains()",
+            |inner| inner.try_contains(&id),
+            |inner| inner.contains(&id),
+        )
     }
 
     /// Live records matching a filter, or every live record when none is given.
     ///
-    /// **Exact, and therefore a complete walk.** With a filter this evaluates
-    /// every record's metadata and counts the matches. It cannot stop early:
-    /// a count is a statement about the whole index, so the first record it
-    /// skipped would make the answer a lower bound rather than a count.
-    /// `scan_candidates` stops at `FULL_SCAN_THRESHOLD` because a search only
-    /// needs to know whether the matching set is small enough to rank directly,
-    /// which is a question an early exit answers and this one is not.
+    /// **Exact.** A count is a statement about the whole index, so it never
+    /// stops early, and a record it skipped would make the answer a lower
+    /// bound rather than a count. Where every field the filter names is
+    /// declared in `indexed_fields`, it counts the bits of the columns'
+    /// selection and reads no metadata. Otherwise it reads records' metadata.
     ///
-    /// What it reuses is `matches_filter` and `validate_filter_conditions`,
-    /// which are the whole of the filter language. What it does not reuse is
-    /// the scan's give-up point, its distance evaluation and its sort, none of
-    /// which a count reads.
+    /// It compiles the filter language `search` takes, and judges a record
+    /// by the same compiled filter, so a filter counts the records a search
+    /// under it may return.
     ///
     /// Without a filter it is `len(index)` and reads one map length.
     ///
@@ -1147,17 +1589,20 @@ impl HNSWIndex {
         py: Python<'_>,
         filter: Option<&Bound<PyDict>>,
     ) -> Result<usize, PyEngineError> {
-        let conditions = filter
-            .map(python_dict_to_value_map)
-            .transpose()?
-            .as_ref()
-            .map(compile_filter)
-            .transpose()?;
+        self.held("count()", |inner| {
+            let conditions = filter
+                .map(python_dict_to_value_map)
+                .transpose()?
+                .as_ref()
+                .map(compile_filter)
+                .transpose()?;
 
-        // The walk runs with the interpreter lock released. It reads every
-        // record, which at 100,000 records is tens of milliseconds, and holding
-        // the lock for that would stall every Python thread in the process.
-        Ok(py.detach(|| self.inner.count(conditions.as_ref())))
+            // The walk runs with the interpreter lock released. It may read
+            // every record, which at 100,000 records is tens of milliseconds,
+            // and holding the lock for that would stall every Python thread in
+            // the process.
+            Ok(py.detach(|| inner.count(conditions.as_ref())))
+        })
     }
 
     /// The metadata fields this index built a column for, in the order they
@@ -1166,10 +1611,15 @@ impl HNSWIndex {
     /// Empty on an index created without `indexed_fields` and on every
     /// directory saved before the declaration existed. A filter naming a field
     /// not in this list still works and still returns the same records; what it
-    /// costs is a walk of every record's metadata.
+    /// costs is a walk of records' metadata.
     #[getter]
-    pub fn indexed_fields(&self) -> Vec<String> {
-        self.inner.indexed_fields()
+    pub fn indexed_fields(&self, py: Python<'_>) -> Result<Vec<String>, PyEngineError> {
+        self.cheap(
+            py,
+            "indexed_fields",
+            Collection::try_indexed_fields,
+            Collection::indexed_fields,
+        )
     }
 
     /// Return the graph's spare buffer capacity, and the per-record stores',
@@ -1182,20 +1632,15 @@ impl HNSWIndex {
     /// same index reports a smaller graph after a save and load round trip than
     /// it did when it was built.
     ///
-    /// `compact()` does not reclaim it. Compaction rebuilds by inserting, so the
-    /// replacement graph regrows exactly the same slack, which is why this is
-    /// its own operation. `compact()` shrinks the graph it built in the same
-    /// way, so a caller who runs compaction gets the graph's slack back too.
-    ///
-    /// **No node, edge or distance is touched.** Fourteen buffers are
+    /// **No node, edge or distance is touched.** The buffers are
     /// reallocated at their current lengths and their contents copied, so the
     /// topology after the call is the topology before it and every search
     /// returns the same page with the same scores.
     ///
-    /// The id store, the per-record metadata and the declared columns give
-    /// back what they reserved past their records the same way, at their
-    /// lengths, so no record, field or value moves either. What the call
-    /// returns is exactly what `get_stats()["reserved_memory_mb"]` priced.
+    /// The id store, the per-record metadata and the declared columns shrink
+    /// the same way, at their lengths, so no record, field or value moves
+    /// either. What the call returns is exactly what
+    /// `get_stats()["reserved_memory_mb"]` priced.
     ///
     /// **The index stays writable.** Every buffer is a growable vector, so the
     /// next `add()` reallocates the per node arenas once and then proceeds as
@@ -1207,19 +1652,15 @@ impl HNSWIndex {
     /// Returns the bytes released, which is zero only when the buffers are
     /// already tight, in which case nothing is reallocated either.
     ///
-    /// **On an empty index it releases the whole creation reservation**, which
-    /// is what `expected_size` bought. Calling it before inserting is therefore
-    /// not free: it hands back the pre-allocation and every subsequent
-    /// insertion regrows the arenas from nothing. Call it on an index that
+    /// **On an empty index it releases the arenas `expected_size` reserved**,
+    /// so calling it before inserting is not free: every subsequent insertion
+    /// regrows them from nothing. Call it on an index that
     /// holds its records, not on one about to receive them.
-    pub fn shrink_to_fit(&self, py: Python<'_>) -> usize {
-        py.detach(|| self.inner.shrink_to_fit())
+    pub fn shrink_to_fit(&self, py: Python<'_>) -> Result<usize, PyEngineError> {
+        self.released(py, "shrink_to_fit()", |inner| Ok(inner.shrink_to_fit()))
     }
 
     /// Get records by ID(s) with PQ reconstruction support and storage mode awareness
-    ///
-    /// Looks the ids up in the union of the raw vectors and the quantized codes,
-    /// so it already saw every record before the other accessors did.
     ///
     /// **An absent id is dropped by default and raised with `strict=True`.** The
     /// default is silence because that is what every existing caller is written
@@ -1227,11 +1668,10 @@ impl HNSWIndex {
     /// reports an id the index does not hold, and changing the return shape
     /// would break every one of them. What the default cannot do is say *which*
     /// nine, since the result is not aligned with the input. `strict=True`
-    /// raises a `KeyError` naming the absent ids, which is the form a caller who
-    /// cares can act on, and it is recommended over the alternative of returning
-    /// a structure carrying the misses: a caller who passes ids it believes are
-    /// present wants the failure, and one who does not can filter with
-    /// `contains`.
+    /// raises a `KeyError`, which is the form a caller who cares can act on,
+    /// and it is recommended over the alternative of returning a structure
+    /// carrying the misses: a caller who passes ids it believes are present
+    /// wants the failure, and one who does not can filter with `contains`.
     ///
     /// `return_vector` is served from the raw vector where one exists and from a
     /// reconstruction of the code where one does not. Under `quantized_only`
@@ -1242,7 +1682,8 @@ impl HNSWIndex {
     /// subvectors and 8 bits, a reconstructed vector differed from the stored
     /// unit vector by 0.066 at the worst component and sat at cosine similarity
     /// 0.991 to it. Under `quantized_with_raw` every record keeps its raw
-    /// vector and returns exactly. `get_stats()["raw_vectors_stored"]` is what
+    /// vector and returns the stored vector exactly, at unit length under
+    /// `cosine`. `get_stats()["raw_vectors_stored"]` is what
     /// tells the two apart in aggregate.
     #[pyo3(signature = (input, return_vector = true, strict = false))]
     pub fn get_records(
@@ -1252,39 +1693,42 @@ impl HNSWIndex {
         return_vector: bool,
         strict: bool,
     ) -> Result<Vec<Py<PyDict>>, PyEngineError> {
-        let ids: Vec<String> = if let Ok(id_str) = input.extract::<String>() {
-            vec![id_str]
-        } else if let Ok(id_list) = input.extract::<Vec<String>>() {
-            id_list
-        } else {
-            return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
-                "Expected a string or a list of strings for ID(s)",
-            )
-            .into());
-        };
+        self.held("get_records()", |inner| {
+            let ids: Vec<String> = if let Ok(id_str) = input.extract::<String>() {
+                vec![id_str]
+            } else if let Ok(id_list) = input.extract::<Vec<String>>() {
+                id_list
+            } else {
+                return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
+                    "Expected a string or a list of strings for ID(s)",
+                )
+                .into());
+            };
 
-        let records = py.detach(|| self.inner.records(ids, return_vector, strict))?;
+            let records = py.detach(|| inner.records(ids, return_vector, strict))?;
 
-        let mut output = Vec::with_capacity(records.len());
-        for record in records {
-            let dict = PyDict::new(py);
-            dict.set_item("id", record.id)?;
-            dict.set_item("metadata", value_map_to_python(&record.metadata, py)?)?;
-            if let Some(vec) = record.vector {
-                // A list, matching `search`.
-                dict.set_item("vector", vec)?;
+            let mut output = Vec::with_capacity(records.len());
+            for record in records {
+                let dict = PyDict::new(py);
+                dict.set_item("id", record.id)?;
+                dict.set_item("metadata", value_map_to_python(&record.metadata, py)?)?;
+                if let Some(vec) = record.vector {
+                    // A list, matching `search`.
+                    dict.set_item("vector", vec)?;
+                }
+                output.push(dict.into());
             }
-            output.push(dict.into());
-        }
-        Ok(output)
+            Ok(output)
+        })
     }
 
     /// Enhanced get_stats with storage mode information
     ///
     /// The figures, and why `total_memory_mb` is not the resident set, are on
-    /// `Collection::stats`.
-    pub fn get_stats(&self) -> HashMap<String, String> {
-        self.inner.stats()
+    /// `Collection::stats`. The keys come in code point order. The walk runs
+    /// with the interpreter lock released.
+    pub fn get_stats(&self, py: Python<'_>) -> Result<BTreeMap<String, String>, PyEngineError> {
+        self.released(py, "get_stats()", |inner| Ok(inner.stats()))
     }
 
     /// One page of records, as (id, metadata), in the order they were added.
@@ -1311,8 +1755,9 @@ impl HNSWIndex {
     /// which sorting by external id would do for any id that sorts low. And it
     /// is the order `compact` already rebuilds in, for the same reason: a
     /// property of the data rather than of where a hasher put a key. Internal
-    /// ids are unique and are never reissued, so the order is total, and they
-    /// survive a save and load, so it is the same order in the next process.
+    /// ids are unique among the records an index holds, so the order is
+    /// total, and they survive a save and load, so it is the same order in
+    /// the next process. `clear()` starts them again from 1.
     ///
     /// # Paging by cursor rather than by count
     ///
@@ -1325,34 +1770,42 @@ impl HNSWIndex {
     /// page starts.
     ///
     /// It is cheap because internal ids are what the order already rests on.
-    /// They are unique, never reissued, and survive `compact`, `rebuild` and a
-    /// save and load, so a cursor taken in one process is a cursor in the next.
+    /// They are unique, never reissued before a `clear()`, and survive
+    /// `compact`, `rebuild` and a save and load, so a cursor taken in one
+    /// process is a cursor in the next.
     ///
     /// The one case it cannot absorb is the cursor record itself being removed,
     /// since its internal id goes with it. That raises, naming the id, rather
     /// than silently returning a page from somewhere else.
     ///
     /// `offset` stays as a convenience and the two are not combined: passing
-    /// both raises, because a caller mixing them has two ideas about where the
-    /// page starts.
+    /// `after` with an `offset` other than 0 raises, because a caller mixing
+    /// them has two ideas about where the page starts.
     ///
     /// An offset at or past the record count returns an empty list rather than
     /// raising, and `number` of zero returns an empty list. Neither is an error.
+    /// `number` and `offset` are Python integers, and a negative one raises
+    /// `ValueError` naming it. Each record's metadata keys come in code point
+    /// order.
     #[pyo3(signature = (number=10, offset=0, after=None))]
     pub fn list(
         &self,
         py: Python<'_>,
-        number: usize,
-        offset: usize,
+        number: i64,
+        offset: i64,
         after: Option<String>,
     ) -> Result<Vec<(String, Py<PyAny>)>, PyEngineError> {
-        let page = py.detach(|| self.inner.list(number, offset, after.as_deref()))?;
+        self.held("list()", |inner| {
+            let number = count(number, "number")?;
+            let offset = count(offset, "offset")?;
+            let page = py.detach(|| inner.list(number, offset, after.as_deref()))?;
 
-        let mut results = Vec::with_capacity(page.len());
-        for (id, metadata) in page {
-            results.push((id, value_map_to_python(&metadata, py)?));
-        }
-        Ok(results)
+            let mut results = Vec::with_capacity(page.len());
+            for (id, metadata) in page {
+                results.push((id, value_map_to_python(&metadata, py)?));
+            }
+            Ok(results)
+        })
     }
 
     /// Check whether a record with this id is in the index
@@ -1363,8 +1816,13 @@ impl HNSWIndex {
     /// It used to read `vectors`, which under `quantized_only` holds only the
     /// records collected before training, so this returned `false` for a record
     /// that search returned and `remove_point` removed.
-    pub fn contains(&self, id: String) -> bool {
-        self.inner.contains(&id)
+    pub fn contains(&self, py: Python<'_>, id: String) -> Result<bool, PyEngineError> {
+        self.cheap(
+            py,
+            "contains()",
+            |inner| inner.try_contains(&id),
+            |inner| inner.contains(&id),
+        )
     }
 
     /// Add index-level metadata, merging the pairs into what is held.
@@ -1378,25 +1836,42 @@ impl HNSWIndex {
         py: Python<'_>,
         metadata: HashMap<String, String>,
     ) -> Result<(), PyEngineError> {
-        Ok(py.detach(|| self.inner.add_metadata(metadata))?)
+        self.released(py, "add_metadata()", |inner| inner.add_metadata(metadata))
     }
 
     /// Get index-level metadata value
-    pub fn get_metadata(&self, key: String) -> Option<String> {
-        self.inner.metadata(&key)
+    pub fn get_metadata(
+        &self,
+        py: Python<'_>,
+        key: String,
+    ) -> Result<Option<String>, PyEngineError> {
+        self.cheap(
+            py,
+            "get_metadata()",
+            |inner| inner.try_metadata(&key),
+            |inner| inner.metadata(&key),
+        )
     }
 
-    /// Get all index-level metadata
-    pub fn get_all_metadata(&self) -> HashMap<String, String> {
-        self.inner.all_metadata()
+    /// Get all index-level metadata, the keys in code point order
+    pub fn get_all_metadata(
+        &self,
+        py: Python<'_>,
+    ) -> Result<BTreeMap<String, String>, PyEngineError> {
+        self.cheap(
+            py,
+            "get_all_metadata()",
+            Collection::try_all_metadata,
+            Collection::all_metadata,
+        )
     }
 
     /// Get a human-readable info string
     ///
     /// `vectors=` is the live record count in every storage mode. See
     /// `Collection::info`.
-    pub fn info(&self) -> String {
-        self.inner.info()
+    pub fn info(&self, py: Python<'_>) -> Result<String, PyEngineError> {
+        self.cheap(py, "info()", Collection::try_info, Collection::info)
     }
 
     /// Remove vector by ID
@@ -1407,7 +1882,7 @@ impl HNSWIndex {
         // removal itself is short, but the wait for the mutation guard is not,
         // because `add` can hold it for a long insert with the lock released.
         // Waiting here with the lock held would stall every Python thread.
-        Ok(py.detach(|| self.inner.remove_point(id))?)
+        self.released(py, "remove_point()", |inner| inner.remove_point(id))
     }
 
     /// Remove a batch of records, taking the mutation lock once.
@@ -1441,7 +1916,7 @@ impl HNSWIndex {
         py: Python<'_>,
         ids: Vec<String>,
     ) -> Result<Vec<String>, PyEngineError> {
-        Ok(py.detach(|| self.inner.remove_points(&ids))?)
+        self.released(py, "remove_points()", |inner| inner.remove_points(&ids))
     }
 
     /// Remove records by id or by filter, and report how many went.
@@ -1479,7 +1954,7 @@ impl HNSWIndex {
         ids: Option<&Bound<PyAny>>,
         r#where: Option<&Bound<PyDict>>,
     ) -> Result<usize, PyEngineError> {
-        match (ids, r#where) {
+        self.held("delete()", |inner| match (ids, r#where) {
             (Some(_), Some(_)) => Err(Error::DeleteBothSelectors.into()),
             (None, None) => Err(Error::DeleteNoSelector.into()),
             (Some(ids), None) => {
@@ -1494,10 +1969,10 @@ impl HNSWIndex {
                     .into());
                 };
 
-                Ok(py.detach(|| self.inner.delete_ids(&requested))?)
+                Ok(py.detach(|| inner.delete_ids(&requested))?)
             }
             (None, Some(filter)) => self.remove_where(py, filter),
-        }
+        })
     }
 
     /// Remove every record whose metadata matches the filter, and report how
@@ -1528,8 +2003,10 @@ impl HNSWIndex {
         py: Python<'_>,
         filter: &Bound<PyDict>,
     ) -> Result<usize, PyEngineError> {
-        let conditions = compile_filter(&python_dict_to_value_map(filter)?)?;
-        Ok(py.detach(|| self.inner.remove_where(&conditions))?)
+        self.held("remove_where()", |inner| {
+            let conditions = compile_filter(&python_dict_to_value_map(filter)?)?;
+            Ok(py.detach(|| inner.remove_where(&conditions))?)
+        })
     }
 
     /// Empty the index, keeping its configuration, and report how many
@@ -1563,24 +2040,24 @@ impl HNSWIndex {
     /// llama-index probes `hasattr(index, "clear")` and raised
     /// `NotImplementedError` when it found nothing.
     pub fn clear(&self, py: Python<'_>) -> Result<usize, PyEngineError> {
-        Ok(py.detach(|| self.inner.clear())?)
+        self.released(py, "clear()", |inner| inner.clear())
     }
 
     /// Replace one record's metadata without resupplying its vector.
     ///
-    /// **Wholesale, not a merge.** The supplied mapping becomes the record's
+    /// **Wholesale, not a merge.** The supplied dict becomes the record's
     /// metadata and any key not in it is gone. That is what `add(overwrite=True)`
     /// already does, since it removes the record outright before inserting the
     /// replacement, so the two ways of re-tagging a record agree.
     ///
     /// Returns `false` for an id the index does not hold, and writes nothing in
     /// that case. `true` when the metadata was replaced. Passing an empty
-    /// mapping clears the record's metadata, which is a write and returns
+    /// dict clears the record's metadata, which is a write and returns
     /// `true`.
     ///
-    /// **It touches `vector_metadata` and nothing else.** No graph work, no
-    /// vector work, no id allocation, no training. The record keeps its internal
-    /// id, its graph node, its stored vector and its quantized codes.
+    /// No graph work, no vector work, no id allocation, no training. The
+    /// record keeps its internal id, its graph node, its stored vector and its
+    /// quantized codes.
     ///
     /// That is the reason it exists. Re-tagging a document used to mean reading
     /// it back with `get_records` and adding it again with `overwrite=True`, and
@@ -1594,8 +2071,10 @@ impl HNSWIndex {
         id: String,
         metadata: &Bound<PyDict>,
     ) -> Result<bool, PyEngineError> {
-        let fields = python_dict_to_value_map(metadata)?;
-        Ok(py.detach(|| self.inner.update_metadata(&id, fields))?)
+        self.held("update_metadata()", |inner| {
+            let fields = python_dict_to_value_map(metadata)?;
+            Ok(py.detach(|| inner.update_metadata(&id, fields))?)
+        })
     }
 
     /// Rebuild the graph at a new degree, in place.
@@ -1608,9 +2087,7 @@ impl HNSWIndex {
     /// width or the wrong metric rejects or misranks its records outright, and
     /// `ef_construction` describes work already done.
     ///
-    /// At least one of the three has to be given. Rebuilding the graph as it
-    /// stands is `compact()`, which reclaims the nodes removals and overwrites
-    /// leave behind.
+    /// At least one of the three has to be given.
     ///
     /// `expected_size` moves with `m` because the two are related. It selects
     /// the default `m`, it sizes the replacement graph's reservation, and it is
@@ -1619,15 +2096,11 @@ impl HNSWIndex {
     ///
     /// `ef_construction` moves with them because **the warning below names it as
     /// one of two remedies and a caller has to be able to take either.** Raising
-    /// `m` past half of `ef_construction` switches the neighbour selection
-    /// heuristic off, and the message says to raise `ef_construction` or lower
-    /// `m`. It is honest to report afterwards for the same reason the rebuild is
-    /// honest at all: every record really was re-inserted at the new width.
+    /// `m` to half of `ef_construction` or past it draws the warning, and the
+    /// message says to raise `ef_construction` or lower `m`.
     ///
-    /// **Everything except the graph survives untouched.** Each record is
-    /// re-inserted under the internal id it already holds, so the id store,
-    /// the metadata store and every declared field's column stay
-    /// correct without being rewritten, and the record any given id resolves to
+    /// **Every record survives unchanged.** Each record is re-inserted under
+    /// the internal id it already holds, so the record any given id resolves to
     /// is the same before and after. A quantized index is rebuilt from its
     /// stored codes rather than re-encoded, so the codebook is not retrained and
     /// no record's code changes; a `quantized_with_raw` index carries its raw
@@ -1649,18 +2122,23 @@ impl HNSWIndex {
     pub fn rebuild(
         &self,
         py: Python<'_>,
-        m: Option<usize>,
-        expected_size: Option<usize>,
-        ef_construction: Option<usize>,
+        m: Option<i64>,
+        expected_size: Option<i64>,
+        ef_construction: Option<i64>,
     ) -> Result<usize, PyEngineError> {
-        let plan = self.inner.plan_rebuild(m, expected_size, ef_construction)?;
-        // Before the interpreter lock is released, because a Python warning
-        // needs it. The pair is what decides it, exactly as at `create()`, and
-        // **both of the remedies it names are reachable from here**: this takes
-        // `ef_construction` as well as `m`, so a caller told to raise one or
-        // lower the other can do either.
-        construct::warn_if_selection_disabled(py, plan.m, plan.ef_construction)?;
-        Ok(py.detach(|| self.inner.rebuild(plan))?)
+        self.held("rebuild()", |inner| {
+            let m = count_if_given(m, "m")?;
+            let expected_size = count_if_given(expected_size, "expected_size")?;
+            let ef_construction = count_if_given(ef_construction, "ef_construction")?;
+            let plan = inner.plan_rebuild(m, expected_size, ef_construction)?;
+            // Before the interpreter lock is released, because a Python warning
+            // needs it. The pair is what decides it, exactly as at `create()`, and
+            // **both of the remedies it names are reachable from here**: this takes
+            // `ef_construction` as well as `m`, so a caller told to raise one or
+            // lower the other can do either.
+            construct::warn_if_selection_disabled(py, plan.m, plan.ef_construction)?;
+            Ok(py.detach(|| inner.rebuild(plan))?)
+        })
     }
 
     /// Rebuild the graph in memory and reclaim the nodes removal and overwrite strand.
@@ -1674,39 +2152,50 @@ impl HNSWIndex {
     /// traversal steps they cost.
     ///
     /// Returns the number of nodes reclaimed. Zero means the graph held no stranded
-    /// nodes, in which case nothing is rebuilt and the call is a no-op.
+    /// nodes, in which case the graph is not rebuilt. A sparse space, where the
+    /// index declares one, is compacted first whatever the graph holds, which
+    /// takes back the postings and the stored nonzeros of removed records.
     ///
     /// The cost is a full sequential rebuild, proportional to the live record count
-    /// rather than to the amount of debris. Nothing outside the graph is touched.
-    /// Internal ids, external ids, metadata, stored vectors, quantized codes, PQ
-    /// training state and the id counter all survive unchanged, so the record any
-    /// given id resolves to is the same before and after.
+    /// rather than to the amount of debris. Beside the graph, the rebuild gives back
+    /// the text of removed records' ids that the id store still held. Internal ids,
+    /// external ids, metadata, stored vectors, quantized codes, PQ training state
+    /// and the id counter all survive unchanged, so the record any given id
+    /// resolves to is the same before and after.
     ///
     /// The replacement graph is built in full before the old one is dropped, so peak
-    /// memory holds both for the duration and a failure part way through leaves the
-    /// index exactly as it was.
+    /// memory holds both for the duration and a failure part way through leaves
+    /// every record, page and saved file as it was.
     ///
     /// This is never automatic. Calling it is a decision a deployment can schedule.
     ///
-    /// The rebuild runs with the interpreter lock released, and every function
-    /// it reaches is in the index crate, which names nothing of Python.
+    /// The rebuild runs with the interpreter lock released.
     pub fn compact(&self, py: Python<'_>) -> Result<usize, PyEngineError> {
-        Ok(py.detach(|| self.inner.compact())?)
+        self.released(py, "compact()", |inner| inner.compact())
     }
 
-    /// Get performance characteristics and limitations
-    pub fn get_performance_info(&self) -> HashMap<String, String> {
-        self.inner.performance_info()
+    /// Get performance characteristics and limitations, the keys in code
+    /// point order
+    pub fn get_performance_info(&self) -> Result<BTreeMap<String, String>, PyEngineError> {
+        self.held("get_performance_info()", |inner| {
+            Ok(inner.performance_info())
+        })
     }
 
-    /// Concurrent benchmark for search performance
+    /// Concurrent benchmark for search performance, the keys in code point
+    /// order. `query_count` and `max_threads` are Python integers, and a
+    /// negative one raises `ValueError` naming it.
     #[pyo3(signature = (query_count, max_threads=None))]
     pub fn benchmark_concurrent_reads(
         &self,
         py: Python<'_>,
-        query_count: usize,
-        max_threads: Option<usize>,
-    ) -> Result<HashMap<String, f64>, PyEngineError> {
-        Ok(py.detach(|| self.inner.benchmark_reads(query_count, max_threads))?)
+        query_count: i64,
+        max_threads: Option<i64>,
+    ) -> Result<BTreeMap<String, f64>, PyEngineError> {
+        self.held("benchmark_concurrent_reads()", |inner| {
+            let query_count = count(query_count, "query_count")?;
+            let max_threads = count_if_given(max_threads, "max_threads")?;
+            Ok(py.detach(|| inner.benchmark_reads(query_count, max_threads))?)
+        })
     }
 }
