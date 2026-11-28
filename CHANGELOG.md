@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [0.14.0] - 2026-11-27
+## [0.14.0] - 2026-11-28
 
 ### Added
 
@@ -143,6 +143,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`import zeusdb_vector_database` succeeds where the working folder has been removed and `ZEUSDB_LOG_FILE` is a relative path.**
 
+- **Every call that reads the clock works on a system clock set before 1970, and records that clock's time**, the import under `ZEUSDB_LOG_ROTATION=daily` among them, and the Python layer writes each log record whose time is before 1970 in either format.
+
+- **The Python layer writes its JSON log records where deprecation warnings are errors.**
+
 - **`bits=None` and `storage_mode=None` take their defaults**, as `None` does for every other key of a quantization config but `type`.
 
 ### Internal
@@ -150,6 +154,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Every tool the release workflow installs has an exact version and is checked against a published hash.**
 
 - **The release workflow runs the Python suite on each wheel, all but the two modules that need the `test-support` build, and publishes only after every run passes.**
+
+- **The engine reads the clock for the times an index's files record, and writes and reads those times, with a module of its own that uses only the Rust standard library.** A save writes every timestamp as before, and a load accepts and refuses the same texts.
 
 ### Format
 

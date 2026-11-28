@@ -1,4 +1,5 @@
-//! The clock, and the spellings of the times the engine writes and reads.
+//! The clock and the spellings for the times an index's files record, and
+//! the date a daily log file is named by.
 //!
 //! [`Timestamp`] is a UTC instant, held as whole seconds from
 //! 1970-01-01T00:00:00Z, negative before it, and the nanoseconds past that
@@ -10,9 +11,9 @@
 //!
 //! # The spellings
 //!
-//! The engine writes three, and each keeps its spelling byte for byte, since
-//! the saved format records the first as text and the other two name
-//! folders and files.
+//! Each of the three below keeps its spelling byte for byte, since the
+//! saved format records the first as text and the other two name folders
+//! and files.
 //!
 //! - [`Timestamp::to_rfc3339`], such as `2026-11-27T06:27:49.767390800+00:00`,
 //!   for each time that `manifest.json`, `quantization.json`, a training
